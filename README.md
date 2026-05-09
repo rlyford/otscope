@@ -160,21 +160,30 @@ The complete operator manual is **[OTscope_User_Guide.md](./OTscope_User_Guide.m
 ## Project Structure
 
 ```
-pcap_analyzer_program/
-├── otscope.py                  # The tool (single-file Python program)
-├── README.md                   # This file
-├── requirements.txt            # Python dependencies
-├── LICENSE.txt                 # Source-available proprietary license
-├── OTscope_User_Guide.md       # Complete operator manual
-├── OTscope_User_Guide.docx     # Same guide as Word document (optional)
-└── captures1/                  # Example output folder
-    ├── <session>.otpa_session              # Session state JSON
-    ├── OT_PCAP_Analysis_*.docx             # Word reports
-    ├── OT_PCAP_Analysis_*.json             # JSON reports
-    ├── OT_Device_Inventory_*.csv           # Device CSVs
-    ├── OT_Flow_Allowlist_*.csv             # Flow CSVs
-    ├── OTscope_Purdue_Summary_*.svg        # Always-written diagram
-    └── OTscope_Purdue_Detail_*.svg         # Only when ≤50 devices
+otscope/                            # repo root
+├── README.md                       # this file
+├── CLAUDE.md                       # Claude Code agent guide
+├── AGENTS.md                       # Codex agent guide
+├── .gitignore
+└── otscope/                        # tool directory
+    ├── src/
+    │   └── otscope.py              # the tool (single-file Python program)
+    ├── docs/
+    │   └── OTscope_User_Guide.md   # complete operator manual
+    ├── requirements.txt
+    ├── LICENSE.txt
+    ├── README.md                   # mirrored quick-start (same as repo root)
+    ├── pcaps/                      # gitignored — put your pcap subfolders here
+    │   └── <site-name>/
+    │       └── *.pcap / *.pcapng
+    └── output/                     # gitignored — generated artifacts land here
+        ├── <session>.otpa_session
+        ├── OT_PCAP_Analysis_*.docx
+        ├── OT_PCAP_Analysis_*.json
+        ├── OT_Device_Inventory_*.csv
+        ├── OT_Flow_Allowlist_*.csv
+        ├── OTscope_Purdue_Summary_*.svg
+        └── OTscope_Purdue_Detail_*.svg
 ```
 
 ---
