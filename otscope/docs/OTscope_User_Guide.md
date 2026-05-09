@@ -465,6 +465,18 @@ When the Word report opens, work top-down for fastest triage:
 
 Running log of capabilities added in each release. Newest at the top.
 
+### Version 2.6.0 · May 2026
+
+Auditor-focused report overhaul and `--technical-appendix` flag.
+
+- **Complete DOCX report redesign** for IT-oriented cybersecurity auditors unfamiliar with OT/ICS.  The report follows a progressive-disclosure model: the main Word document is a concise workpaper; the JSON export carries complete machine-readable detail; CSVs carry device and flow inventories.
+- New 12-section report structure: Cover Page → Document Purpose and Scope → How to Use This Report → Executive Summary → Network Interpretation Summary → Risk Summary → Findings (grouped by category) → Timeline / Attack-Chain Summary → MITRE ATT&CK for ICS Coverage → Top Riskiest Devices → Device Inventory → Appendix A: Wireshark Investigation Guide.
+- **New per-finding fields** — detection confidence, maliciousness confidence (with "may be authorized maintenance" qualifier where appropriate), OT significance narrative for IT auditors, auditor action bullets, and benign-case explanation.
+- **Auto-sequential finding IDs** (`MODBUS-001`, `DNP3-001`, etc.) assigned at report generation time; `dedupe_key` preserved in the JSON export for correlation.
+- **`--technical-appendix` CLI flag** — when passed, appends Appendix B (Detailed Technical Evidence) to the Word report, including raw evidence lines and per-pcap breakdown.  Absent the flag, technical detail remains in the JSON export only, keeping the Word document readable by non-technical audit reviewers.
+- New module-level helper functions: `detection_confidence_for_finding`, `maliciousness_confidence_for_finding`, `ot_significance_for_finding`, `auditor_guidance_for_finding`, `benign_explanation_for_finding`, `build_network_interpretation_summary`.
+- `technical_appendix` parameter threaded through `generate_report`, `prompt_report_generation`, and all top-level flow functions (`new_session_flow`, `resume_flow`, `add_pcaps_flow`, `report_only_flow`, `scan_flow`).
+
 ### Version 2.5.0 · May 2026
 
 Expanded OT protocol coverage and Modbus register value anomaly detection.

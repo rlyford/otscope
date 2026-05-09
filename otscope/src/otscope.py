@@ -58,7 +58,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 
 TOOL_NAME = "OTscope"
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 __author__ = "Ryan Lyford"
 __copyright__ = "© 2026 Ryan Lyford. All rights reserved."
 
@@ -2082,6 +2082,365 @@ def ask_environment_questions(existing: Optional[Dict[str, str]] = None) -> Dict
         else:
             answers[key] = answer
     return answers
+
+
+
+
+# ----------------------------------------------------------------------
+# Report helper: category → finding ID prefix  (e.g. "MODBUS-001")
+# ----------------------------------------------------------------------
+_CATEGORY_PREFIX_MAP: Dict[str, str] = {
+    "Modbus TCP":                        "MODBUS",
+    "BACnet/IP":                         "BACNET",
+    "DNP3":                              "DNP3",
+    "IEC 61850":                         "IEC61850",
+    "IEC 60870-5-104":                   "IEC104",
+    "MQTT":                              "MQTT",
+    "OPC-UA":                            "OPCUA",
+    "EtherNet/IP":                       "ENIP",
+    "Siemens S7 / PROFINET":             "S7",
+    "Omron FINS":                        "FINS",
+    "GE SRTP":                           "GESRTP",
+    "Schneider UMAS":                    "UMAS",
+    "Mitsubishi MELSEC":                 "MELSEC",
+    "OSIsoft PI Server":                 "PI",
+    "Ignition Gateway":                  "IGNITION",
+    "Node-RED":                          "NODERED",
+    "Physical Security":                 "PHYSSEC",
+    "Cleartext and Legacy Protocols":    "LEGACY",
+    "Artifact Extraction":               "ARTIFACT",
+    "Network Hygiene and Segmentation":  "NETHYG",
+    "Intrusion Indicators":              "INTRUSION",
+    "Unknown and Unclassified Traffic":  "UNKNOWN",
+    "Absence of Expected Traffic":       "ABSENCE",
+    "Baseline Deviation":                "BASELINE",
+    "Protection Guidance":               "PROTECT",
+}
+
+# MITRE ATT&CK for ICS technique names (for display in the coverage table)
+_MITRE_ICS_NAMES: Dict[str, str] = {
+    "T0812": "Default Credentials",
+    "T0814": "Denial of Service",
+    "T0816": "Device Restart/Shutdown",
+    "T0828": "Loss of Productivity",
+    "T0830": "Adversary-in-the-Middle",
+    "T0831": "Manipulation of Control",
+    "T0836": "Modify Parameter",
+    "T0840": "Network Connection Enumeration",
+    "T0841": "Network Service Scanning",
+    "T0842": "Network Sniffing",
+    "T0843": "Program Download",
+    "T0845": "Program Upload",
+    "T0846": "Remote System Discovery",
+    "T0855": "Unauthorized Command Message",
+    "T0856": "Spoof Reporting Message",
+    "T0857": "System Firmware",
+    "T0858": "Manipulate I/O Image",
+    "T0859": "Valid Accounts",
+    "T0866": "Exploitation of Remote Services",
+    "T0878": "Alarm Suppression",
+    "T0882": "Theft of Operational Information",
+    "T0884": "Connection Proxy",
+    "T0885": "Commonly Used Port",
+    "T0886": "Remote Services",
+    "T0887": "Wireless Sniffing",
+    "T0888": "Remote System Information Discovery",
+}
+
+
+def _finding_id_prefix(category: str) -> str:
+    """Return the short report ID prefix for a finding category."""
+    return _CATEGORY_PREFIX_MAP.get(category, "FIND")
+
+
+def detection_confidence_for_finding(finding: "Finding") -> str:
+    """Estimate how confident the tool is that the detection is accurate."""
+    text = " ".join([finding.title, finding.category, " ".join(finding.tags)]).lower()
+    if any(t in text for t in ("arp spoof", "multiple mac", "adversary-in-the-middle",
+                                "mitm attack")):
+        return "High"
+    if any(t in text for t in ("register scanning", "polling burst", "register value anomaly",
+                                "public ip", "cleartext credentials", "dnp3 direct operate",
+                                "dnp3 cold restart", "dnp3 warm restart", "plc stop",
+                                "s7 write", "authentication failure")):
+        return "High"
+    if any(t in text for t in ("replay", "identical modbus response", "possible",
+                                "may indicate")):
+        return "Medium"
+    if any(t in text for t in ("unknown", "unclassified", "absence")):
+        return "Low"
+    return "Medium"
+
+
+def maliciousness_confidence_for_finding(finding: "Finding") -> str:
+    """Estimate how likely the detected behavior is malicious vs. operationally normal."""
+    text = " ".join([finding.title, finding.category, " ".join(finding.tags)]).lower()
+    if finding.severity == SEVERITY_INTRUSION:
+        return "High"
+    if any(t in text for t in ("adversary-in-the-middle attack pattern", "mitm attack",
+                                "suspicious tool", "mimikatz", "cobalt strike", "metasploit")):
+        return "High"
+    if any(t in text for t in ("replay", "identical modbus response", "arp spoof",
+                                "gratuitous arp burst")):
+        return "Medium"
+    if any(t in text for t in ("modbus register scanning", "register scanning",
+                                "polling burst", "polling anomaly")):
+        return "Low — may be authorized maintenance"
+    if any(t in text for t in ("unknown", "unclassified", "absence")):
+        return "Unknown"
+    if finding.severity == SEVERITY_CRITICAL:
+        return "Medium"
+    if finding.severity == SEVERITY_HIGH:
+        return "Low / Medium — requires site validation"
+    return "Unknown"
+
+
+def ot_significance_for_finding(finding: "Finding") -> str:
+    """Return an OT-focused explanation of why this finding matters to an IT auditor."""
+    text = " ".join([
+        finding.title, finding.description, finding.category, " ".join(finding.tags),
+    ]).lower()
+    if any(t in text for t in ("register scanning",)):
+        return (
+            "Sequential register reads across a wide address space are consistent with "
+            "reconnaissance of a controller's internal state — mapping which registers hold "
+            "process values, setpoints, or status bits.  While an engineer may perform this "
+            "during commissioning, the same pattern from an unknown host is a common precursor "
+            "to targeted manipulation."
+        )
+    if any(t in text for t in ("polling burst", "polling anomaly")):
+        return (
+            "OT devices communicate in tightly controlled, deterministic cycles.  A burst of "
+            "abnormally high or irregular polling can indicate configuration errors, a "
+            "malfunctioning HMI, unauthorized scanning, or a denial-of-service condition "
+            "against the controller.  Sustained abnormal polling can exhaust controller "
+            "resources and disrupt process control."
+        )
+    if any(t in text for t in ("replay", "identical modbus response")):
+        return (
+            "Replay behavior — receiving identical responses at anomalous timing intervals — "
+            "is a known OT attack pattern where an attacker feeds a controller pre-recorded "
+            "legitimate data to mask real-world sensor values.  This is particularly serious "
+            "in safety-critical processes where operators rely on controller feedback."
+        )
+    if any(t in text for t in ("arp spoof", "adversary-in-the-middle", "mitm")):
+        return (
+            "In an OT network, an Adversary-in-the-Middle position between an HMI and a PLC "
+            "allows real-time observation, modification, or replay of any command or process "
+            "value.  This bypasses application-layer authentication and is one of the most "
+            "serious network-layer threats to OT data integrity and process safety."
+        )
+    if any(t in text for t in ("write", "direct operate", "control operation", "writeproperty")):
+        return (
+            "In OT environments, write-capable commands have direct physical consequences: "
+            "they can change setpoints, open or close valves, start or stop motors, and modify "
+            "controller configuration.  Unapproved writes are among the highest-risk OT events "
+            "because the impact extends to physical processes and may affect safety systems."
+        )
+    if any(t in text for t in ("plc stop", "cold restart", "warm restart", "disable spontaneous")):
+        return (
+            "Commands that stop, restart, or suppress reporting from a PLC or RTU have "
+            "immediate operational impact — halting production, disabling safety monitoring, "
+            "or disrupting the operator's view of the process.  In MITRE ATT&CK for ICS "
+            "these are classified as impact-stage techniques."
+        )
+    if any(t in text for t in ("register value anomaly",)):
+        return (
+            "Sudden large jumps in register values can indicate spoofed or injected Modbus "
+            "responses rather than real sensor readings.  In safety-critical processes, "
+            "acting on spoofed data can cause equipment damage, process upsets, or safety "
+            "system failures."
+        )
+    if any(t in text for t in ("cleartext", "without tls", "no authentication", "anonymous")):
+        return (
+            "Most legacy OT protocols were designed for isolated networks and lack "
+            "authentication and encryption.  Where IT/OT connectivity exists, cleartext "
+            "communications expose process data, commands, and credentials to any host "
+            "with network visibility."
+        )
+    if any(t in text for t in ("boundary", "it-to-ot", "ot-to-it", "public ip", "segmentation")):
+        return (
+            "OT network segmentation is a primary defense layer.  Direct communication "
+            "between IT and OT zones creates pathways through which IT-side compromise can "
+            "reach control systems.  Public IP exposure extends that risk to internet threats."
+        )
+    if any(t in text for t in ("firmware", "program download", "logic download", "block download")):
+        return (
+            "Firmware and logic downloads modify the program driving physical processes.  "
+            "Unauthorized downloads are among the most serious OT security events because a "
+            "compromised PLC program persists through reboots and can cause physical harm."
+        )
+    return (
+        "In OT environments, traffic anomalies that would be low-risk in IT can have direct "
+        "consequences for physical processes, equipment, and safety.  This finding warrants "
+        "validation with site personnel to determine whether it is authorized activity or a "
+        "gap requiring remediation."
+    )
+
+
+def auditor_guidance_for_finding(finding: "Finding") -> List[str]:
+    """Return 3–5 auditor action bullets for validating a finding."""
+    text = " ".join([finding.title, finding.category, " ".join(finding.tags)]).lower()
+    if any(t in text for t in ("register scanning",)):
+        return [
+            "Confirm the source IP is an authorized engineering workstation or licensed HMI.",
+            "Check whether a maintenance window, commissioning activity, or diagnostic session was underway during the capture period.",
+            "Request the site's approved communication matrix and verify this flow is documented.",
+            "If the source is unknown or undocumented, treat as unauthorized reconnaissance and escalate.",
+        ]
+    if any(t in text for t in ("write", "direct operate", "control operation", "writeproperty")):
+        return [
+            "Confirm the source host has an authorized role to issue write or control commands.",
+            "Verify that the write activity aligns with a known maintenance window or approved change record.",
+            "Confirm the destination device is the expected target for commands from this source.",
+            "Request operator logs and change records covering the capture timestamp.",
+            "If the source is not an approved HMI or engineering workstation, escalate immediately.",
+        ]
+    if any(t in text for t in ("polling burst", "polling anomaly")):
+        return [
+            "Confirm whether abnormal polling rates correspond to a known maintenance or troubleshooting period.",
+            "Verify the polling source is a licensed, approved HMI or SCADA system.",
+            "Check whether the controller's CPU utilization was affected during the burst period.",
+            "If unexplained, check for rogue HMI software, misconfigured historian, or unauthorized device.",
+        ]
+    if any(t in text for t in ("replay", "identical modbus response")):
+        return [
+            "Validate whether the affected device was in a normal operating state during the capture.",
+            "Ask site staff whether any network taps, traffic mirrors, or test equipment were active.",
+            "Compare the captured Modbus responses against known-good process values for the same period.",
+            "If no legitimate explanation exists, treat as potential replay injection and investigate the network path.",
+        ]
+    if any(t in text for t in ("arp spoof", "adversary-in-the-middle", "mitm")):
+        return [
+            "Map the MAC addresses involved to specific physical ports on the switch.",
+            "Determine whether any network monitoring appliance, IDS sensor, or traffic mirror could explain multiple MACs.",
+            "Review switch port security configuration and ARP table logs for the affected subnet.",
+            "If no legitimate explanation exists, treat as active intrusion and escalate immediately.",
+        ]
+    if any(t in text for t in ("cleartext", "without tls", "no authentication")):
+        return [
+            "Confirm whether the protocol has a secure mode that is not currently enabled.",
+            "Verify whether the exposed traffic includes credentials, process commands, or sensitive data.",
+            "Confirm whether this traffic crosses zone boundaries to IT or external networks.",
+            "Assess whether the vendor has issued guidance for securing this service.",
+        ]
+    if any(t in text for t in ("boundary", "it-to-ot", "public ip")):
+        return [
+            "Confirm whether the cross-zone communication is intentional and documented in the site's architecture.",
+            "Request the segmentation diagram and verify controls at the zone boundary.",
+            "Confirm whether firewall rules explicitly permit or deny the observed flow.",
+            "Assess whether the remote host has been included in the site's threat model.",
+        ]
+    return [
+        "Confirm with site personnel whether the observed behavior is expected and authorized.",
+        "Cross-reference the source and destination IPs against the site's approved communication matrix.",
+        "Request maintenance logs and change records covering the capture period.",
+        "If the activity cannot be explained by normal operations, escalate for further investigation.",
+    ]
+
+
+def benign_explanation_for_finding(finding: "Finding") -> str:
+    """One sentence describing what site context would make this finding benign."""
+    text = " ".join([finding.title, finding.category, " ".join(finding.tags)]).lower()
+    if any(t in text for t in ("register scanning",)):
+        return "This finding would be benign if the source is a licensed engineering workstation performing routine commissioning, maintenance, or diagnostic reads with site approval."
+    if any(t in text for t in ("polling burst",)):
+        return "This finding would be benign if the increased polling rate was a deliberate configuration change or occurred during a scheduled data-collection or commissioning activity."
+    if any(t in text for t in ("replay", "identical modbus response")):
+        return "This finding would be benign if a network mirror, protocol gateway, or retransmission mechanism was active during the capture period."
+    if any(t in text for t in ("arp spoof", "adversary-in-the-middle", "mitm")):
+        return "This finding would be benign if a network monitoring appliance, IDS sensor, or traffic mirror was installed on the subnet using promiscuous mode or transparent bridging."
+    if any(t in text for t in ("write", "direct operate", "control operation")):
+        return "This finding would be benign if the source is an authorized HMI or engineering workstation performing approved maintenance or commissioning during a documented change window."
+    if any(t in text for t in ("cleartext",)):
+        return "This would be acceptable only if the traffic is confined to a physically isolated, non-routable segment with no IT or external connectivity — which must be confirmed with the site."
+    if any(t in text for t in ("boundary", "it-to-ot", "public ip")):
+        return "This finding would be benign if the cross-zone communication is explicitly documented, monitored, and intentionally permitted through a reviewed segmentation policy."
+    if any(t in text for t in ("plc stop", "cold restart", "warm restart")):
+        return "This finding would be benign if the source is an authorized engineering workstation and the restart was part of a scheduled, documented maintenance window."
+    return "This finding would be benign if confirmed by site personnel as representing authorized, expected communications during normal or approved maintenance operations."
+
+
+def build_network_interpretation_summary(session: "SessionState") -> List[str]:
+    """Return a list of plain-English paragraphs interpreting observed network behavior."""
+    paragraphs: List[str] = []
+    devices = session.devices
+
+    ot_initiators: List["DeviceRecord"] = []
+    ot_responders: List["DeviceRecord"] = []
+    it_noise_on_ot = False
+
+    for dev in devices.values():
+        role = (dev.inferred_role or "").lower()
+        if any(r in role for r in ("hmi", "engineering", "scada", "historian", "workstation")):
+            ot_initiators.append(dev)
+        elif any(r in role for r in ("plc", "rtu", "controller", "field device", "server")):
+            ot_responders.append(dev)
+        it_noise_protocols = {"mdns", "llmnr", "nbns", "ssdp"}
+        if (any(p.lower() in it_noise_protocols for p in dev.protocols)
+                and "OT" in (dev.inferred_zone or "")):
+            it_noise_on_ot = True
+
+    ot_initiators.sort(key=lambda d: d.outgoing_count + d.incoming_count, reverse=True)
+    ot_responders.sort(key=lambda d: d.outgoing_count + d.incoming_count, reverse=True)
+
+    if ot_initiators:
+        init_text = ", ".join(
+            f"{d.ip} ({d.inferred_role})" for d in ot_initiators[:3]
+        )
+        paragraphs.append(
+            f"Likely OT communication initiators (HMI / SCADA / engineering workstations): "
+            f"{init_text}.  These hosts generated the majority of outbound OT protocol traffic "
+            f"and appear to represent the control or management tier.  Validate their roles "
+            f"with site staff before treating them as confirmed sources."
+        )
+
+    if ot_responders:
+        resp_text = ", ".join(
+            f"{d.ip} ({d.inferred_role})" for d in ot_responders[:3]
+        )
+        paragraphs.append(
+            f"Likely OT servers / controllers (PLCs, RTUs, field devices): "
+            f"{resp_text}.  These hosts predominantly responded to requests on OT protocol "
+            f"ports and appear to represent the field or control layer.  Validate physical "
+            f"device identification with site staff."
+        )
+
+    if it_noise_on_ot:
+        paragraphs.append(
+            "IT-style broadcast protocols (mDNS, LLMNR, NBNS, SSDP) were observed on what "
+            "appear to be OT network segments.  These originate from Windows-based HMIs or "
+            "engineering workstations but may also indicate insufficient segmentation between "
+            "IT and OT zones or the presence of unauthorized IT devices on OT subnets."
+        )
+
+    ephemeral_count = sum(
+        1 for c in session.connections.values()
+        if c.destination_port and int(c.destination_port) > 49151
+    )
+    if ephemeral_count > 10:
+        paragraphs.append(
+            f"{ephemeral_count:,} flows use high ephemeral destination ports (>49151).  "
+            "These are typically response-side ports on the initiating host — not "
+            "independently meaningful services — and do not require individual firewall rules."
+        )
+
+    paragraphs.append(
+        "Network zone assignments and device roles above are inferred from traffic patterns "
+        "alone.  Validate all device identifications against the site's network documentation, "
+        "asset register, and physical inspection before using this summary in a formal finding.  "
+        "Confirm whether all observed communication paths appear in the site's approved "
+        "communication matrix."
+    )
+
+    if not paragraphs:
+        paragraphs.append(
+            "Insufficient traffic was observed to draw meaningful conclusions about OT network "
+            "roles and communication patterns.  Consider retaking the capture from a point with "
+            "visibility to OT protocol traffic."
+        )
+
+    return paragraphs
 
 
 class OTPcapAnalyzer:
@@ -6885,7 +7244,8 @@ class OTPcapAnalyzer:
             lines.append(f"  {connection.source_ip} -> {connection.destination_ip} : {connection.protocol}/{connection.destination_port} ({connection.packet_count} pkts){marker}")
         return "\n".join(lines)
 
-    def generate_report(self) -> Path:
+
+    def generate_report(self, technical_appendix: bool = False) -> Path:
         """Generate the Word report, with plain-text fallback on failure."""
         assert self.session is not None
         report_date = datetime.now().strftime("%Y%m%d")
@@ -6928,12 +7288,18 @@ class OTPcapAnalyzer:
             from docx.oxml.ns import qn
             from docx.oxml import OxmlElement
 
-            # ---- Inline table-styling helpers -------------------------
-            # These closures capture qn / OxmlElement / RGBColor from the
-            # enclosing scope so they can be called anywhere below without
-            # re-importing or threading extra arguments through each call.
-            _HDR_COLOR = "2E5F8A"   # header row fill (dark professional blue)
-            _HDR_TXT   = RGBColor(0xFF, 0xFF, 0xFF)  # white text on header
+            # ---- Shared styling helpers ----------------------------------------
+            _HDR_COLOR = "2E5F8A"
+            _HDR_TXT   = RGBColor(0xFF, 0xFF, 0xFF)
+            _SEV_COLOR = {
+                SEVERITY_INTRUSION:   RGBColor(0xB0, 0x00, 0x20),
+                SEVERITY_CRITICAL:    RGBColor(0xCC, 0x00, 0x00),
+                SEVERITY_CORRELATION: RGBColor(0x00, 0x55, 0xAA),
+                SEVERITY_HIGH:        RGBColor(0xE0, 0x73, 0x00),
+                SEVERITY_MEDIUM:      RGBColor(0xC4, 0x9A, 0x00),
+                SEVERITY_LOW:         RGBColor(0x55, 0x55, 0x55),
+                SEVERITY_INFO:        RGBColor(0x88, 0x88, 0x88),
+            }
 
             def _shade_cell(cell, fill_hex: str) -> None:
                 tc = cell._tc
@@ -6945,7 +7311,6 @@ class OTPcapAnalyzer:
                 tcPr.append(shd)
 
             def _style_table(tbl, hdr_color: str = _HDR_COLOR) -> None:
-                """Apply Table Grid style and shade/bold the header row."""
                 tbl.style = "Table Grid"
                 if not tbl.rows:
                     return
@@ -6956,10 +7321,20 @@ class OTPcapAnalyzer:
                             run.bold = True
                             run.font.color.rgb = _HDR_TXT
 
+            def _add_kv_table(rows_data):
+                """Add a 2-col key/value table with no header row."""
+                if not rows_data:
+                    return
+                tbl = document.add_table(rows=len(rows_data), cols=2)
+                tbl.style = "Table Grid"
+                for i, (k, v) in enumerate(rows_data):
+                    cells = tbl.rows[i].cells
+                    cells[0].text = k
+                    for run in cells[0].paragraphs[0].runs:
+                        run.bold = True
+                    cells[1].text = v or "—"
+
             document = Document()
-            # Embed authorship into the .docx file's core properties.
-            # These appear in File → Properties / Get Info on every system
-            # and are cleanly preserved across copy, email, and re-save.
             try:
                 cp = document.core_properties
                 cp.author = __author__
@@ -6973,31 +7348,37 @@ class OTPcapAnalyzer:
                 cp.category = "OT/ICS Security Assessment"
             except Exception:
                 pass
-            title = document.add_heading(f"{TOOL_NAME} Report", level=0)
-            title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            meta_table = document.add_table(rows=4, cols=2)
+
+            # ================================================================
+            # 1. COVER PAGE
+            # ================================================================
+            title_para = document.add_heading(f"{TOOL_NAME} — OT/ICS Security Assessment", level=0)
+            title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            sub_para = document.add_paragraph()
+            sub_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            sub_run = sub_para.add_run(
+                "Audit Workpaper  ·  DRAFT — Validate all findings with site personnel before reporting"
+            )
+            sub_run.italic = True
+            meta_table = document.add_table(rows=5, cols=2)
             _style_table(meta_table)
-            _meta_rows = [
-                ("Site",      self.session.site),
-                ("Assessor",  self.session.assessor),
-                ("Session",   self.session.name),
-                ("Generated", utc_now_iso()),
-            ]
-            for i, (label, value) in enumerate(_meta_rows):
+            for i, (label, value) in enumerate([
+                ("Site",        self.session.site or "—"),
+                ("Assessor",    self.session.assessor or "—"),
+                ("Session",     self.session.name or "—"),
+                ("Generated",   utc_now_iso()),
+                ("Risk Score",  f"{risk['score']} ({risk['band']})"),
+            ]):
                 meta_table.rows[i].cells[0].text = label
-                meta_table.rows[i].cells[1].text = value or "—"
-            # Visible authorship line so credit-stripping requires
-            # editing the document, not just the source code.
+                meta_table.rows[i].cells[1].text = value
             tool_credit_p = document.add_paragraph()
             tool_credit_run = tool_credit_p.add_run(
                 f"Analysis Tool: {TOOL_NAME} v{VERSION} — authored by {__author__}.  {__copyright__}"
             )
             tool_credit_run.italic = True
+            document.add_page_break()
 
-            # ---- Auto-generated Table of Contents (item #7) -----------
-            # Insert a TOC field that Word populates on document open
-            # (or via right-click → Update Field).  python-docx has no
-            # native TOC support, so we build the field XML directly.
+            # ---- Table of Contents ----
             document.add_heading("Table of Contents", level=1)
             toc_para = document.add_paragraph()
             toc_run = toc_para.add_run()
@@ -7005,7 +7386,7 @@ class OTPcapAnalyzer:
             fldChar1.set(qn("w:fldCharType"), "begin")
             instrText = OxmlElement("w:instrText")
             instrText.set(qn("xml:space"), "preserve")
-            instrText.text = r'TOC \o "1-2" \h \z \u'  # H1 + H2, hyperlinks, hide tab leader
+            instrText.text = r'TOC \o "1-2" \h \z \u'
             fldChar2 = OxmlElement("w:fldChar")
             fldChar2.set(qn("w:fldCharType"), "separate")
             placeholder = OxmlElement("w:t")
@@ -7016,47 +7397,58 @@ class OTPcapAnalyzer:
                 toc_run._r.append(el)
             document.add_page_break()
 
-            # ---- Executive Summary (item #6) --------------------------
-            # One-page snapshot for the reader who needs the bottom line
-            # before diving into the detail.
+            # ================================================================
+            # 2. EXECUTIVE SUMMARY
+            # ================================================================
             document.add_heading("Executive Summary", level=1)
             counts = risk.get("counts", {})
-            sev_summary_parts = []
-            for sev_key in (SEVERITY_INTRUSION, SEVERITY_CRITICAL, SEVERITY_CORRELATION,
-                            SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_LOW, SEVERITY_INFO):
-                if counts.get(sev_key):
-                    sev_summary_parts.append(f"{counts[sev_key]} {sev_key}")
-            sev_line = " · ".join(sev_summary_parts) if sev_summary_parts else "no findings emitted"
-            document.add_paragraph(
-                f"Overall Risk Score: {risk['score']} ({risk['band']}) — {sev_line}."
+            sev_parts = []
+            for sev in (SEVERITY_INTRUSION, SEVERITY_CRITICAL, SEVERITY_CORRELATION,
+                        SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_LOW, SEVERITY_INFO):
+                if counts.get(sev):
+                    sev_parts.append(f"{counts[sev]} {sev}")
+            sev_line = " · ".join(sev_parts) if sev_parts else "no findings"
+            top_risk_items = self.compute_per_device_risk(top_n=5)
+            top_asset_text = ""
+            if top_risk_items:
+                top_asset_text = "; ".join(
+                    f"{item['ip']} ({item['role']}, score {item['score']})"
+                    for item in top_risk_items[:3]
+                )
+            highest_finding = max(
+                (f for f in self.session.findings),
+                key=lambda f: SEVERITY_ORDER.get(f.severity, 0),
+                default=None,
             )
-            # Surface up to 3 high-severity narrative lines so the
-            # attack chain story lands on page 1.
+            document.add_paragraph(
+                f"Risk Score: {risk['score']} ({risk['band']}).  "
+                f"Finding breakdown: {sev_line}."
+            )
+            if top_asset_text:
+                document.add_paragraph(f"Top affected assets: {top_asset_text}.")
+            if highest_finding:
+                document.add_paragraph(
+                    f"The primary security concern in this capture is in the "
+                    f"{highest_finding.category} category.  The highest-severity finding is: "
+                    f"{highest_finding.title}.  "
+                    "Because OT traffic is highly context-dependent, the auditor should "
+                    "validate asset roles, maintenance windows, and approved communications "
+                    "with site personnel before concluding that any finding represents "
+                    "malicious activity."
+                )
             narrative_lines = [ln for ln in (correlation_lines or []) if ln.startswith("⚠")]
             if narrative_lines:
-                document.add_paragraph("Key Attack Chain Narratives:")
+                document.add_paragraph("Attack Chain Indicators:")
                 for ln in narrative_lines[:3]:
                     document.add_paragraph(ln, style="List Bullet")
-            # Top-5 affected hosts by severity-weighted score
-            top_risk_for_summary = self.compute_per_device_risk(top_n=5)
-            if top_risk_for_summary:
-                document.add_paragraph("Top 5 Affected Hosts:")
-                for item in top_risk_for_summary:
-                    document.add_paragraph(
-                        f"{item['ip']} ({item['role']}) — score {item['score']}, "
-                        f"{item['critical']} critical / {item['high']} high / "
-                        f"{item['findings']} total findings",
-                        style="List Bullet",
-                    )
-            # What you should do next: top-3 fix recommendations from the
-            # highest-severity scored findings (skipping informational).
             actionable = [
                 f for f in self.session.findings
-                if f.severity in {SEVERITY_INTRUSION, SEVERITY_CRITICAL, SEVERITY_HIGH, SEVERITY_CORRELATION}
+                if f.severity in {SEVERITY_INTRUSION, SEVERITY_CRITICAL,
+                                   SEVERITY_HIGH, SEVERITY_CORRELATION}
             ]
             actionable.sort(key=lambda f: SEVERITY_ORDER.get(f.severity, 0), reverse=True)
             if actionable:
-                document.add_paragraph("What to Do Next:")
+                document.add_paragraph("Immediate Next Steps:")
                 seen_titles: set = set()
                 for f in actionable:
                     if f.title in seen_titles:
@@ -7068,250 +7460,282 @@ class OTPcapAnalyzer:
                         f"{f.title} — {recommended_fix_for_finding(f)}",
                         style="List Bullet",
                     )
-            # Reference to artifacts
             document.add_paragraph(
-                "Companion Artifacts: a JSON addendum (machine-readable findings), "
-                "a Device Inventory CSV (full device list), and a Flow Allowlist CSV "
-                "(observed flow tuples for segmentation policy) are written next to this report."
+                "Companion artifacts generated alongside this report: "
+                "JSON addendum (complete machine-readable findings), "
+                "Device Inventory CSV (full asset list), "
+                "Flow Allowlist CSV (observed flow tuples for segmentation review).  "
+                + ("Appendix B (detailed technical evidence) is included at the end of this report."
+                   if technical_appendix else
+                   "Use --technical-appendix when generating the report to include "
+                   "Appendix B with detailed packet-level evidence.")
             )
             document.add_page_break()
 
-            document.add_heading("Risk Summary", level=1)
-            document.add_paragraph(f"Overall Risk Score: {risk['score']} ({risk['band']})")
-            _sev_fill = {
-                SEVERITY_INTRUSION:  "B00020",
-                SEVERITY_CRITICAL:   "CC0000",
-                SEVERITY_CORRELATION:"005599",
-                SEVERITY_HIGH:       "C05800",
-                SEVERITY_MEDIUM:     "8B6E00",
-                SEVERITY_LOW:        "555555",
-                SEVERITY_INFO:       "888888",
-            }
-            _sev_weight = {sev: SCORE_WEIGHTS.get(sev, 0) for sev in _sev_fill}
-            risk_sev_table = document.add_table(rows=1, cols=3)
-            _style_table(risk_sev_table)
-            _rsh = risk_sev_table.rows[0].cells
-            _rsh[0].text = "Severity"
-            _rsh[1].text = "Count"
-            _rsh[2].text = "Score Contribution"
-            for sev in (SEVERITY_INTRUSION, SEVERITY_CRITICAL, SEVERITY_CORRELATION,
-                        SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_LOW, SEVERITY_INFO):
-                cnt = risk["counts"].get(sev, 0)
-                if cnt == 0:
-                    continue
-                _rsr = risk_sev_table.add_row().cells
-                _rsr[0].text = sev
-                _rsr[1].text = str(cnt)
-                _rsr[2].text = str(cnt * _sev_weight.get(sev, 0))
-                fill = _sev_fill.get(sev, "444444")
-                for cell in _rsr:
-                    _shade_cell(cell, fill)
-                    for para in cell.paragraphs:
-                        for run in para.runs:
-                            run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-            document.add_heading("Environment Discovery", level=1)
+            # ================================================================
+            # 3. ENVIRONMENT DISCOVERY / CONTEXT
+            # ================================================================
+            document.add_heading("Environment Discovery and Context", level=1)
+            document.add_paragraph(
+                "Answers provided at session start.  These inform the analysis and should be "
+                "validated against the actual site configuration."
+            )
             _env_items = list(self.session.environment_answers.items())
             if _env_items:
                 env_table = document.add_table(rows=1, cols=2)
                 _style_table(env_table)
-                env_table.rows[0].cells[0].text = "Question"
-                env_table.rows[0].cells[1].text = "Answer"
+                env_table.rows[0].cells[0].text = "Parameter"
+                env_table.rows[0].cells[1].text = "Value"
                 for key, value in _env_items:
                     _er = env_table.add_row().cells
                     _er[0].text = key.replace("_", " ").title()
                     _er[1].text = value or "(not provided)"
             else:
                 document.add_paragraph("No environment discovery answers were recorded.")
-            document.add_heading("Correlation Summary", level=1)
-            if correlation_lines:
-                for line in correlation_lines:
-                    document.add_paragraph(line, style="List Bullet")
-            else:
-                document.add_paragraph("No higher-order correlations were automatically identified beyond the individual findings.")
-            document.add_heading("Suggested Controls", level=1)
-            if protection_findings:
-                for finding in protection_findings[:10]:
-                    document.add_paragraph(f"{finding.title}: {recommended_fix_for_finding(finding)}", style="List Bullet")
-            else:
-                document.add_paragraph("No additional control recommendations were generated from the current findings set.")
 
-            # ---- Findings: grouped by category (item #2) --------------
-            # Build a category → categorized helper so we can render an H2
-            # heading for each category and emit the issues underneath.
-            # Issues are already sorted by severity desc, then category,
-            # then title (see aggregated_report_issues).  Re-bucket here.
-            full_session_pcap_set = frozenset(self.session.processed_pcaps.keys())
-            full_session_pcap_count = len(full_session_pcap_set)
+            # ================================================================
+            # 4. KEY OT CONCEPTS FOR IT AUDITORS
+            # ================================================================
+            document.add_heading("Key OT Concepts for IT Auditors", level=1)
+            document.add_paragraph(
+                "Brief context on OT/ICS network behavior for auditors with IT backgrounds."
+            )
+            ot_concepts = [
+                ("PLCs and HMIs communicate differently from IT systems",
+                 "OT devices operate in tightly controlled, deterministic cycles.  "
+                 "Changes in timing, polling frequency, or the registers accessed can be "
+                 "operationally significant even when raw packet counts look unremarkable."),
+                ("Modbus TCP lacks modern security features",
+                 "Modbus TCP — the most common OT protocol — has no built-in authentication, "
+                 "encryption, or authorization.  Any host that can reach TCP port 502 can read "
+                 "or write process data.  This is by design for isolation, not acceptable where "
+                 "network segmentation is incomplete."),
+                ("Engineering workstations may legitimately perform broad reads",
+                 "An engineer commissioning, troubleshooting, or calibrating a PLC may issue "
+                 "sequential reads across many registers — behavior that resembles reconnaissance "
+                 "from an IT perspective.  Always confirm whether a maintenance window was active "
+                 "before treating broad reads as malicious."),
+                ("Inferred device roles require site validation",
+                 "This tool infers whether a host is a PLC, HMI, historian, or engineering "
+                 "workstation based on traffic patterns.  These are probabilistic inferences, "
+                 "not facts.  Validate all device roles with site staff and physical inspection."),
+                ("OT remediation requires operational coordination",
+                 "Blocking a Modbus flow or shutting down a device without coordination with "
+                 "operations can halt production, disable safety monitoring, or cause physical "
+                 "process upsets.  All OT remediation must be planned with the process owner."),
+                ("A technically suspicious finding may be operationally normal",
+                 "A finding rated HIGH by this tool may be fully explained by approved "
+                 "maintenance, a scheduled data-export job, or a vendor support connection.  "
+                 "The auditor's task is to determine whether each finding is a gap or an "
+                 "authorized behavior."),
+            ]
+            for concept_title, concept_body in ot_concepts:
+                p = document.add_paragraph(style="List Bullet")
+                run_t = p.add_run(f"{concept_title}: ")
+                run_t.bold = True
+                p.add_run(concept_body)
+
+            # ================================================================
+            # 5. PRIORITY FINDINGS
+            # ================================================================
+            document.add_heading("Priority Findings", level=1)
+            document.add_paragraph(
+                "Findings are grouped by category and ordered by severity.  "
+                "CRITICAL and HIGH findings receive full detail below.  "
+                "Lower-severity findings within the same category are summarized.  "
+                "Complete structured findings are in the JSON addendum.  "
+                "Wireshark investigation steps are in Appendix A."
+            )
+
+            # Assign sequential human-readable IDs
+            issue_ids: Dict[Tuple[str, str], str] = {}
+            id_counters: Dict[str, int] = defaultdict(int)
+            for issue in report_issues:
+                prefix = _finding_id_prefix(issue["category"])
+                id_counters[prefix] += 1
+                issue_ids[(issue["category"], issue["title"])] = (
+                    f"{prefix}-{id_counters[prefix]:03d}"
+                )
+
+            # Re-bucket by category
             issues_by_category: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
             for issue in report_issues:
                 issues_by_category[issue["category"]].append(issue)
-            # Order categories by severity-of-most-severe-issue, then
-            # alphabetically — keeps INTRUSION/CRITICAL groups at the top.
-            def _category_priority(cat: str) -> Tuple[int, str]:
-                cat_issues = issues_by_category[cat]
-                top_sev = max((SEVERITY_ORDER.get(i["severity"], 0) for i in cat_issues), default=0)
+
+            def _cat_priority(cat: str) -> Tuple[int, str]:
+                top_sev = max(
+                    (SEVERITY_ORDER.get(i["severity"], 0)
+                     for i in issues_by_category[cat]),
+                    default=0,
+                )
                 return (-top_sev, cat)
-            ordered_categories = sorted(issues_by_category.keys(), key=_category_priority)
 
-            # Track which finding categories appear so the Wireshark
-            # appendix at the end only includes guides for categories
-            # that actually fired.
+            ordered_categories = sorted(issues_by_category.keys(), key=_cat_priority)
             wireshark_categories_used: Dict[str, Tuple[str, List[str]]] = {}
+            EVIDENCE_CAP_FULL = 5
+            EVIDENCE_CAP_ABBREV = 3
+            EP_CAP = 20
 
-            document.add_heading("Findings", level=1)
-            document.add_paragraph(
-                "Findings are grouped by category. Within each category, items are sorted "
-                "by severity. Per-finding 'Wireshark Investigation' detail has been "
-                "consolidated into Appendix A at the end of this report; each finding "
-                "links to the appropriate appendix entry."
-            )
+            def _ep_str(src_ips, dst_ips) -> str:
+                ep = list(dict.fromkeys(sorted(src_ips) + sorted(dst_ips)))
+                if len(ep) > EP_CAP:
+                    return (", ".join(ep[:EP_CAP])
+                            + f" (+{len(ep) - EP_CAP} more — see Device Inventory CSV)")
+                return ", ".join(ep) if ep else "—"
+
+            def _roles_str(src_ips, dst_ips) -> str:
+                def _fmt(ips):
+                    parts = []
+                    for ip in list(ips)[:2]:
+                        dev = self.session.devices.get(ip)
+                        parts.append(
+                            f"{ip} ({dev.inferred_role})"
+                            if dev and dev.inferred_role else ip
+                        )
+                    return ", ".join(parts)
+                src = _fmt(src_ips)
+                dst = _fmt(dst_ips)
+                return f"{src} → {dst}" if dst else src
+
+            def _mitre_str(finding) -> str:
+                if not finding.mitre_ids:
+                    return "—"
+                parts = []
+                for tid in finding.mitre_ids[:4]:
+                    name = _MITRE_ICS_NAMES.get(tid, "")
+                    parts.append(f"{tid} – {name}" if name else tid)
+                return "; ".join(parts)
+
+            def _render_full_finding(issue: Dict[str, Any], fid: str) -> None:
+                representative = issue["findings"][0]
+                sev = issue["severity"]
+                color = _SEV_COLOR.get(sev, RGBColor(0x44, 0x44, 0x44))
+                ws_filter, ws_steps = wireshark_steps_for_finding(representative)
+                appendix_key = issue["category"]
+                if ws_steps:
+                    wireshark_categories_used[appendix_key] = (ws_filter, ws_steps)
+                ws_ref = f"Appendix A — {appendix_key}" if ws_steps else "Appendix A"
+
+                h3 = document.add_heading(level=3)
+                h3_run = h3.add_run(f"[{sev}]  {issue['title']}")
+                h3_run.font.color.rgb = color
+
+                meta_rows = [
+                    ("Finding ID",              fid),
+                    ("Affected Assets",         _ep_str(issue["source_ips"], issue["destination_ips"])),
+                    ("Inferred OT Roles",       _roles_str(issue["source_ips"], issue["destination_ips"])),
+                    ("Category",                issue["category"]),
+                    ("MITRE ATT&CK for ICS",    _mitre_str(representative)),
+                    ("Advisory References",     "; ".join(representative.advisory_refs[:3])
+                                                if representative.advisory_refs else "—"),
+                    ("Detection Confidence",    detection_confidence_for_finding(representative)),
+                    ("Maliciousness Confidence",maliciousness_confidence_for_finding(representative)),
+                    ("Operational Context",     "Yes — validate with site personnel"),
+                ]
+                _add_kv_table([(k, v) for k, v in meta_rows if v and v != "—"])
+
+                document.add_heading("What Was Observed", level=4)
+                document.add_paragraph(issue["description"])
+
+                document.add_heading("OT Significance", level=4)
+                document.add_paragraph(ot_significance_for_finding(representative))
+
+                document.add_heading("Key Evidence", level=4)
+                for line in issue["evidence"][:EVIDENCE_CAP_FULL]:
+                    document.add_paragraph(line, style="List Bullet")
+                if len(issue["evidence"]) > EVIDENCE_CAP_FULL:
+                    document.add_paragraph(
+                        f"(+{len(issue['evidence']) - EVIDENCE_CAP_FULL} additional "
+                        f"evidence lines in JSON finding {fid})",
+                        style="List Bullet",
+                    )
+
+                document.add_heading("Auditor Guidance", level=4)
+                for bullet in auditor_guidance_for_finding(representative):
+                    document.add_paragraph(bullet, style="List Bullet")
+
+                benign_p = document.add_paragraph()
+                benign_p.add_run("What Would Make This Benign: ").bold = True
+                benign_p.add_run(benign_explanation_for_finding(representative))
+
+                fix_p = document.add_paragraph()
+                fix_p.add_run("Recommended Action: ").bold = True
+                fix_p.add_run(recommended_fix_for_finding(representative))
+
+                detail_parts = [f"JSON finding {fid}", ws_ref]
+                if technical_appendix:
+                    detail_parts.append(f"Appendix B — {fid}")
+                detail_p = document.add_paragraph()
+                detail_r = detail_p.add_run(
+                    "Details: See " + " · ".join(detail_parts) + "."
+                )
+                detail_r.italic = True
+
+            def _render_abbrev_finding(issue: Dict[str, Any], fid: str) -> None:
+                representative = issue["findings"][0]
+                sev = issue["severity"]
+                color = _SEV_COLOR.get(sev, RGBColor(0x44, 0x44, 0x44))
+                ws_filter, ws_steps = wireshark_steps_for_finding(representative)
+                if ws_steps:
+                    wireshark_categories_used[issue["category"]] = (ws_filter, ws_steps)
+
+                p = document.add_paragraph()
+                title_run = p.add_run(f"[{sev}] {issue['title']}  ({fid})")
+                title_run.bold = True
+                title_run.font.color.rgb = color
+
+                meta_line = f"Assets: {_ep_str(issue['source_ips'], issue['destination_ips'])}"
+                if representative.mitre_ids:
+                    meta_line += f"  |  MITRE: {', '.join(representative.mitre_ids[:2])}"
+                mp = document.add_paragraph(meta_line)
+                if mp.runs:
+                    mp.runs[0].font.size = Pt(9)
+
+                document.add_paragraph(issue["description"])
+                for line in issue["evidence"][:EVIDENCE_CAP_ABBREV]:
+                    document.add_paragraph(line, style="List Bullet")
+                fix_p = document.add_paragraph()
+                fix_p.add_run("Action: ").bold = True
+                fix_p.add_run(recommended_fix_for_finding(representative))
+
             for category_name in ordered_categories:
                 cat_issues = issues_by_category[category_name]
-                cat_count = len(cat_issues)
-                cat_top_sev = max(cat_issues, key=lambda i: SEVERITY_ORDER.get(i["severity"], 0))["severity"]
+                cat_top_sev = max(
+                    cat_issues,
+                    key=lambda i: SEVERITY_ORDER.get(i["severity"], 0),
+                )["severity"]
                 document.add_heading(
-                    f"{category_name} — {cat_count} finding(s), top severity: {cat_top_sev}",
+                    f"{category_name}  "
+                    f"({len(cat_issues)} finding(s), top severity: {cat_top_sev})",
                     level=2,
                 )
-                for issue in cat_issues:
-                    paragraph = document.add_paragraph()
-                    run = paragraph.add_run(f"[{issue['severity']}] {issue['title']}")
-                    run.bold = True
-                    if issue["severity"] == SEVERITY_CRITICAL:
-                        run.font.color.rgb = RGBColor(0xCC, 0x00, 0x00)
-                    elif issue["severity"] == SEVERITY_HIGH:
-                        run.font.color.rgb = RGBColor(0xE0, 0x73, 0x00)
-                    elif issue["severity"] == SEVERITY_MEDIUM:
-                        run.font.color.rgb = RGBColor(0xC4, 0x9A, 0x00)
-                    elif issue["severity"] == SEVERITY_CORRELATION:
-                        run.font.color.rgb = RGBColor(0x00, 0x55, 0xAA)
-                    elif issue["severity"] == SEVERITY_INTRUSION:
-                        run.font.color.rgb = RGBColor(0xB0, 0x00, 0x20)
-                    representative = issue["findings"][0]
-                    why_text = why_this_matters_for_finding(representative)
-                    fix_text = recommended_fix_for_finding(representative)
-                    related = related_findings_for_finding(self.session, representative)
-                    # ---- Finding metadata mini-table -------------------
-                    # Build all metadata values first so the table only
-                    # gets rows that have actual content.
-                    ENDPOINT_CAP = 30
-                    PCAP_CAP = 8
-                    _endpoints_text = ""
-                    if issue["source_ips"] or issue["destination_ips"]:
-                        _ep_list = list(dict.fromkeys(
-                            sorted(issue["source_ips"]) + sorted(issue["destination_ips"])
-                        ))
-                        if len(_ep_list) > ENDPOINT_CAP:
-                            _endpoints_text = (
-                                ", ".join(_ep_list[:ENDPOINT_CAP])
-                                + f" … (+{len(_ep_list) - ENDPOINT_CAP:,} more — see Device Inventory CSV)"
-                            )
-                        else:
-                            _endpoints_text = ", ".join(_ep_list)
-                    _pcaps_text = ""
-                    if issue["source_pcaps"]:
-                        _pcaps_set = set(issue["source_pcaps"])
-                        if full_session_pcap_count > 1 and _pcaps_set >= full_session_pcap_set:
-                            _pcaps_text = f"(all {full_session_pcap_count} session pcaps)"
-                        else:
-                            _ps = sorted(issue["source_pcaps"])
-                            if len(_ps) > PCAP_CAP:
-                                _pcaps_text = (
-                                    ", ".join(_ps[:PCAP_CAP])
-                                    + f" … (+{len(_ps) - PCAP_CAP} more)"
-                                )
-                            else:
-                                _pcaps_text = ", ".join(_ps)
-                    _mitre_text  = ", ".join(representative.mitre_ids) if representative.mitre_ids else ""
-                    _advisory_text = "; ".join(representative.advisory_refs) if representative.advisory_refs else ""
-                    _related_text  = ", ".join(related) if related else ""
-                    ws_filter, ws_steps = wireshark_steps_for_finding(representative)
-                    if ws_steps:
-                        appendix_key = category_name
-                        if appendix_key not in wireshark_categories_used:
-                            wireshark_categories_used[appendix_key] = (ws_filter, ws_steps)
-                    _ws_text = f"See Appendix A — {appendix_key}." if ws_steps else ""
-                    _meta_rows_finding = [
-                        ("Severity",            issue["severity"]),
-                        ("Category",            issue["category"]),
-                        ("Affected Endpoints",  _endpoints_text),
-                        ("Source Pcaps",        _pcaps_text),
-                        ("MITRE ATT&CK",        _mitre_text),
-                        ("Advisory Refs",       _advisory_text),
-                        ("Related Findings",    _related_text),
-                        ("Wireshark",           _ws_text),
-                    ]
-                    _meta_rows_finding = [(k, v) for k, v in _meta_rows_finding if v]
-                    if _meta_rows_finding:
-                        fm_table = document.add_table(rows=1, cols=2)
-                        _style_table(fm_table)
-                        fm_table.rows[0].cells[0].text = "Field"
-                        fm_table.rows[0].cells[1].text = "Value"
-                        for _fk, _fv in _meta_rows_finding:
-                            _fr = fm_table.add_row().cells
-                            _fr[0].text = _fk
-                            _fr[1].text = _fv
-                    document.add_paragraph(issue["description"])
-                    document.add_paragraph(f"Why This Matters: {why_text}")
-                    document.add_paragraph("Evidence:")
-                    for line in issue["evidence"][:30]:
-                        document.add_paragraph(line, style="List Bullet")
-                    document.add_paragraph(f"Recommended Fix: {fix_text}")
+                full_rendered = 0
+                for idx, issue in enumerate(cat_issues):
+                    fid = issue_ids.get(
+                        (issue["category"], issue["title"]),
+                        f"FIND-{idx+1:03d}",
+                    )
+                    sev_rank = SEVERITY_ORDER.get(issue["severity"], 0)
+                    if sev_rank >= SEVERITY_ORDER.get(SEVERITY_HIGH, 3) or full_rendered == 0:
+                        _render_full_finding(issue, fid)
+                        full_rendered += 1
+                    else:
+                        _render_abbrev_finding(issue, fid)
 
-            # ---- Timeline / Attack-Chain view ------------------------
-            # Chronological ordering of findings that have a first_seen
-            # timestamp, narrowed to MEDIUM+ severity so the table is
-            # usable for incident narrative / kill-chain reconstruction.
-            severity_rank = {SEVERITY_INTRUSION: 6, SEVERITY_CRITICAL: 5, SEVERITY_CORRELATION: 4,
-                             SEVERITY_HIGH: 3, SEVERITY_MEDIUM: 2, SEVERITY_LOW: 1, SEVERITY_INFO: 0}
-            timeline_events = []
-            for finding in self.session.findings:
-                if severity_rank.get(finding.severity, 0) < 2:
-                    continue
-                if not finding.first_seen:
-                    continue
-                try:
-                    ts_val = float(finding.first_seen)
-                    ts_iso = datetime.fromtimestamp(ts_val, timezone.utc).replace(tzinfo=None).isoformat() + "Z"
-                except (TypeError, ValueError):
-                    ts_iso = finding.first_seen
-                    try:
-                        ts_val = datetime.fromisoformat(finding.first_seen.replace("Z", "+00:00")).timestamp()
-                    except Exception:
-                        ts_val = 0.0
-                timeline_events.append((ts_val, ts_iso, finding))
-            timeline_events.sort(key=lambda x: x[0])
-            if timeline_events:
-                document.add_heading("Timeline / Attack Chain", level=1)
-                document.add_paragraph(
-                    "Chronological ordering of MEDIUM-or-higher findings by first observation. "
-                    "Use this to reconstruct the sequence of activity in the capture and "
-                    "identify causal chains (reconnaissance → access → control action)."
-                )
-                tl_table = document.add_table(rows=1, cols=5)
-                _style_table(tl_table)
-                tl_hdr = tl_table.rows[0].cells
-                tl_hdr[0].text = "First Seen (UTC)"
-                tl_hdr[1].text = "Severity"
-                tl_hdr[2].text = "Title"
-                tl_hdr[3].text = "Source → Destination"
-                tl_hdr[4].text = "MITRE"
-                for _, ts_iso, finding in timeline_events[:80]:
-                    row_cells = tl_table.add_row().cells
-                    row_cells[0].text = ts_iso
-                    row_cells[1].text = finding.severity
-                    row_cells[2].text = finding.title
-                    endpoints = f"{','.join(finding.source_ips[:2])} → {','.join(finding.destination_ips[:2])}".strip(" →")
-                    row_cells[3].text = endpoints or "—"
-                    row_cells[4].text = ", ".join(finding.mitre_ids[:3])
+            # ================================================================
+            # 6. NETWORK INTERPRETATION SUMMARY
+            # ================================================================
+            document.add_heading("Network Interpretation Summary", level=1)
+            document.add_paragraph(
+                "Observed communication patterns interpreted for the auditor.  "
+                "All device roles are inferred from traffic and require site validation."
+            )
+            for para_text in build_network_interpretation_summary(self.session):
+                document.add_paragraph(para_text)
 
-            document.add_heading("Network Map", level=1)
-            document.add_paragraph("This map was inferred from observed network traffic. Device roles and zone placements are the tool's best inference from traffic behavior. Verify with site staff and update manually as needed.")
-            map_paragraph = document.add_paragraph()
-            map_run = map_paragraph.add_run(network_map)
-            map_run.font.name = "Courier New"
-            map_run.font.size = Pt(9)
-            # MITRE ATT&CK for ICS coverage summary
+            # ================================================================
+            # 7. MITRE ATT&CK FOR ICS COVERAGE
+            # ================================================================
             mitre_counts: Counter[str] = Counter()
             for finding in self.session.findings:
                 for tid in finding.mitre_ids:
@@ -7319,129 +7743,278 @@ class OTPcapAnalyzer:
             if mitre_counts:
                 document.add_heading("MITRE ATT&CK for ICS Coverage", level=1)
                 document.add_paragraph(
-                    "Techniques mapped from findings. Counts reflect how many findings "
-                    "exhibit traffic consistent with each technique."
+                    "Technique IDs mapped from findings.  Indicates which MITRE ATT&CK for ICS "
+                    "tactics are consistent with the observed traffic.  These are guidance for "
+                    "further investigation, not proof of a specific attack or noncompliance."
                 )
-                mitre_table = document.add_table(rows=1, cols=2)
+                mitre_table = document.add_table(rows=1, cols=3)
                 _style_table(mitre_table)
                 mh = mitre_table.rows[0].cells
                 mh[0].text = "Technique ID"
-                mh[1].text = "Findings"
+                mh[1].text = "Technique Name"
+                mh[2].text = "Findings"
                 for tid, cnt in mitre_counts.most_common():
                     mr = mitre_table.add_row().cells
                     mr[0].text = tid
-                    mr[1].text = str(cnt)
-            # Per-device risk table
-            top_risk = self.compute_per_device_risk(top_n=15)
-            document.add_heading("Top Riskiest Devices", level=1)
-            if top_risk:
-                document.add_paragraph(
-                    "Devices ranked by severity-weighted finding score. "
-                    "Higher scores indicate more or more-severe findings touching that IP."
-                )
-                risk_table = document.add_table(rows=1, cols=6)
-                _style_table(risk_table)
-                rh = risk_table.rows[0].cells
-                rh[0].text = "IP"
-                rh[1].text = "Role"
-                rh[2].text = "Score"
-                rh[3].text = "CRIT"
-                rh[4].text = "HIGH"
-                rh[5].text = "Top Finding"
-                for item in top_risk:
-                    rr = risk_table.add_row().cells
-                    rr[0].text = item["ip"]
-                    rr[1].text = item["role"]
-                    rr[2].text = str(item["score"])
-                    rr[3].text = str(item["critical"])
-                    rr[4].text = str(item["high"])
-                    rr[5].text = item["top_titles"][0] if item["top_titles"] else ""
-            else:
-                document.add_paragraph("No scored findings were attributable to specific devices.")
-            # Device Inventory: cap the in-document table at the top-N
-            # devices by total traffic.  On flood-scale captures (1M+
-            # source IPs) a full inventory blows the Word file up to
-            # thousands of pages; the cap keeps it readable while the
-            # always-emitted CSV addendum carries the full list.
-            document.add_heading("Device Inventory", level=1)
-            DEVICE_TABLE_CAP = 200
-            all_devices = sorted(
+                    mr[1].text = _MITRE_ICS_NAMES.get(tid, "—")
+                    mr[2].text = str(cnt)
+
+            # ================================================================
+            # 8. DEVICE INVENTORY SUMMARY
+            # ================================================================
+            document.add_heading("Device Inventory Summary", level=1)
+            all_devices_sorted = sorted(
                 self.session.devices.values(),
                 key=lambda d: (d.outgoing_count + d.incoming_count),
                 reverse=True,
             )
-            total_devices = len(all_devices)
-            shown_devices = all_devices[:DEVICE_TABLE_CAP]
-            if total_devices > DEVICE_TABLE_CAP:
-                document.add_paragraph(
-                    f"Showing the top {DEVICE_TABLE_CAP} devices by traffic volume out "
-                    f"of {total_devices:,} total. The complete device inventory is "
-                    "exported to a CSV addendum alongside this report."
-                )
-            else:
-                document.add_paragraph(f"All {total_devices:,} observed device(s).")
-            table = document.add_table(rows=1, cols=8)
-            _style_table(table)
-            headers = table.rows[0].cells
-            headers[0].text = "IP"
-            headers[1].text = "Role"
-            headers[2].text = "Zone"
-            headers[3].text = "Vendor / OS"
-            headers[4].text = "Protocols"
-            headers[5].text = "Ports"
-            headers[6].text = "VLANs"
-            headers[7].text = "Source Pcaps"
-            for device in shown_devices:
-                row = table.add_row().cells
-                row[0].text = device.ip
-                row[1].text = device.inferred_role
-                row[2].text = device.inferred_zone
-                vendor_bits: List[str] = []
-                if device.vendors:
-                    vendor_bits.append("/".join(device.vendors[:3]))
-                if device.os_fingerprint:
-                    vendor_bits.append(device.os_fingerprint)
-                row[3].text = " · ".join(vendor_bits) or "—"
-                row[4].text = ", ".join(device.protocols[:8])
-                row[5].text = ", ".join(str(port) for port in sorted(device.ports)[:12])
-                row[6].text = ", ".join(sorted(device.vlans)) or "—"
-                # Limit pcap list per row too — 15-pcap sessions made
-                # this column 800+ chars wide and pushed table past page edge.
-                pc_list = sorted(device.source_pcaps)
-                pc_text = ", ".join(pc_list[:3])
-                if len(pc_list) > 3:
-                    pc_text += f" (+{len(pc_list) - 3} more)"
-                row[7].text = pc_text
+            total_devices = len(all_devices_sorted)
+            document.add_paragraph(
+                f"Total observed devices: {total_devices:,}.  "
+                "Top 15 by traffic are shown below.  "
+                "The complete Device Inventory CSV (all devices, all fields) is written "
+                "alongside this report."
+            )
+            DEVICE_SUMMARY_CAP = 15
+            device_risk_lookup = {
+                item["ip"]: item["score"]
+                for item in self.compute_per_device_risk(top_n=50)
+            }
+            dev_sum_table = document.add_table(rows=1, cols=5)
+            _style_table(dev_sum_table)
+            dsh = dev_sum_table.rows[0].cells
+            for ci, h in enumerate(["IP", "Inferred Role", "Zone", "Protocols", "Risk Score"]):
+                dsh[ci].text = h
+            for device in all_devices_sorted[:DEVICE_SUMMARY_CAP]:
+                dr = dev_sum_table.add_row().cells
+                dr[0].text = device.ip
+                dr[1].text = device.inferred_role or "—"
+                dr[2].text = device.inferred_zone or "—"
+                dr[3].text = ", ".join(device.protocols[:5]) or "—"
+                dr[4].text = str(device_risk_lookup.get(device.ip, 0))
 
-            # ---- Appendix A: Wireshark Investigation Guides (item #1) ---
-            # The same per-category guide that used to be inlined under
-            # every finding is now rendered exactly once per category at
-            # the end of the document.  Findings link here via the
-            # "Wireshark Investigation: see Appendix A — <Category>" line.
+            # ================================================================
+            # 9. FLOW ALLOWLIST SUMMARY
+            # ================================================================
+            document.add_heading("Flow Allowlist Summary", level=1)
+            flow_count = len(self.session.connections)
+            document.add_paragraph(
+                f"A total of {flow_count:,} unique source/destination/port/protocol flow "
+                "tuples were observed.  The complete Flow Allowlist CSV is written alongside "
+                "this report and can be used as input for firewall policy review or "
+                "segmentation gap analysis.  Each row is a communication path actually "
+                "observed; flows not in the CSV but permitted by policy may indicate "
+                "unnecessary exposure."
+            )
+            document.add_paragraph(
+                "Auditor note: the Flow Allowlist does not distinguish authorized from "
+                "unauthorized flows — it is an observed inventory.  Compare it against "
+                "the site’s approved communication matrix to identify undocumented paths."
+            )
+
+            # ================================================================
+            # 10. LIMITATIONS OF ANALYSIS
+            # ================================================================
+            document.add_heading("Limitations of Analysis", level=1)
+            document.add_paragraph(
+                "The following limitations apply to all findings in this report and should "
+                "be disclosed when presenting results in a formal audit."
+            )
+            limitations = [
+                "PCAP-only analysis.  This report is based solely on observed network traffic.  "
+                "It cannot confirm asset ownership, operator intent, system purpose, or whether "
+                "observed behavior was authorized.",
+                "Inferred roles and zones require site validation.  Device roles and Purdue "
+                "model zone assignments are inferred from traffic patterns.  They must be "
+                "confirmed with site staff and physical inspection.",
+                "Maintenance window context is unknown.  The tool has no visibility into "
+                "approved maintenance windows or change records.  Anomalous-looking activity "
+                "may be fully authorized, increasing false-positive risk.",
+                "No known-good baseline.  Without a baseline from a validated normal period, "
+                "anomaly detections cannot be distinguished from normal process behavior.  "
+                "Use --compare-baseline to reduce this limitation.",
+                "Advisory and framework mappings are guidance, not findings of noncompliance.  "
+                "MITRE ATT&CK for ICS technique IDs indicate what observed behavior is "
+                "consistent with — not proof of an attack or standards violation.",
+                "OT protocol coverage is not exhaustive.  This tool covers the most common "
+                "OT/ICS protocols but may not recognize all proprietary protocols in use.",
+                "Blocking OT traffic without operational validation can disrupt physical "
+                "processes.  No remediation action should be taken without coordination with "
+                "the process owner, controls engineer, and operations management.",
+            ]
+            for lim in limitations:
+                document.add_paragraph(lim, style="List Bullet")
+
+            # ================================================================
+            # APPENDIX A: WIRESHARK INVESTIGATION GUIDE
+            # ================================================================
             if wireshark_categories_used:
                 document.add_page_break()
-                document.add_heading("Appendix A: Wireshark Investigation Guides", level=1)
+                document.add_heading("Appendix A: Wireshark Investigation Guide", level=1)
                 document.add_paragraph(
-                    "Per-category step-by-step instructions for taking a finding from "
-                    "this report into Wireshark and digging deeper. Tip: where an "
-                    "evidence line ends with @<epoch>, paste that value into Wireshark "
-                    "as `frame.time_epoch == <value>` to jump to the exact frame. "
-                    "Findings that aggregate session-level state (ARP spoof, multi-"
-                    "subnet, public-IP, VLAN) instead include an 'Observation window' "
-                    "evidence line with two epochs — use them as `frame.time_epoch >= "
-                    "A && frame.time_epoch <= B` to bracket the window."
+                    "Per-category instructions for investigating findings in Wireshark.  "
+                    "Evidence lines that end with @<epoch> can be pasted into Wireshark as "
+                    "`frame.time_epoch == <value>` to jump to the exact frame.  "
+                    "Lines with an Observation Window provide two epoch values — use "
+                    "`frame.time_epoch >= A && frame.time_epoch <= B` to bracket the window."
                 )
                 for cat in sorted(wireshark_categories_used):
-                    ws_filter, ws_steps = wireshark_categories_used[cat]
+                    ws_filter_a, ws_steps_a = wireshark_categories_used[cat]
                     document.add_heading(cat, level=2)
-                    if ws_filter:
-                        document.add_paragraph(f"Display filter: {ws_filter}")
-                    for step in ws_steps:
+                    if ws_filter_a:
+                        document.add_paragraph(f"Display filter: {ws_filter_a}")
+                    for step in ws_steps_a:
                         document.add_paragraph(step, style="List Bullet")
+
+            # ================================================================
+            # APPENDIX B: DETAILED TECHNICAL EVIDENCE (--technical-appendix)
+            # ================================================================
+            if technical_appendix:
+                document.add_page_break()
+                document.add_heading("Appendix B: Detailed Technical Evidence", level=1)
+                document.add_paragraph(
+                    "This appendix is included because --technical-appendix was specified.  "
+                    "It contains full packet-level evidence and supporting detail for all "
+                    "findings.  The main report body summarizes only the most actionable items."
+                )
+                # Timeline / Attack Chain
+                severity_rank_b = {
+                    SEVERITY_INTRUSION: 6, SEVERITY_CRITICAL: 5,
+                    SEVERITY_CORRELATION: 4, SEVERITY_HIGH: 3,
+                    SEVERITY_MEDIUM: 2, SEVERITY_LOW: 1, SEVERITY_INFO: 0,
+                }
+                timeline_events = []
+                for finding in self.session.findings:
+                    if severity_rank_b.get(finding.severity, 0) < 2 or not finding.first_seen:
+                        continue
+                    try:
+                        ts_val = float(finding.first_seen)
+                        ts_iso = (datetime.fromtimestamp(ts_val, timezone.utc)
+                                  .replace(tzinfo=None).isoformat() + "Z")
+                    except (TypeError, ValueError):
+                        ts_iso = finding.first_seen
+                        try:
+                            ts_val = datetime.fromisoformat(
+                                finding.first_seen.replace("Z", "+00:00")
+                            ).timestamp()
+                        except Exception:
+                            ts_val = 0.0
+                    timeline_events.append((ts_val, ts_iso, finding))
+                timeline_events.sort(key=lambda x: x[0])
+                if timeline_events:
+                    document.add_heading("B.1  Timeline / Attack Chain", level=2)
+                    document.add_paragraph(
+                        "Chronological ordering of MEDIUM+ findings by first observation."
+                    )
+                    tl_table = document.add_table(rows=1, cols=5)
+                    _style_table(tl_table)
+                    tl_hdr = tl_table.rows[0].cells
+                    for ci, h in enumerate(
+                        ["First Seen (UTC)", "Severity", "Title",
+                         "Source → Dest", "MITRE"]
+                    ):
+                        tl_hdr[ci].text = h
+                    for _, ts_iso_b, finding in timeline_events[:80]:
+                        rc = tl_table.add_row().cells
+                        rc[0].text = ts_iso_b
+                        rc[1].text = finding.severity
+                        rc[2].text = finding.title
+                        ep_b = (
+                            f"{','.join(finding.source_ips[:2])} "
+                            f"→ {','.join(finding.destination_ips[:2])}"
+                        ).strip(" →")
+                        rc[3].text = ep_b or "—"
+                        rc[4].text = ", ".join(finding.mitre_ids[:3])
+
+                # Full evidence for every finding
+                document.add_heading("B.2  Full Evidence by Finding", level=2)
+                for issue in report_issues:
+                    fid_b = issue_ids.get((issue["category"], issue["title"]), "?")
+                    representative_b = issue["findings"][0]
+                    bp = document.add_paragraph()
+                    brun = bp.add_run(
+                        f"[{issue['severity']}] {issue['title']}  ({fid_b})"
+                    )
+                    brun.bold = True
+                    brun.font.color.rgb = _SEV_COLOR.get(
+                        issue["severity"], RGBColor(0x44, 0x44, 0x44)
+                    )
+                    for line in issue["evidence"]:
+                        document.add_paragraph(line, style="List Bullet")
+                    fp2 = document.add_paragraph()
+                    fp2.add_run("Recommended Fix: ").bold = True
+                    fp2.add_run(recommended_fix_for_finding(representative_b))
+
+                # Full network map
+                document.add_heading("B.3  Inferred Network Map", level=2)
+                document.add_paragraph("Inferred from observed traffic.  Validate with site staff.")
+                nm_para = document.add_paragraph()
+                nm_run = nm_para.add_run(network_map)
+                nm_run.font.name = "Courier New"
+                nm_run.font.size = Pt(9)
+
+                # Top riskiest devices
+                top_risk = self.compute_per_device_risk(top_n=15)
+                if top_risk:
+                    document.add_heading("B.4  Top Riskiest Devices", level=2)
+                    risk_table = document.add_table(rows=1, cols=6)
+                    _style_table(risk_table)
+                    rh = risk_table.rows[0].cells
+                    for ci, h in enumerate(
+                        ["IP", "Role", "Score", "CRIT", "HIGH", "Top Finding"]
+                    ):
+                        rh[ci].text = h
+                    for item in top_risk:
+                        rr = risk_table.add_row().cells
+                        rr[0].text = item["ip"]
+                        rr[1].text = item["role"]
+                        rr[2].text = str(item["score"])
+                        rr[3].text = str(item["critical"])
+                        rr[4].text = str(item["high"])
+                        rr[5].text = item["top_titles"][0] if item["top_titles"] else ""
+
+                # Full device inventory
+                DEVICE_TABLE_CAP = 200
+                document.add_heading("B.5  Full Device Inventory", level=2)
+                shown_devices_b = all_devices_sorted[:DEVICE_TABLE_CAP]
+                if total_devices > DEVICE_TABLE_CAP:
+                    document.add_paragraph(
+                        f"Top {DEVICE_TABLE_CAP} by traffic out of {total_devices:,} total.  "
+                        "See Device Inventory CSV for the complete list."
+                    )
+                else:
+                    document.add_paragraph(f"All {total_devices:,} observed device(s).")
+                inv_table = document.add_table(rows=1, cols=8)
+                _style_table(inv_table)
+                inv_h = inv_table.rows[0].cells
+                for ci, h in enumerate(
+                    ["IP", "Role", "Zone", "Vendor/OS", "Protocols", "Ports", "VLANs", "Pcaps"]
+                ):
+                    inv_h[ci].text = h
+                for device in shown_devices_b:
+                    dr = inv_table.add_row().cells
+                    dr[0].text = device.ip
+                    dr[1].text = device.inferred_role
+                    dr[2].text = device.inferred_zone
+                    vendor_bits: List[str] = []
+                    if device.vendors:
+                        vendor_bits.append("/".join(device.vendors[:3]))
+                    if device.os_fingerprint:
+                        vendor_bits.append(device.os_fingerprint)
+                    dr[3].text = " · ".join(vendor_bits) or "—"
+                    dr[4].text = ", ".join(device.protocols[:8])
+                    dr[5].text = ", ".join(str(p) for p in sorted(device.ports)[:12])
+                    dr[6].text = ", ".join(sorted(device.vlans)) or "—"
+                    pc_list = sorted(device.source_pcaps)
+                    pc_text = ", ".join(pc_list[:3])
+                    if len(pc_list) > 3:
+                        pc_text += f" (+{len(pc_list) - 3} more)"
+                    dr[7].text = pc_text
 
             document.save(report_path)
             print(colorize(f"[✓] Word report generated: {report_path}", "SUCCESS"))
             return report_path
+
         except Exception as exc:
             fallback_path = report_path.with_suffix(".txt")
             fallback_text = [
@@ -7956,6 +8529,15 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         choices=["word", "json", "both"], default="word",
         help="Report format produced at the end of a --scan run (default: word).",
     )
+    parser.add_argument(
+        "--technical-appendix", dest="technical_appendix",
+        action="store_true", default=False,
+        help=(
+            "Include Appendix B (Detailed Technical Evidence) in the Word report.  "
+            "By default the main report is concise; use this flag when reviewers need "
+            "full raw evidence lines and per-pcap breakdown."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -7972,6 +8554,7 @@ def prompt_report_generation(
     analyzer: OTPcapAnalyzer,
     prompt_text: str = "Generate report now?",
     fmt: Optional[str] = None,
+    technical_appendix: bool = False,
 ) -> None:
     """Ask which report format(s) to produce and generate them.
 
@@ -7987,10 +8570,10 @@ def prompt_report_generation(
     if fmt in {"j", "json"}:
         analyzer.generate_json_report()
     elif fmt in {"b", "both"}:
-        analyzer.generate_report()
+        analyzer.generate_report(technical_appendix=technical_appendix)
         analyzer.generate_json_report()
     else:
-        analyzer.generate_report()
+        analyzer.generate_report(technical_appendix=technical_appendix)
 
 
 def scan_flow(analyzer: OTPcapAnalyzer, config: Dict[str, Any], args: argparse.Namespace) -> None:
@@ -8025,7 +8608,11 @@ def scan_flow(analyzer: OTPcapAnalyzer, config: Dict[str, Any], args: argparse.N
 
     print_header("Analysis Start")
     analyzer.analyze_pcaps(selected_pcaps)
-    prompt_report_generation(analyzer, fmt=getattr(args, "report_format", "word"))
+    prompt_report_generation(
+        analyzer,
+        fmt=getattr(args, "report_format", "word"),
+        technical_appendix=getattr(args, "technical_appendix", False),
+    )
 
 
 def new_session_flow(
@@ -8035,6 +8622,7 @@ def new_session_flow(
     assessor_hint: Optional[str] = None,
     site_hint: Optional[str] = None,
     env_hint: Optional[str] = None,
+    technical_appendix: bool = False,
 ) -> None:
     """Create and run a new session."""
     if starting_pcap:
@@ -8065,10 +8653,10 @@ def new_session_flow(
     save_config(config)
     print_header("Analysis Start")
     analyzer.analyze_pcaps(selected_pcaps)
-    prompt_report_generation(analyzer, "Generate report now?")
+    prompt_report_generation(analyzer, "Generate report now?", technical_appendix=technical_appendix)
 
 
-def resume_flow(analyzer: OTPcapAnalyzer, config: Dict[str, Any], session_path: Optional[Path] = None) -> None:
+def resume_flow(analyzer: OTPcapAnalyzer, config: Dict[str, Any], session_path: Optional[Path] = None, technical_appendix: bool = False) -> None:
     """Resume or inspect an existing session."""
     if session_path is None:
         folder_text = prompt_input("Folder containing the session file", config.get("last_pcap_folder") or None)
@@ -8084,13 +8672,13 @@ def resume_flow(analyzer: OTPcapAnalyzer, config: Dict[str, Any], session_path: 
         if answer.startswith("r"):
             existing_paths = [Path(item.path) for item in session.processed_pcaps.values() if Path(item.path).exists()]
             analyzer.analyze_pcaps(existing_paths)
-            prompt_report_generation(analyzer, "Generate updated report now?")
+            prompt_report_generation(analyzer, "Generate updated report now?", technical_appendix=technical_appendix)
             return
         if answer.startswith("a"):
-            add_pcaps_flow(analyzer, config, session_path)
+            add_pcaps_flow(analyzer, config, session_path, technical_appendix=technical_appendix)
             return
         if answer.startswith("g"):
-            prompt_report_generation(analyzer, "Generate report?")
+            prompt_report_generation(analyzer, "Generate report?", technical_appendix=technical_appendix)
             return
         if answer.startswith("f"):
             for finding in sorted(session.findings, key=lambda item: (SEVERITY_ORDER.get(item.severity, 0), item.title), reverse=True):
@@ -8102,7 +8690,7 @@ def resume_flow(analyzer: OTPcapAnalyzer, config: Dict[str, Any], session_path: 
         return
 
 
-def add_pcaps_flow(analyzer: OTPcapAnalyzer, config: Dict[str, Any], session_path: Optional[Path] = None) -> None:
+def add_pcaps_flow(analyzer: OTPcapAnalyzer, config: Dict[str, Any], session_path: Optional[Path] = None, technical_appendix: bool = False) -> None:
     """Add new pcaps to an existing session without reprocessing old ones."""
     if session_path is None:
         folder_text = prompt_input("Folder containing the session file", config.get("last_pcap_folder") or None)
@@ -8118,14 +8706,14 @@ def add_pcaps_flow(analyzer: OTPcapAnalyzer, config: Dict[str, Any], session_pat
     if not selected_pcaps:
         raise SystemExit("No new pcaps selected.")
     analyzer.analyze_pcaps(selected_pcaps)
-    prompt_report_generation(analyzer, "Regenerate report now?")
+    prompt_report_generation(analyzer, "Regenerate report now?", technical_appendix=technical_appendix)
 
 
-def report_only_flow(analyzer: OTPcapAnalyzer, session_path: Path) -> None:
+def report_only_flow(analyzer: OTPcapAnalyzer, session_path: Path, technical_appendix: bool = False) -> None:
     """Generate a report from saved state only."""
     session = analyzer.load_session(session_path)
     session_summary(session)
-    prompt_report_generation(analyzer, "Generate report?")
+    prompt_report_generation(analyzer, "Generate report?", technical_appendix=technical_appendix)
 
 
 def run_application(args: argparse.Namespace) -> None:
@@ -8144,8 +8732,9 @@ def run_application(args: argparse.Namespace) -> None:
     signal.signal(signal.SIGINT, signal_handler)
     print_banner()
     print_network_safety_banner()
+    ta = getattr(args, "technical_appendix", False)
     if args.report_only:
-        report_only_flow(analyzer, Path(args.report_only).expanduser())
+        report_only_flow(analyzer, Path(args.report_only).expanduser(), technical_appendix=ta)
         return
     # Baseline-only shortcuts: operate against an existing session file
     if args.save_baseline or args.compare_baseline:
@@ -8165,7 +8754,7 @@ def run_application(args: argparse.Namespace) -> None:
         scan_flow(analyzer, config, args)
         return
     if args.session:
-        resume_flow(analyzer, config, Path(args.session).expanduser())
+        resume_flow(analyzer, config, Path(args.session).expanduser(), technical_appendix=ta)
         return
     if args.pcap:
         new_session_flow(
@@ -8174,19 +8763,21 @@ def run_application(args: argparse.Namespace) -> None:
             assessor_hint=getattr(args, "assessor", None),
             site_hint=getattr(args, "site", None),
             env_hint=getattr(args, "env", None),
+            technical_appendix=ta,
         )
         return
     mode = startup_menu()
     if mode == "resume":
-        resume_flow(analyzer, config)
+        resume_flow(analyzer, config, technical_appendix=ta)
     elif mode == "add":
-        add_pcaps_flow(analyzer, config)
+        add_pcaps_flow(analyzer, config, technical_appendix=ta)
     else:
         new_session_flow(
             analyzer, config,
             assessor_hint=getattr(args, "assessor", None),
             site_hint=getattr(args, "site", None),
             env_hint=getattr(args, "env", None),
+            technical_appendix=ta,
         )
 
 
