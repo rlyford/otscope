@@ -8035,6 +8035,8 @@ def new_session_flow(
     """Create and run a new session."""
     default_folder = str(starting_pcap.parent) if starting_pcap else config.get("last_pcap_folder", "")
     if not default_folder:
+        if _PCAPS_ROOT.is_dir():
+            default_folder = str(_PCAPS_ROOT)
         _print_pcap_subfolders()
     folder_text = prompt_input("Pcap subfolder name or full path", default_folder or None)
     folder = resolve_pcap_folder(folder_text)
