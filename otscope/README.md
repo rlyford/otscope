@@ -154,7 +154,6 @@ The complete operator manual is **[OTscope_User_Guide.md](./OTscope_User_Guide.m
 - Triage order for reading reports
 - Known limitations
 - **Version History** — running changelog, newest at top
-- **Addendum A** — forensic authorship watermarks and verification workflow
 
 ---
 
@@ -194,9 +193,9 @@ That's the entire dependency surface. SVG diagrams use only the standard library
 
 © 2026 Ryan Lyford. All rights reserved.
 
-OTscope is **source-available** under a proprietary license. You may run it for OT/ICS security-assessment work within your own organization (including for paid client engagements where you are the assessor) and share the resulting reports / CSVs / SVG diagrams with your engagement clients. Public redistribution, forking, SaaS hosting, and modification for redistribution require prior written permission. Authorship attribution and the embedded forensic watermarks must be preserved.
+OTscope is **source-available** under a proprietary license. You may run it for OT/ICS security-assessment work within your own organization (including for paid client engagements where you are the assessor) and share the resulting reports / CSVs / SVG diagrams with your engagement clients. Public redistribution, forking, SaaS hosting, and modification for redistribution require prior written permission. Authorship attribution must be preserved in all copies.
 
-See **[LICENSE.txt](./LICENSE.txt)** for the complete terms, and **[OTscope_User_Guide.md Addendum A](./OTscope_User_Guide.md#addendum-a--forensic-authorship-watermarks)** for the full attribution-trace inventory.
+See **[LICENSE.txt](./LICENSE.txt)** for the complete terms.
 
 For commercial licensing (redistribution, hosting, OEM, white-label), contact Ryan Lyford with "OTscope licensing" in the subject line.
 

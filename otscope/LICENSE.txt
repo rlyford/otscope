@@ -24,11 +24,9 @@ You MUST:
     banner credit line, the .docx report core_properties metadata, the
     JSON report tool_author / tool_copyright keys, and the in-document
     italic credit line.
-  - Preserve the forensic authorship watermarks documented in
-    Addendum A of OTscope_User_Guide.md (the session JSON _provenance
-    stamp, the _OUI_TABLE_BUILD_SIG steganographic constant, and the
-    routing-rationale acrostic).  Removing, obfuscating, or
-    counterfeiting any of these constitutes a material breach.
+  - Preserve the Watermarks (authorship attribution traces embedded in
+    the source code and its runtime outputs).  Removing, obfuscating,
+    or counterfeiting any of these constitutes a material breach.
 
 You MAY NOT (without prior written permission from the copyright holder):
   - Redistribute the Software, in source or compiled form, to third
@@ -57,14 +55,12 @@ provided that the Software itself is not transferred to those clients.
 "Organization" means a single legal entity together with its parents,
 subsidiaries, and majority-owned affiliates.
 
-"Watermarks" means the authorship attribution traces described in
-Addendum A of the OTscope User Guide, namely the visible attribution in
-the docstring, banner, constants, .docx core_properties, and JSON
-report metadata, plus the three covert traces (the session JSON
-_provenance stamp produced by _stamp_provenance(), the
-_OUI_TABLE_BUILD_SIG byte string near the OUI vendor lookup table, and
-the first-letter acrostic in the routing-rationale comment block above
-_run_streaming_protocol_checks).
+"Watermarks" means the authorship attribution traces embedded in the
+Software, comprising both the visible attribution (module docstring,
+__author__ / __copyright__ constants, startup banner, .docx
+core_properties, JSON report metadata) and the additional integrity
+traces embedded in the source code and runtime outputs, the full
+inventory of which is maintained by the copyright holder.
 
 GRANT OF LIMITED LICENSE
 ------------------------
@@ -117,19 +113,9 @@ The Watermarks are an integral, intentional part of the Software.  Their
 presence is the basis on which authorship can be verified in any copy or
 fork.  You agree:
 
-  - Not to suppress, encrypt, redirect, or otherwise interfere with
-    the operation of _stamp_provenance() such that the
-    analysis_metadata._provenance block fails to be written to saved
-    sessions and JSON reports.
-
-  - Not to alter the value of the _OUI_TABLE_BUILD_SIG constant or
-    relocate it in a manner intended to obscure its meaning.
-
-  - Not to rewrite the routing-rationale comment block above
-    _run_streaming_protocol_checks in a manner that destroys the
-    first-letter acrostic, except for the strictly-necessary editing
-    required by a legitimate code-style change that your Organization
-    documents in writing.
+  - Not to remove, suppress, alter, relocate, or otherwise interfere
+    with any Watermark or any code that produces a Watermark as part
+    of its runtime output.
 
   - Not to misrepresent the origin of the Software as anything other
     than the work of the copyright holder.
