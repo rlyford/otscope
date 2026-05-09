@@ -1,0 +1,237 @@
+OTscope — Source-Available Proprietary License
+================================================
+
+Copyright © 2026 Ryan Lyford. All Rights Reserved.
+
+This file governs use, copying, modification, and distribution of the
+OTscope software (the "Software"), including all source code, documentation,
+generated reports, embedded metadata, and associated artifacts provided in
+this repository.
+
+PLAIN-ENGLISH SUMMARY (non-binding; the terms below control)
+------------------------------------------------------------
+You MAY:
+  - Read, study, and evaluate the source code.
+  - Run the Software unmodified to perform OT/ICS security assessments
+    within your own organization, including for paid client engagements
+    where you are the assessor.
+  - Generate reports, JSON, CSV, and SVG artifacts from your own pcap
+    captures or from captures you are authorized to analyze.
+
+You MUST:
+  - Preserve all visible authorship attribution: the module docstring
+    header, the __author__ and __copyright__ constants, the startup
+    banner credit line, the .docx report core_properties metadata, the
+    JSON report tool_author / tool_copyright keys, and the in-document
+    italic credit line.
+  - Preserve the forensic authorship watermarks documented in
+    Addendum A of OTscope_User_Guide.md (the session JSON _provenance
+    stamp, the _OUI_TABLE_BUILD_SIG steganographic constant, and the
+    routing-rationale acrostic).  Removing, obfuscating, or
+    counterfeiting any of these constitutes a material breach.
+
+You MAY NOT (without prior written permission from the copyright holder):
+  - Redistribute the Software, in source or compiled form, to third
+    parties outside your organization.
+  - Publish, mirror, or fork the Software on any public repository,
+    package registry, or distribution channel.
+  - Host the Software as a service, SaaS offering, or any analysis
+    platform accessible to users outside your organization.
+  - Sell, sublicense, rent, lease, or otherwise commercialize the
+    Software as a product.
+  - Create derivative works for redistribution.
+  - Use the Software, the OTscope name, or the author's name to endorse
+    or promote products without separate written permission.
+
+DEFINITIONS
+-----------
+"Software" means the OTscope source code in this repository, the User
+Guide documents, the README, the requirements file, and any related
+files distributed alongside them.
+
+"Internal Use" means execution of the Software by employees, contractors,
+and affiliated personnel of a single organization, including their
+clients in the course of authorized OT/ICS security-assessment work,
+provided that the Software itself is not transferred to those clients.
+
+"Organization" means a single legal entity together with its parents,
+subsidiaries, and majority-owned affiliates.
+
+"Watermarks" means the authorship attribution traces described in
+Addendum A of the OTscope User Guide, namely the visible attribution in
+the docstring, banner, constants, .docx core_properties, and JSON
+report metadata, plus the three covert traces (the session JSON
+_provenance stamp produced by _stamp_provenance(), the
+_OUI_TABLE_BUILD_SIG byte string near the OUI vendor lookup table, and
+the first-letter acrostic in the routing-rationale comment block above
+_run_streaming_protocol_checks).
+
+GRANT OF LIMITED LICENSE
+------------------------
+Subject to the terms below, the copyright holder grants you a worldwide,
+royalty-free, non-exclusive, non-transferable, non-sublicensable license
+to:
+
+  (a) Reproduce one or more copies of the Software solely for Internal
+      Use within your Organization.
+
+  (b) Execute the Software, unmodified or with private modifications
+      that remain within your Organization, to perform OT/ICS security
+      assessments.
+
+  (c) Generate, retain, and share with your engagement clients the
+      output artifacts produced by the Software (reports, CSVs, SVG
+      diagrams, session files, baselines), provided the artifacts'
+      embedded authorship metadata is not altered.
+
+This license takes effect when you obtain the Software and continues
+until terminated.
+
+RESTRICTIONS
+------------
+Except as expressly granted above, you may not:
+
+  1. Distribute the Software outside your Organization in any form.
+
+  2. Modify the Software for the purpose of public redistribution,
+     including by removing, replacing, or obscuring any authorship
+     attribution or the Watermarks.
+
+  3. Reverse-engineer, decompile, or disassemble the Software for the
+     purpose of identifying, removing, or counterfeiting the Watermarks.
+
+  4. Remove or alter any copyright notices, the __author__ or
+     __copyright__ constants, the startup banner credit, the .docx
+     core_properties.author / last_modified_by / comments / category
+     fields, or the JSON report tool_author / tool_copyright keys.
+
+  5. Use the Software in violation of applicable export-control laws,
+     sanctions regimes, or other laws governing your jurisdiction.
+
+  6. Use the Software to analyze packet captures you do not have
+     lawful authority to inspect.
+
+ATTRIBUTION INTEGRITY
+---------------------
+The Watermarks are an integral, intentional part of the Software.  Their
+presence is the basis on which authorship can be verified in any copy or
+fork.  You agree:
+
+  - Not to suppress, encrypt, redirect, or otherwise interfere with
+    the operation of _stamp_provenance() such that the
+    analysis_metadata._provenance block fails to be written to saved
+    sessions and JSON reports.
+
+  - Not to alter the value of the _OUI_TABLE_BUILD_SIG constant or
+    relocate it in a manner intended to obscure its meaning.
+
+  - Not to rewrite the routing-rationale comment block above
+    _run_streaming_protocol_checks in a manner that destroys the
+    first-letter acrostic, except for the strictly-necessary editing
+    required by a legitimate code-style change that your Organization
+    documents in writing.
+
+  - Not to misrepresent the origin of the Software as anything other
+    than the work of the copyright holder.
+
+REPORTS AND ARTIFACTS
+---------------------
+Output artifacts produced by the Software (Word reports, JSON reports,
+CSVs, SVG diagrams, session files, baseline files) are owned by you to
+the extent they incorporate facts derived from your own data.  However,
+the templates, narrative text, finding descriptions, recommended-fix
+language, MITRE / advisory mappings, Wireshark-investigation guides,
+diagram layouts, and embedded authorship metadata produced by the
+Software remain the copyrighted work of the copyright holder and are
+licensed for redistribution only as part of an unmodified Software
+output.
+
+You may share output artifacts with your engagement clients, your
+internal stakeholders, regulators, and law enforcement as required by
+the assessment relationship.
+
+NO WARRANTY
+-----------
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.
+IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM,
+DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR
+OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR
+THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+THE SOFTWARE IS A SECURITY-ASSESSMENT TOOL.  THE COPYRIGHT HOLDER MAKES
+NO REPRESENTATION THAT IT WILL DETECT EVERY VULNERABILITY OR EVERY
+ATTACK PRESENT IN A GIVEN PACKET CAPTURE, NOR THAT EVERY FINDING IT
+EMITS IS A TRUE POSITIVE.  YOU ARE SOLELY RESPONSIBLE FOR THE
+INTERPRETATION OF ITS OUTPUT AND FOR ANY DECISIONS BASED ON THAT OUTPUT.
+
+LIMITATION OF LIABILITY
+-----------------------
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE COPYRIGHT
+HOLDER'S TOTAL LIABILITY UNDER OR IN CONNECTION WITH THIS LICENSE OR
+THE SOFTWARE IS LIMITED TO ZERO UNITED STATES DOLLARS (US $0).
+
+NEITHER PARTY SHALL BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL,
+CONSEQUENTIAL, EXEMPLARY, OR PUNITIVE DAMAGES, OR FOR LOST PROFITS,
+LOST REVENUE, LOST DATA, BUSINESS INTERRUPTION, OR PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES, WHETHER OR NOT THE OTHER PARTY HAS BEEN
+ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+TERMINATION
+-----------
+This license terminates automatically and immediately if you breach any
+of its terms, including any of the Restrictions or the Attribution
+Integrity provisions.  Upon termination you must cease all use of the
+Software, destroy all copies in your possession or control, and certify
+in writing that you have done so if requested by the copyright holder.
+
+Sections that by their nature should survive termination (NO WARRANTY,
+LIMITATION OF LIABILITY, ATTRIBUTION INTEGRITY, REPORTS AND ARTIFACTS,
+and any accrued payment obligations) survive termination.
+
+COMMERCIAL LICENSING / GRANTS BEYOND THIS LICENSE
+-------------------------------------------------
+For redistribution rights, public hosting, SaaS offerings, OEM
+incorporation, white-label distribution, or any other use beyond what
+this license permits, contact the copyright holder to negotiate a
+separate written agreement.  The copyright holder may grant such rights
+on commercially reasonable terms at sole discretion.
+
+Contact: Ryan Lyford  (please include "OTscope licensing" in the subject)
+
+GOVERNING LAW
+-------------
+This license is governed by the laws of the State of [PLACEHOLDER —
+fill in your home jurisdiction], without regard to its conflict-of-laws
+principles.  The exclusive venue for any dispute arising from this
+license is the state and federal courts located in [PLACEHOLDER —
+county, state], and both parties consent to personal jurisdiction
+there.
+
+ENTIRE AGREEMENT
+----------------
+This license is the entire agreement between you and the copyright
+holder regarding the Software, and supersedes any prior or
+contemporaneous understanding regarding it.  No modification of this
+license is effective unless in writing and signed by the copyright
+holder.  If any provision of this license is held to be unenforceable,
+the remaining provisions remain in full force and effect, and the
+unenforceable provision shall be reformed only to the minimum extent
+necessary to make it enforceable.
+
+----------------------------------------------------------------------
+NOTICE TO USERS
+This license is proprietary and source-available; it is not an
+OSI-approved open-source license.  The GitHub License sidebar will
+show "Other" or "View license" rather than an SPDX identifier.  The
+copyright holder considers this an accurate representation of the
+license terms.
+
+NOTICE TO LICENSOR
+This license file is a starting draft.  Before relying on it for
+enforcement against a real infringer, have it reviewed by counsel
+licensed in your jurisdiction, fill in the GOVERNING LAW placeholders,
+and confirm the warranty/liability caps are consistent with the laws
+that govern your residence and your client engagements.
+----------------------------------------------------------------------

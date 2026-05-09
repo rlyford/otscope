@@ -1,0 +1,10 @@
+venv/
+**/venv/
+__pycache__/
+*.pyc
+otscope/output/
+*.pcap
+*.pcapng
+otscope/pcaps/
+.claude/
+notes/
