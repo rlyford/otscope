@@ -7861,17 +7861,21 @@ def session_summary(session: SessionState) -> None:
 
 
 def resolve_pcap_folder(raw: str) -> Path:
-    """Resolve a pcap folder path, expanding bare subfolder names against _PCAPS_ROOT.
+    """Resolve a pcap folder path, expanding bare names against _PCAPS_ROOT.
 
-    If *raw* contains no path separator and _PCAPS_ROOT exists, the input is
-    treated as a subfolder name under _PCAPS_ROOT.  A full or relative path is
-    used as-is.
+    Resolution order for bare names (no path separator):
+    1. Subfolder under _PCAPS_ROOT  (e.g. "plant-a" → pcaps/plant-a)
+    2. Sibling of _PCAPS_ROOT       (e.g. "pcaps"   → otscope/pcaps)
+    A full or relative path containing a separator is used as-is.
     """
     p = Path(raw).expanduser()
     if not p.is_absolute() and os.sep not in raw and "/" not in raw and _PCAPS_ROOT.is_dir():
         candidate = _PCAPS_ROOT / raw
         if candidate.exists():
             return candidate
+        sibling = _PCAPS_ROOT.parent / raw
+        if sibling.exists() and sibling.is_dir():
+            return sibling
     return p
 
 
@@ -8033,11 +8037,13 @@ def new_session_flow(
     env_hint: Optional[str] = None,
 ) -> None:
     """Create and run a new session."""
-    default_folder = str(starting_pcap.parent) if starting_pcap else config.get("last_pcap_folder", "")
-    if not default_folder:
-        if _PCAPS_ROOT.is_dir():
-            default_folder = str(_PCAPS_ROOT)
-        _print_pcap_subfolders()
+    if starting_pcap:
+        default_folder = str(starting_pcap.parent)
+    elif _PCAPS_ROOT.is_dir():
+        default_folder = str(_PCAPS_ROOT)
+    else:
+        default_folder = config.get("last_pcap_folder", "")
+    _print_pcap_subfolders()
     folder_text = prompt_input("Pcap subfolder name or full path", default_folder or None)
     folder = resolve_pcap_folder(folder_text)
     if not folder.exists() or not folder.is_dir():
