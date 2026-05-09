@@ -102,9 +102,9 @@ An Obsidian vault lives at `notes/` in the repo root (gitignored — never commi
 
 **Always keep the vault up to date when completing a task:**
 
-- `notes/OTscope/Dev Log.md` — add an entry (newest at top) summarizing what changed and why.
-- `notes/OTscope/Feature Backlog.md` — check off completed items; add new ideas surfaced during the work.
-- `notes/OTscope/Architecture Decisions.md` — add an entry if a meaningful design decision was made.
+- `notes/Dev Log.md` — add an entry (newest at top) summarizing what changed and why.
+- `notes/Feature Backlog.md` — check off completed items; add new ideas surfaced during the work.
+- `notes/Architecture Decisions.md` — add an entry if a meaningful design decision was made.
 
 Update the vault as part of every task, before creating the PR commit.
 
