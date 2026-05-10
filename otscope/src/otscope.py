@@ -7245,6 +7245,320 @@ class OTPcapAnalyzer:
         return "\n".join(lines)
 
 
+    def generate_purdue_svgs(self) -> Tuple[Path, Optional[Path]]:
+        """Generate Purdue-Model architecture SVG diagrams.
+
+        Always writes a Summary SVG (one box per layer).  Writes a Detail SVG
+        (individual device boxes + flow arrows) only when ≤50 devices are
+        present.  Both files land alongside the session pcap folder.
+
+        Returns (summary_path, detail_path_or_None).
+        """
+        assert self.session is not None
+        report_date = datetime.now().strftime("%Y%m%d")
+        folder = Path(self.session.folder)
+        slug = safe_slug(self.session.site)
+        summary_path = folder / f"OTscope_Purdue_Summary_{slug}_{report_date}.svg"
+        detail_path: Optional[Path] = None
+
+        # ── severity → display colour ──────────────────────────────────────
+        _SEV_FILL = {
+            SEVERITY_INTRUSION:   ("#FFD0D0", "#8B0000"),
+            SEVERITY_CRITICAL:    ("#FFB3B3", "#CC0000"),
+            SEVERITY_CORRELATION: ("#CCE0FF", "#003399"),
+            SEVERITY_HIGH:        ("#FFE0B0", "#CC5500"),
+            SEVERITY_MEDIUM:      ("#FFF9C4", "#9A7B00"),
+            SEVERITY_LOW:         ("#EEEEEE", "#555555"),
+            SEVERITY_INFO:        ("#F5F5F5", "#888888"),
+        }
+        _DEFAULT_FILL = ("#F8F8F8", "#AAAAAA")
+
+        def _layer_colour(devices: List[DeviceRecord]) -> Tuple[str, str]:
+            """Return (fill, stroke) for the highest-severity device in a layer."""
+            top_sev = ""
+            for dev in devices:
+                for finding in self.session.findings:  # type: ignore[union-attr]
+                    if dev.ip in finding.source_ips or dev.ip in finding.destination_ips:
+                        if SEVERITY_ORDER.get(finding.severity, 0) > SEVERITY_ORDER.get(top_sev, -1):
+                            top_sev = finding.severity
+            return _SEV_FILL.get(top_sev, _DEFAULT_FILL)
+
+        # ── canonical layer order ──────────────────────────────────────────
+        LAYER_ORDER = [
+            "External / Public",
+            "Purdue L4/L5",
+            "Purdue L3/L3.5 Boundary",
+            "Purdue L2/L3",
+            "Purdue L1/L2",
+            "Physical Security / OT Edge",
+            "Unknown",
+        ]
+        LAYER_LABEL = {
+            "External / Public":        "External / Public",
+            "Purdue L4/L5":             "L4/L5 — IT / Corporate",
+            "Purdue L3/L3.5 Boundary":  "L3/L3.5 — DMZ / Boundary",
+            "Purdue L2/L3":             "L2/L3 — Supervisory / HMI",
+            "Purdue L1/L2":             "L1/L2 — Controllers / PLC / RTU",
+            "Physical Security / OT Edge": "Physical Security / OT Edge",
+            "Unknown":                  "Unclassified",
+        }
+
+        # Group devices by zone, compute per-layer top protocols
+        layers: Dict[str, List[DeviceRecord]] = defaultdict(list)
+        for dev in self.session.devices.values():
+            z = dev.inferred_zone if dev.inferred_zone in LAYER_ORDER else "Unknown"
+            layers[z].append(dev)
+        active_layers = [z for z in LAYER_ORDER if layers[z]]
+
+        # ── SUMMARY SVG ────────────────────────────────────────────────────
+        W = 860
+        PAD = 28
+        BOX_H = 80
+        GAP = 14
+        ARROW_W = 18
+        title_h = 44
+        legend_h = 32
+        total_h = title_h + legend_h + PAD + len(active_layers) * (BOX_H + GAP) + PAD
+
+        svg_lines: List[str] = []
+        svg_lines.append(
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{total_h}" '
+            f'font-family="Segoe UI,Arial,sans-serif">'
+        )
+        # Background
+        svg_lines.append(f'<rect width="{W}" height="{total_h}" fill="#FAFAFA" rx="6"/>')
+        # Title
+        svg_lines.append(
+            f'<text x="{W//2}" y="28" text-anchor="middle" font-size="15" '
+            f'font-weight="bold" fill="#1A1A1A">'
+            f'OTscope Purdue Model — {self.session.site}</text>'
+        )
+        # Legend
+        lx = PAD
+        ly = title_h + 8
+        for sev_label, (fill, stroke) in [
+            ("INTRUSION", _SEV_FILL[SEVERITY_INTRUSION]),
+            ("CRITICAL",  _SEV_FILL[SEVERITY_CRITICAL]),
+            ("HIGH",      _SEV_FILL[SEVERITY_HIGH]),
+            ("MEDIUM",    _SEV_FILL[SEVERITY_MEDIUM]),
+            ("LOW/INFO",  _SEV_FILL[SEVERITY_LOW]),
+            ("No findings", _DEFAULT_FILL),
+        ]:
+            svg_lines.append(
+                f'<rect x="{lx}" y="{ly}" width="14" height="14" '
+                f'fill="{fill}" stroke="{stroke}" stroke-width="1.5" rx="2"/>'
+            )
+            svg_lines.append(
+                f'<text x="{lx + 18}" y="{ly + 11}" font-size="10" fill="#333">{sev_label}</text>'
+            )
+            lx += 90
+
+        # Layer boxes
+        y = title_h + legend_h + PAD
+        box_x = PAD
+        box_w = W - 2 * PAD
+
+        for idx, zone in enumerate(active_layers):
+            devs = layers[zone]
+            fill, stroke = _layer_colour(devs)
+            label = LAYER_LABEL.get(zone, zone)
+            n = len(devs)
+            protos: Counter[str] = Counter()
+            for d in devs:
+                for p in d.protocols[:5]:
+                    protos[p] += 1
+            top_protos = ", ".join(p for p, _ in protos.most_common(4)) or "—"
+
+            # Draw arrow connector between layers (skip for first)
+            if idx > 0:
+                ax = W // 2
+                ay = y - GAP
+                svg_lines.append(
+                    f'<line x1="{ax}" y1="{ay - 4}" x2="{ax}" y2="{ay + 4}" '
+                    f'stroke="#999" stroke-width="2" marker-end="url(#arr)"/>'
+                )
+
+            svg_lines.append(
+                f'<rect x="{box_x}" y="{y}" width="{box_w}" height="{BOX_H}" '
+                f'fill="{fill}" stroke="{stroke}" stroke-width="2" rx="6"/>'
+            )
+            svg_lines.append(
+                f'<text x="{box_x + 14}" y="{y + 22}" font-size="12" '
+                f'font-weight="bold" fill="#111">{label}</text>'
+            )
+            svg_lines.append(
+                f'<text x="{box_x + 14}" y="{y + 40}" font-size="11" fill="#333">'
+                f'{n:,} device(s)</text>'
+            )
+            svg_lines.append(
+                f'<text x="{box_x + 14}" y="{y + 57}" font-size="10" fill="#555">'
+                f'Protocols: {top_protos}</text>'
+            )
+            y += BOX_H + GAP
+
+        # Arrow marker def
+        svg_lines.insert(1,
+            '<defs><marker id="arr" markerWidth="8" markerHeight="8" '
+            'refX="4" refY="4" orient="auto">'
+            '<path d="M0,0 L8,4 L0,8 Z" fill="#999"/></marker></defs>'
+        )
+        svg_lines.append('</svg>')
+        summary_path.write_text("\n".join(svg_lines), encoding="utf-8")
+        print(colorize(f"[✓] Purdue Summary SVG: {summary_path}", "SUCCESS"))
+
+        # ── DETAIL SVG (≤50 devices only) ─────────────────────────────────
+        n_total = len(self.session.devices)
+        if n_total > 50:
+            print(f"[i] Purdue Detail SVG skipped ({n_total:,} devices > 50 limit).")
+            return summary_path, None
+
+        detail_path = folder / f"OTscope_Purdue_Detail_{slug}_{report_date}.svg"
+
+        # Assign grid positions for devices within each layer
+        DW = 1100
+        DPAD = 32
+        D_TITLE_H = 44
+        D_LAYER_HEAD = 26
+        D_DEV_W = 160
+        D_DEV_H = 46
+        D_DEV_GAP_X = 12
+        D_DEV_GAP_Y = 12
+        D_LAYER_PAD = 10
+
+        # Pre-compute per-device severities
+        dev_sev: Dict[str, str] = {}
+        for finding in self.session.findings:
+            for ip in finding.source_ips + finding.destination_ips:
+                if SEVERITY_ORDER.get(finding.severity, 0) > SEVERITY_ORDER.get(dev_sev.get(ip, ""), -1):
+                    dev_sev[ip] = finding.severity
+
+        # Compute device box positions
+        dev_pos: Dict[str, Tuple[int, int]] = {}  # ip -> (cx, cy) centre
+        layer_rects: List[Tuple[int, int, int, int, str, str, str]] = []  # x,y,w,h,fill,stroke,label
+
+        curr_y = D_TITLE_H + DPAD
+
+        for zone in active_layers:
+            devs_in_zone = sorted(
+                layers[zone],
+                key=lambda d: (d.outgoing_count + d.incoming_count),
+                reverse=True,
+            )
+            n_devs = len(devs_in_zone)
+            cols = max(1, min(5, n_devs))
+            rows = (n_devs + cols - 1) // cols
+            inner_w = cols * D_DEV_W + (cols - 1) * D_DEV_GAP_X
+            layer_h = D_LAYER_HEAD + D_LAYER_PAD + rows * (D_DEV_H + D_DEV_GAP_Y)
+            lx = DPAD
+            lw = DW - 2 * DPAD
+            fill, stroke = _layer_colour(devs_in_zone)
+            label = LAYER_LABEL.get(zone, zone)
+            layer_rects.append((lx, curr_y, lw, layer_h, fill, stroke, label))
+            # Position device boxes
+            start_x = lx + (lw - inner_w) // 2
+            for i, dev in enumerate(devs_in_zone):
+                col = i % cols
+                row = i // cols
+                cx = start_x + col * (D_DEV_W + D_DEV_GAP_X) + D_DEV_W // 2
+                cy = curr_y + D_LAYER_HEAD + D_LAYER_PAD + row * (D_DEV_H + D_DEV_GAP_Y) + D_DEV_H // 2
+                dev_pos[dev.ip] = (cx, cy)
+            curr_y += layer_h + GAP
+
+        total_detail_h = curr_y + DPAD
+
+        d_lines: List[str] = []
+        d_lines.append(
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{DW}" height="{total_detail_h}" '
+            f'font-family="Segoe UI,Arial,sans-serif">'
+        )
+        d_lines.append(
+            '<defs><marker id="arr" markerWidth="8" markerHeight="8" '
+            'refX="4" refY="4" orient="auto">'
+            '<path d="M0,0 L8,4 L0,8 Z" fill="#AAAAAA"/></marker></defs>'
+        )
+        d_lines.append(f'<rect width="{DW}" height="{total_detail_h}" fill="#FAFAFA" rx="6"/>')
+        d_lines.append(
+            f'<text x="{DW//2}" y="28" text-anchor="middle" font-size="15" '
+            f'font-weight="bold" fill="#1A1A1A">'
+            f'OTscope Purdue Detail — {self.session.site}</text>'
+        )
+
+        # Layer background rectangles
+        for (lx, ly, lw, lh, fill, stroke, label) in layer_rects:
+            d_lines.append(
+                f'<rect x="{lx}" y="{ly}" width="{lw}" height="{lh}" '
+                f'fill="{fill}" stroke="{stroke}" stroke-width="1.5" rx="5" opacity="0.7"/>'
+            )
+            d_lines.append(
+                f'<text x="{lx + 10}" y="{ly + 18}" font-size="11" '
+                f'font-weight="bold" fill="#222">{label}</text>'
+            )
+
+        # Flow arrows (top 30 by packet count)
+        top_flows = sorted(
+            self.session.connections.values(),
+            key=lambda c: c.packet_count,
+            reverse=True,
+        )[:30]
+        for conn in top_flows:
+            if conn.source_ip not in dev_pos or conn.destination_ip not in dev_pos:
+                continue
+            x1, y1 = dev_pos[conn.source_ip]
+            x2, y2 = dev_pos[conn.destination_ip]
+            if x1 == x2 and y1 == y2:
+                continue
+            # Bezier control point offset
+            mx = (x1 + x2) / 2 + (y2 - y1) * 0.18
+            my = (y1 + y2) / 2 - (x2 - x1) * 0.08
+            d_lines.append(
+                f'<path d="M{x1},{y1} Q{mx:.0f},{my:.0f} {x2},{y2}" '
+                f'fill="none" stroke="#AAAAAA" stroke-width="1.2" '
+                f'opacity="0.5" marker-end="url(#arr)"/>'
+            )
+
+        # Device boxes (drawn on top of arrows)
+        for zone in active_layers:
+            for dev in layers[zone]:
+                if dev.ip not in dev_pos:
+                    continue
+                cx, cy = dev_pos[dev.ip]
+                bx = cx - D_DEV_W // 2
+                by = cy - D_DEV_H // 2
+                sev = dev_sev.get(dev.ip, "")
+                d_fill, d_stroke = _SEV_FILL.get(sev, _DEFAULT_FILL)
+                # Highlight CRITICAL/INTRUSION
+                if sev in (SEVERITY_CRITICAL, SEVERITY_INTRUSION):
+                    d_stroke = "#CC0000"
+                    sw = "2.5"
+                else:
+                    sw = "1.2"
+                d_lines.append(
+                    f'<rect x="{bx}" y="{by}" width="{D_DEV_W}" height="{D_DEV_H}" '
+                    f'fill="{d_fill}" stroke="{d_stroke}" stroke-width="{sw}" rx="4"/>'
+                )
+                # IP (truncate if long)
+                ip_label = dev.ip if len(dev.ip) <= 16 else dev.ip[:14] + "…"
+                d_lines.append(
+                    f'<text x="{cx}" y="{by + 16}" text-anchor="middle" '
+                    f'font-size="10" font-weight="bold" fill="#111">{ip_label}</text>'
+                )
+                role_label = dev.inferred_role[:22] + ("…" if len(dev.inferred_role) > 22 else "")
+                d_lines.append(
+                    f'<text x="{cx}" y="{by + 29}" text-anchor="middle" '
+                    f'font-size="9" fill="#444">{role_label}</text>'
+                )
+                proto_short = (dev.protocols[0] if dev.protocols else "")[:18]
+                d_lines.append(
+                    f'<text x="{cx}" y="{by + 41}" text-anchor="middle" '
+                    f'font-size="8" fill="#666">{proto_short}</text>'
+                )
+
+        d_lines.append('</svg>')
+        detail_path.write_text("\n".join(d_lines), encoding="utf-8")
+        print(colorize(f"[✓] Purdue Detail SVG: {detail_path}", "SUCCESS"))
+
+        return summary_path, detail_path
+
     def generate_report(self, technical_appendix: bool = False) -> Path:
         """Generate the Word report, with plain-text fallback on failure."""
         assert self.session is not None
@@ -7998,8 +8312,16 @@ class OTPcapAnalyzer:
 
             document.save(report_path)
             print(colorize(f"[✓] Word report generated: {report_path}", "SUCCESS"))
+            # Always generate companion artifacts alongside the Word report.
+            try:
+                self.generate_json_report()
+            except Exception as exc:
+                print(f"[!] JSON report generation failed: {exc}")
+            try:
+                self.generate_purdue_svgs()
+            except Exception as exc:
+                print(f"[!] Purdue SVG generation failed: {exc}")
             return report_path
-
         except Exception as exc:
             fallback_path = report_path.with_suffix(".txt")
             fallback_text = [
@@ -8553,11 +8875,14 @@ def prompt_report_generation(
         fmt = prompt_input("Report format: Word / JSON / Both [W/J/B]", "W").strip().lower()
     fmt = (fmt or "word").lower()
     if fmt in {"j", "json"}:
+        # JSON-only: skip Word report but still generate JSON + SVGs.
         analyzer.generate_json_report()
-    elif fmt in {"b", "both"}:
-        analyzer.generate_report(technical_appendix=technical_appendix)
-        analyzer.generate_json_report()
+        try:
+            analyzer.generate_purdue_svgs()
+        except Exception as exc:
+            print(f"[!] Purdue SVG generation failed: {exc}")
     else:
+        # "word" or "both": generate_report auto-produces JSON + SVGs as companions.
         analyzer.generate_report(technical_appendix=technical_appendix)
 
 
