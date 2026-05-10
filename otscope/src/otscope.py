@@ -734,10 +734,10 @@ ADVISORY_MAP: List[Tuple[Tuple[str, ...], List[str]]] = [
         ["NIST SP 800-82r3 §6.2.6", "CIS Benchmark - Network Devices §DHCP"]),
     (("adversary-in-the-middle attack pattern", "mitm attack pattern", "arp-based adversary"),
         ["NIST SP 800-82r3 §6.2.6 (Link-layer)", "MITRE D3FEND D3-ARPE",
-         "CISA AA22-103A (Pipedream/Incontroller)", "Dragos Year-in-Review (annual ICS threat report)"]),
+         "CISA AA22-103A (Pipedream/Incontroller)", "Dragos OT Cybersecurity Year in Review 2025 (dragos.com/year-in-review)"]),
     (("identical modbus response", "possible replay", "modbus replay"),
         ["CISA ICS-TIP-12-146-01A (Modbus security)", "MITRE D3FEND D3-NTA",
-         "Dragos Year-in-Review (annual ICS threat report)"]),
+         "Dragos OT Cybersecurity Year in Review 2025 (dragos.com/year-in-review)"]),
     (("repetitive single-register polling",),
         ["CISA ICS-TIP-12-146-01A (Modbus security)", "NIST SP 800-82r3 §6 (ICS protocols)"]),
     (("dnp3 disable spontaneous", "dnp3 cold restart", "dnp3 warm restart"),
@@ -769,7 +769,7 @@ ADVISORY_MAP: List[Tuple[Tuple[str, ...], List[str]]] = [
          "NIST SP 800-82r3 §6.2 (cleartext OT interfaces)"]),
     (("modbus register value anomaly", "value anomaly"),
         ["CISA ICS-TIP-12-146-01A (Modbus security)", "MITRE D3FEND D3-NTA",
-         "Dragos Year-in-Review (annual ICS threat report)"]),
+         "Dragos OT Cybersecurity Year in Review 2025 (dragos.com/year-in-review)"]),
     # Vendor-specific PSIRT references
     (("honeywell",),
         ["Honeywell PSIRT (security.honeywell.com)"]),
@@ -787,7 +787,7 @@ ADVISORY_MAP: List[Tuple[Tuple[str, ...], List[str]]] = [
         ["GE Digital Security Advisories"]),
     # Dragos / industry threat intel
     (("modbus", "dnp3", "iec 104", "iec 61850", "s7comm", "ethernet/ip"),
-        ["Dragos Year-in-Review (annual ICS threat report)"]),
+        ["Dragos OT Cybersecurity Year in Review 2025 (dragos.com/year-in-review)"]),
 ]
 
 
@@ -7321,6 +7321,29 @@ class OTPcapAnalyzer:
                             run.bold = True
                             run.font.color.rgb = _HDR_TXT
 
+            def _add_hyperlink_to_cell(cell, url: str, text: str) -> None:
+                """Insert a clickable hyperlink into the first paragraph of a table cell."""
+                para = cell.paragraphs[0]
+                para.clear()
+                r_id = para.part.relate_to(
+                    url,
+                    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
+                    is_external=True,
+                )
+                hl = OxmlElement("w:hyperlink")
+                hl.set(qn("r:id"), r_id)
+                wr = OxmlElement("w:r")
+                rPr = OxmlElement("w:rPr")
+                rStyle = OxmlElement("w:rStyle")
+                rStyle.set(qn("w:val"), "Hyperlink")
+                rPr.append(rStyle)
+                wr.append(rPr)
+                wt = OxmlElement("w:t")
+                wt.text = text
+                wr.append(wt)
+                hl.append(wr)
+                para._p.append(hl)
+
             def _add_kv_table(rows_data):
                 """Add a 2-col key/value table with no header row."""
                 if not rows_data:
@@ -7494,49 +7517,7 @@ class OTPcapAnalyzer:
                 document.add_paragraph("No environment discovery answers were recorded.")
 
             # ================================================================
-            # 4. KEY OT CONCEPTS FOR IT AUDITORS
-            # ================================================================
-            document.add_heading("Key OT Concepts for IT Auditors", level=1)
-            document.add_paragraph(
-                "Brief context on OT/ICS network behavior for auditors with IT backgrounds."
-            )
-            ot_concepts = [
-                ("PLCs and HMIs communicate differently from IT systems",
-                 "OT devices operate in tightly controlled, deterministic cycles.  "
-                 "Changes in timing, polling frequency, or the registers accessed can be "
-                 "operationally significant even when raw packet counts look unremarkable."),
-                ("Modbus TCP lacks modern security features",
-                 "Modbus TCP — the most common OT protocol — has no built-in authentication, "
-                 "encryption, or authorization.  Any host that can reach TCP port 502 can read "
-                 "or write process data.  This is by design for isolation, not acceptable where "
-                 "network segmentation is incomplete."),
-                ("Engineering workstations may legitimately perform broad reads",
-                 "An engineer commissioning, troubleshooting, or calibrating a PLC may issue "
-                 "sequential reads across many registers — behavior that resembles reconnaissance "
-                 "from an IT perspective.  Always confirm whether a maintenance window was active "
-                 "before treating broad reads as malicious."),
-                ("Inferred device roles require site validation",
-                 "This tool infers whether a host is a PLC, HMI, historian, or engineering "
-                 "workstation based on traffic patterns.  These are probabilistic inferences, "
-                 "not facts.  Validate all device roles with site staff and physical inspection."),
-                ("OT remediation requires operational coordination",
-                 "Blocking a Modbus flow or shutting down a device without coordination with "
-                 "operations can halt production, disable safety monitoring, or cause physical "
-                 "process upsets.  All OT remediation must be planned with the process owner."),
-                ("A technically suspicious finding may be operationally normal",
-                 "A finding rated HIGH by this tool may be fully explained by approved "
-                 "maintenance, a scheduled data-export job, or a vendor support connection.  "
-                 "The auditor's task is to determine whether each finding is a gap or an "
-                 "authorized behavior."),
-            ]
-            for concept_title, concept_body in ot_concepts:
-                p = document.add_paragraph(style="List Bullet")
-                run_t = p.add_run(f"{concept_title}: ")
-                run_t.bold = True
-                p.add_run(concept_body)
-
-            # ================================================================
-            # 5. PRIORITY FINDINGS
+            # 4. PRIORITY FINDINGS
             # ================================================================
             document.add_heading("Priority Findings", level=1)
             document.add_paragraph(
@@ -7755,7 +7736,11 @@ class OTPcapAnalyzer:
                 mh[2].text = "Findings"
                 for tid, cnt in mitre_counts.most_common():
                     mr = mitre_table.add_row().cells
-                    mr[0].text = tid
+                    _add_hyperlink_to_cell(
+                        mr[0],
+                        f"https://attack.mitre.org/techniques/{tid}/",
+                        tid,
+                    )
                     mr[1].text = _MITRE_ICS_NAMES.get(tid, "—")
                     mr[2].text = str(cnt)
 
