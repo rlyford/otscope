@@ -88,6 +88,7 @@ Optional flags that combine with `--scan`:
 | `--site <name>` | Site name used in the report and filename slug | Folder name |
 | `--env <type>` | Environment type hint (e.g. `manufacturing`, `power`, `water`, `building-automation`, `scada`) | *(empty)* |
 | `--format word\|json\|both` | Report format(s) to generate | `word` |
+| `--technical-appendix` | Append Appendix B (raw evidence lines + per-pcap breakdown) to the Word report | *(omitted — concise report only)* |
 | `--offline` | Hard-lock all outbound network calls | *(unlocked)* |
 
 Examples:
@@ -237,21 +238,35 @@ OTscope writes up to six artifacts alongside any session, named with the site sl
 
 ### 7.1 Word Report Structure
 
-- **Title / metadata table** — Site, Assessor, Session, Generated (styled 2-col table).
-- Auto-generated Table of Contents (right-click → Update Field after open).
-- Executive Summary — risk score, top 3 attack-chain narratives, top 5 affected hosts, top 3 next-steps.
-- **Risk Summary** — color-coded 3-col table (Severity · Count · Score Contribution); each row shaded in its severity color.
-- **Environment Discovery** — styled 2-col table (Question · Answer).
-- Correlation Summary, Suggested Controls.
-- Findings — grouped by category with H2 headings; severity-sorted within each category. Each finding opens with a **compact metadata mini-table** (Severity, Category, Affected Endpoints, Source Pcaps, MITRE IDs, Advisory Refs, Related Findings, Wireshark pointer — rows with no content are omitted), followed by prose: description, why-this-matters, evidence bullets, recommended fix.
-- Timeline / Attack Chain — styled chronological table of MEDIUM+ findings (capped at 80).
-- Network Map — pointer to standalone SVG diagrams + ASCII Purdue-layer text rendering.
-- MITRE ATT&CK for ICS Coverage — styled table of technique IDs by frequency.
-- Top Riskiest Devices — styled table of top 15 by severity-weighted score.
-- Device Inventory — styled table of top 200 devices by traffic; full list in CSV addendum.
-- Appendix A — Wireshark Investigation Guides (per-category, see §8).
+The Word report is designed as an **auditor workpaper** for IT-oriented cybersecurity auditors who may be unfamiliar with OT/ICS protocols. It follows a progressive-disclosure model: the Word document is concise and narrative-focused; raw technical evidence lives in the JSON export; device and flow details are in the CSVs.
 
-All tables use a consistent dark-blue header row (white bold text, full grid borders) for readability.
+**Sections:**
+
+1. **Cover Page** — Site, Assessor, Session name, generated date/time, OTscope version.
+2. **Document Purpose and Scope** — what this report is, what pcap files it covers, what it does not cover.
+3. **How to Use This Report** — reading order guidance, cross-reference map (Word → JSON → CSVs), `--technical-appendix` note.
+4. **Executive Summary** — overall risk band, finding counts by severity, key narrative observations, top affected hosts, recommended immediate actions.
+5. **Network Interpretation Summary** — narrative paragraphs describing the observed network architecture and behavior in plain language for audit readers.
+6. **Risk Summary** — color-coded table (Severity · Count · Score Contribution); each row shaded in its severity color.
+7. **Findings** (grouped by category, severity-sorted within each category). Each finding includes:
+   - Auto-sequential finding ID (e.g. `MODBUS-001`, `DNP3-002`) for cross-referencing
+   - Severity and category
+   - **Detection confidence** (High / Medium / Low) — how certain OTscope is that this event was correctly detected
+   - **Maliciousness confidence** (High / Medium / Low, with "may be authorized maintenance" qualifier where applicable) — how likely the activity represents a threat vs. legitimate operation
+   - **OT Significance** — one-paragraph explanation of why this matters specifically in an OT/ICS context, written for IT audit readers
+   - Description and evidence summary
+   - **Auditor Action** — 3–5 specific verification and follow-up steps
+   - **Benign Explanation** — one sentence describing the most likely legitimate cause, for auditors to ask the asset owner about
+   - Compact metadata: affected endpoints, source pcaps, MITRE IDs, advisory references, Wireshark pointer
+8. **Timeline / Attack-Chain Summary** — chronological table of MEDIUM+ findings (capped at 80), highlighting correlated attack sequences.
+9. **MITRE ATT&CK for ICS Coverage** — table of technique IDs and names observed across all findings.
+10. **Top Riskiest Devices** — top 15 devices by severity-weighted score.
+11. **Device Inventory** — top 200 devices by traffic volume; full list in the Device Inventory CSV.
+12. **Appendix A: Wireshark Investigation Guide** — per-category filter recipes and investigation steps (see §8).
+
+**Appendix B (optional — `--technical-appendix`):** Raw evidence lines and per-pcap breakdown for each finding category. Not included by default to keep the document readable for non-technical reviewers. Pass `--technical-appendix` on the command line to include it. The same detail is always available in the JSON export.
+
+All tables use a consistent dark-blue header row (white bold text, full grid borders). Right-click the Table of Contents and select *Update Field* after opening the document to populate page numbers.
 
 ### 7.2 Severity Color Coding
 
