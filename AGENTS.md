@@ -59,6 +59,27 @@ Violating these rules could constitute license infringement. When in doubt, leav
 
 ---
 
+## Documentation — Keep in Sync
+
+After **any** change to `otscope.py`, ask: does this affect something documented in the User Guide or the Obsidian vault? If yes, update both before committing.
+
+**User Guide** (`otscope/docs/OTscope_User_Guide.md`) must stay current whenever:
+- A CLI flag is added, removed, or its behavior changes → update §3 (Operating Modes and CLI).
+- The report structure or content changes → update §7.1 (Word Report Structure).
+- A new protocol detector or attack-pattern check is added → update §6 (Analysis Pipeline) and the Detection Coverage table in README.
+- A new output artifact is added or changed → update §7 (Reports and Artifacts).
+- Any other user-facing behavior changes → find the relevant section and update it.
+- The version is bumped → add a version history entry at the top of §14.
+
+**Obsidian Vault** (`notes/`) must stay current after every task:
+- `notes/Dev Log.md` — add an entry (newest at top) summarizing what changed and why.
+- `notes/Feature Backlog.md` — check off completed items; add new ideas surfaced during the work.
+- `notes/Architecture Decisions.md` — add an entry if a meaningful design decision was made.
+
+Both the User Guide update and the vault update must be done **before** creating the PR commit.
+
+---
+
 ## Running the Tool
 
 ```bash
@@ -98,15 +119,7 @@ python3 otscope/src/otscope.py --offline
 
 ## Obsidian Vault
 
-An Obsidian vault lives at `notes/` in the repo root (gitignored — never commit it).
-
-**Always keep the vault up to date when completing a task:**
-
-- `notes/Dev Log.md` — add an entry (newest at top) summarizing what changed and why.
-- `notes/Feature Backlog.md` — check off completed items; add new ideas surfaced during the work.
-- `notes/Architecture Decisions.md` — add an entry if a meaningful design decision was made.
-
-Update the vault as part of every task, before creating the PR commit.
+An Obsidian vault lives at `notes/` in the repo root (gitignored — never commit it). See the **Documentation — Keep in Sync** section above for what to update and when.
 
 ---
 
