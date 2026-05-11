@@ -77,9 +77,12 @@ __copyright__ = "© 2026 Ryan Lyford. All rights reserved."
 OFFLINE_MODE: bool = False
 NON_INTERACTIVE: bool = False  # set by --scan; suppresses all prompts
 CONFIG_PATH = Path.home() / ".ot_pcap_analyzer.conf"
-# Default root for capture subfolders — otscope/pcaps/ relative to this file.
-# Bare subfolder names typed at the pcap-path prompt resolve against this root.
-_PCAPS_ROOT = Path(__file__).resolve().parent.parent / "pcaps"
+# All paths are anchored to the directory that contains otscope.py so the tool
+# works correctly whether it lives inside the dev repo (otscope/src/) or as a
+# standalone file dropped into any folder (C:\OTscope\, a USB drive, etc.).
+_SCRIPT_DIR  = Path(__file__).resolve().parent
+_PCAPS_ROOT  = _SCRIPT_DIR / "pcaps"   # default drop folder for capture files
+_OUTPUT_ROOT = _SCRIPT_DIR / "output"  # default destination for all generated artifacts
 
 # JA3 hashes of well-documented offensive tooling (src: JA3 project, Salesforce research,
 # CISA advisories).  Matches here produce CRITICAL findings regardless of other TLS state.
@@ -1210,8 +1213,14 @@ def ensure_runtime_dependencies() -> None:
         for name in missing:
             print(f"    - {name}")
         print("\nInstall guidance:")
+        print("    pip install -r requirements.txt")
+        print("")
+        print("    Linux / macOS alternative:")
         print("    sudo apt install tshark python3-scapy python3-docx")
-        print("    or: pip install scapy python-docx")
+        print("")
+        print("    tshark must also be installed separately if missing:")
+        print("      Windows: https://www.wireshark.org/download.html")
+        print("      macOS:   brew install wireshark")
         raise SystemExit(1)
 
 
@@ -9040,6 +9049,15 @@ def run_application(args: argparse.Namespace) -> None:
     analyzer = OTPcapAnalyzer(config)
     CURRENT_ANALYZER = analyzer
     signal.signal(signal.SIGINT, signal_handler)
+    # Ensure the standard workspace folders exist next to the script.
+    # These are no-ops if the folders already exist or if the user runs
+    # from a read-only location (e.g. a locked USB drive) — errors are
+    # silently ignored so the tool still starts.
+    try:
+        _PCAPS_ROOT.mkdir(parents=True, exist_ok=True)
+        _OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
     print_banner()
     print_network_safety_banner()
     ta = getattr(args, "technical_appendix", False)
