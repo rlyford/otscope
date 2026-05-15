@@ -4,7 +4,7 @@
 
 Interactive multi-pcap OT/ICS traffic analysis with session persistence, role inference, attack-chain correlation, MITRE ATT&CK for ICS mapping, Wireshark investigation guidance, Purdue-Model architecture diagrams, and machine-readable artifacts.
 
-> **Version 2.5.0**  ·  May 2026
+> **Version 2.6.0**  ·  May 2026
 > Authored by Ryan Lyford  ·  © 2026 Ryan Lyford. All rights reserved.
 
 ---
@@ -51,7 +51,29 @@ It is designed for the case where you receive a pile of pcap files from a site y
 
 `scapy` and `capinfos` are optional. SVG diagrams require no additional dependencies — pure stdlib.
 
-### 2.1 First Run
+### 2.1 Field Deployment (Standalone)
+
+When distributing OTscope as a standalone file (without the full repository), the recommended layout is:
+
+```
+OTscope\
+    otscope.py
+    requirements.txt
+    README.txt          ← plain-text quick-start
+    pcaps\              ← drop capture files here
+    output\             ← reports appear here
+```
+
+On first run, OTscope automatically creates `pcaps\` and `output\` next to the script if they do not exist. If `pcaps\` is empty, the startup message will prompt you to drop capture files there before proceeding.
+
+Use `build_release.py` (at the repo root) to package this layout into a zip:
+
+```bash
+python build_release.py           # writes dist/OTscope_v<VERSION>.zip
+python build_release.py --dry-run # preview file list without writing
+```
+
+### 2.2 First Run
 
 ```bash
 python3 otscope.py
@@ -140,19 +162,42 @@ tshark itself is invoked with `-n` on every call so it never resolves any IP, MA
 
 ## 5. Environment Discovery Questions
 
-Asked once at session start. All optional — press Enter to skip individual questions or `S` to skip the rest. Answers add context to findings, enable absence-of-expected-traffic detection, and calibrate severity (e.g. DNP3 without Secure Authentication is CRITICAL in power/utility environments, HIGH otherwise).
+Asked once at session start. All are optional — press Enter to skip a question, or type `S` once to skip the rest.
 
-- Environment type — BAS/BMS, SCADA/ICS, Electrical/Power, Manufacturing, Oil & Gas, Physical Security, Water, Mixed, Unknown.
-- Expected protocols — Modbus, BACnet, DNP3, MQTT, OPC-UA, EtherNet/IP, S7/PROFINET, IEC 61850, ICCP, ONVIF, Profibus, CC-Link, Other.
-- Air-gapped (yes/no) — when yes, `--offline` is implicitly applied.
-- Encrypted OT comms expected anywhere? — escalates cleartext findings if yes.
-- Approximate OT device count.
-- Production vs. lab/test.
-- Known vendor systems (Honeywell, Siemens, Schneider, Rockwell, GE, ABB, Emerson, etc.).
-- Capture context — SPAN, TAP, host-based, unknown.
-- Known incidents/anomalies that prompted the analysis (free text).
-- Baseline file path (optional) — diff against a known-good snapshot.
-- Save current run AS a baseline at the end (yes/no).
+| Question | Effect on analysis |
+| --- | --- |
+| **Environment type** | Calibrates severity for environment-specific protocols. `power` / `electrical` / `substation` escalates DNP3 no-Secure-Auth to CRITICAL and adds absence checks for IEC 61850 and IEC 104. `physical` / `camera` adds absence checks for RTSP/ONVIF/OSDP. |
+| **Expected OT protocols** | Enables absence-of-expected-traffic findings for any protocol you list. If a declared protocol has no traffic in the captures, OTscope adds a MEDIUM finding. See keyword list below. |
+| **Known HMI / EWS IPs** | Any IP listed here is pinned to role "HMI / Engineering Workstation" during device-role inference, overriding the heuristic classifier. |
+| **Air-gapped (yes/no)** | Suppresses all outbound PTR and RDAP lookups (equivalent to `--offline`). Also escalates new-device baseline-diff findings to CRITICAL. |
+| **Baseline file** | Path to a `.otpa_baseline` file — enables diff detection (new device, new flow, new protocol, new port). |
+| **Save as baseline** | After analysis, save this session's device/flow set as a new known-good baseline. |
+
+### 5.1 Expected Protocols — Keyword Reference
+
+Type any of these keywords (comma-separated) to enable absence detection for that protocol:
+
+| Keyword(s) | Protocol |
+| --- | --- |
+| `modbus` | Modbus TCP (TCP 502) |
+| `bacnet` | BACnet/IP (UDP 47808) |
+| `dnp3` | DNP3 (TCP/UDP 20000) |
+| `iec61850`, `goose`, `mms` | IEC 61850 / GOOSE / MMS |
+| `iec104`, `iec60870` | IEC 60870-5-104 (TCP 2404) |
+| `mqtt` | MQTT (TCP 1883 / 8883) |
+| `opcua`, `opc-ua`, `opc` | OPC-UA (TCP 4840 / 4843) |
+| `enip`, `cip`, `ethernet/ip` | EtherNet/IP / CIP (TCP 44818) |
+| `s7`, `profinet`, `siemens` | Siemens S7 / PROFINET |
+| `omron`, `fins` | Omron FINS (TCP/UDP 9600) |
+| `srtp`, `ge` | GE SRTP (TCP 18245) |
+| `umas`, `schneider`, `modicon` | Schneider UMAS (TCP 1024) |
+| `melsec`, `mitsubishi`, `slmp` | Mitsubishi MELSEC SLMP (TCP 5007) |
+| `historian`, `osisoft` | OSIsoft PI Server (TCP 9001) |
+| `ignition` | Ignition Gateway (TCP 4592) |
+| `nodered`, `node-red` | Node-RED (TCP 1880) |
+| `physical`, `rtsp`, `osdp`, `onvif`, `camera` | Physical Security (RTSP / ONVIF / OSDP) |
+
+Example entry: `modbus, dnp3, historian, ignition`
 
 ---
 
@@ -439,14 +484,16 @@ Net result: a 1.4M-device flood capture renders as a ~50-page Word report with t
 | Path | Purpose |
 | --- | --- |
 | `~/.ot_pcap_analyzer.conf` | Last folder, last assessor, last site, configurable thresholds. |
-| `<pcap_folder>/<session>.otpa_session` | Session state JSON — devices, connections, findings, environment answers, processed pcaps. |
-| `<pcap_folder>/<site>_baseline.otpa_baseline` | Optional: known-good snapshot for diffing. |
-| `<pcap_folder>/OT_PCAP_Analysis_<site>_<YYYYMMDD>.docx` | Word report. |
-| `<pcap_folder>/OT_PCAP_Analysis_<site>_<YYYYMMDD>.json` | JSON report. |
-| `<pcap_folder>/OT_Device_Inventory_<site>_<YYYYMMDD>.csv` | Full device inventory. |
-| `<pcap_folder>/OT_Flow_Allowlist_<site>_<YYYYMMDD>.csv` | Observed flows for segmentation policy. |
-| `<pcap_folder>/OTscope_Purdue_Summary_<site>_<YYYYMMDD>.svg` | Visual Purdue diagram (always). |
-| `<pcap_folder>/OTscope_Purdue_Detail_<site>_<YYYYMMDD>.svg` | Visual per-device diagram (≤50 devices only). |
+| `<session_folder>/<session>.otpa_session` | Session state JSON — devices, connections, findings, environment answers, processed pcaps. |
+| `<session_folder>/<site>_baseline.otpa_baseline` | Optional: known-good snapshot for diffing. |
+| `<session_folder>/OT_PCAP_Analysis_<site>_<YYYYMMDD>.docx` | Word report. |
+| `<session_folder>/OT_PCAP_Analysis_<site>_<YYYYMMDD>.json` | JSON report (auto-generated alongside every Word report). |
+| `<session_folder>/OT_Device_Inventory_<site>_<YYYYMMDD>.csv` | Full device inventory. |
+| `<session_folder>/OT_Flow_Allowlist_<site>_<YYYYMMDD>.csv` | Observed flows for segmentation policy. |
+| `<session_folder>/OTscope_Purdue_Summary_<session>.svg` | Visual Purdue diagram (always). |
+| `<session_folder>/OTscope_Purdue_Detail_<session>.svg` | Visual per-device diagram (≤50 devices only). |
+
+> **Field deployment note:** When running from the standard field layout, `pcaps\` is the default pcap drop folder and `output\` is the default session folder — both are siblings of `otscope.py` and are auto-created on first run.
 
 ---
 
@@ -479,6 +526,22 @@ When the Word report opens, work top-down for fastest triage:
 ## 14. Version History
 
 Running log of capabilities added in each release. Newest at the top.
+
+### Version 2.6.0 · May 2026 (patch 4)
+
+Field deployment, discovery question overhaul, and complete expected-protocol absence coverage.
+
+- **4 documentation-only discovery questions removed** (`expected_vendors`, `known_it_services`, `capture_context`, `maintenance_window`) — none drove analysis logic.
+- **`expected_protocols` question rewritten** with an inline keyword cheat-sheet. Users can now type any recognized keyword to enable absence detection for that protocol.
+- **Absence-of-expected-traffic detection completed** across all 17 supported protocols. Three previously env_type-only checks (IEC 61850, IEC 60870-5-104, Physical Security) now also trigger from `expected_protocols`. Seven vendor protocols added in v2.5.0 (Omron FINS, GE SRTP, Schneider UMAS, Mitsubishi MELSEC, OSIsoft PI, Ignition, Node-RED) now have absence findings when declared but not observed.
+- **JSON and Purdue SVG files are now always auto-generated** alongside every successful Word report — no `--format both` required.
+- **Field deployment packaging** — `pcaps\` and `output\` are auto-created as siblings of `otscope.py` on first run. If `pcaps\` is empty, a startup hint directs the user to drop captures there. `README.txt` added alongside the script with a plain-text 10-step quick-start.
+- **`build_release.py`** at the repo root packages the field distribution zip (`dist/OTscope_v<VERSION>.zip`) on demand. Supports `--dry-run`.
+- **Script-relative path anchor** — all workspace paths now use `_SCRIPT_DIR = Path(__file__).resolve().parent` so `pcaps\` and `output\` always resolve correctly regardless of where `otscope.py` is placed.
+- **Windows-friendly dependency error** — `ensure_runtime_dependencies()` now leads with `pip install -r requirements.txt` and includes tshark download links for Windows and macOS.
+- **Advisory references updated** — Dragos references now cite the specific "Dragos OT Cybersecurity Year in Review 2025 (dragos.com/year-in-review)" rather than a generic title.
+- **"Key OT Concepts for IT Auditors" section removed** from the Word report — report stays focused on the pcap under analysis.
+- **MITRE ATT&CK technique IDs** in the Word report's ATT&CK coverage table are now hyperlinked to `attack.mitre.org`.
 
 ### Version 2.6.0 · May 2026
 
