@@ -2,9 +2,21 @@ venv/
 **/venv/
 __pycache__/
 *.pyc
-otscope/output/
+
+# Capture files — never commit pcap data
 *.pcap
 *.pcapng
+
+# Dev-repo legacy output/pcaps dirs (parent of src/)
+otscope/output/
 otscope/pcaps/
+
+# Field-deployment workspace dirs (siblings of otscope.py in src/)
+# Ignore content but track the .gitkeep so the folders exist in a fresh clone/zip.
+otscope/src/pcaps/*
+!otscope/src/pcaps/.gitkeep
+otscope/src/output/*
+!otscope/src/output/.gitkeep
+
 .claude/
 notes/

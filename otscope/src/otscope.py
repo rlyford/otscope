@@ -9058,6 +9058,17 @@ def run_application(args: argparse.Namespace) -> None:
         _OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     except OSError:
         pass
+    # If the pcaps folder exists but holds no capture files, guide the user
+    # before they hit the file-selection prompt mid-session.
+    if _PCAPS_ROOT.is_dir() and not any(
+        f.suffix.lower() in {".pcap", ".pcapng", ".cap"}
+        for f in _PCAPS_ROOT.rglob("*")
+        if f.is_file()
+    ):
+        print(colorize(f"[i] No capture files found in {_PCAPS_ROOT}", "INFO"))
+        print(colorize(f"    Drop your .pcap / .pcapng files into that folder, then run OTscope again.", "INFO"))
+        print(colorize(f"    (You can also enter any full path at the prompt below.)", "INFO"))
+        print()
     print_banner()
     print_network_safety_banner()
     ta = getattr(args, "technical_appendix", False)
