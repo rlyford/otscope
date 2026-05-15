@@ -2062,12 +2062,11 @@ def discovery_questions() -> List[Tuple[str, str]]:
     """Return the environment discovery question set."""
     return [
         ("environment_type", "Environment type (e.g., manufacturing, power, water, physical security, building automation)"),
-        ("expected_protocols", "Expected OT protocols (comma-separated, optional)"),
-        ("expected_vendors", "Known vendors/platforms (optional)"),
+        ("expected_protocols",
+         "Expected OT protocols — enter any that apply, comma-separated\n"
+         "    Keywords: modbus  bacnet  dnp3  iec61850  iec104  mqtt  opcua  enip  s7\n"
+         "              omron   srtp    umas  melsec    historian  ignition  nodered  physical"),
         ("known_hmis", "Known HMI or engineering workstation IPs/hostnames (optional)"),
-        ("known_it_services", "Known IT services expected near the OT boundary (optional)"),
-        ("capture_context", "Capture notes / vantage point (switch SPAN, host capture, tap, etc.)"),
-        ("maintenance_window", "Known maintenance window or off-hours context (optional)"),
         ("air_gapped", "Is this environment air-gapped or isolated from the internet? (yes/no)"),
         ("baseline_file", "Baseline file to compare against (optional path, e.g. site_baseline.otpa_baseline)"),
         ("save_as_baseline", "After analysis, save this session's device/flow set AS a new baseline? (yes/no)"),
@@ -3526,8 +3525,8 @@ class OTPcapAnalyzer:
         rows = self._filtered_rows(pcaps, "mms || goose || sv || tcp.port == 102")
         if not rows:
             env_type = self.session.environment_answers.get("environment_type", "").lower() if self.session else ""
-            if any(term in env_type for term in ("power", "electrical", "substation")):
-                self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected IEC 61850 traffic not observed", "The environment appears electrical/power-related, but no GOOSE or MMS traffic was observed.", ["No mms/goose/sv packets matched."], [], [], "IEC 61850", [pcap.name for pcap in pcaps], "absence::iec61850")
+            if any(term in env_type for term in ("power", "electrical", "substation")) or self._expected_protocol(["iec61850", "iec 61850", "goose", "mms"]):
+                self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected IEC 61850 traffic not observed", "IEC 61850 / GOOSE / MMS was expected but no matching traffic was observed.", ["No mms/goose/sv packets matched."], [], [], "IEC 61850", [pcap.name for pcap in pcaps], "absence::iec61850")
             return 0
         goose_by_mac: Dict[str, List[int]] = defaultdict(list)
         for pcap, row in rows:
@@ -3557,12 +3556,12 @@ class OTPcapAnalyzer:
         rows = self._filtered_rows(pcaps, "tcp.port == 2404")
         if not rows:
             env_type = self.session.environment_answers.get("environment_type", "").lower() if self.session else ""
-            if any(term in env_type for term in ("power", "electrical", "utility", "substation", "grid")):
+            if any(term in env_type for term in ("power", "electrical", "utility", "substation", "grid")) or self._expected_protocol(["iec104", "iec 104", "iec60870"]):
                 self.add_finding(
                     SEVERITY_MEDIUM,
                     "Absence of Expected Traffic",
                     "Expected IEC 60870-5-104 traffic not observed",
-                    "The environment appears power/utility-related, but no IEC 60870-5-104 traffic was observed on TCP/2404.",
+                    "IEC 60870-5-104 was expected but no traffic was observed on TCP/2404.",
                     ["No TCP/2404 or IEC 104 packets matched."],
                     [], [], "IEC 60870-5-104",
                     [pcap.name for pcap in pcaps],
@@ -3780,8 +3779,8 @@ class OTPcapAnalyzer:
         rows = self._filtered_rows(pcaps, "rtsp || udp.port == 3702 || tcp.port == 554 || tcp.port == 8554 || tcp.port == 8080")
         if not rows:
             env_type = self.session.environment_answers.get("environment_type", "").lower() if self.session else ""
-            if "physical" in env_type or "camera" in env_type:
-                self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected physical security traffic not observed", "The environment appears related to physical security, but no RTSP/ONVIF/OSDP activity was observed.", ["No physical security protocol packets matched."], [], [], "Physical Security", [pcap.name for pcap in pcaps], "absence::physical-security")
+            if "physical" in env_type or "camera" in env_type or self._expected_protocol(["physical", "rtsp", "osdp", "onvif", "camera"]):
+                self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected physical security traffic not observed", "Physical security protocols (RTSP/ONVIF/OSDP) were expected but no matching traffic was observed.", ["No physical security protocol packets matched."], [], [], "Physical Security", [pcap.name for pcap in pcaps], "absence::physical-security")
             return 0
         for pcap, row in rows:
             source_ip = row_source_ip(row)
@@ -6468,9 +6467,9 @@ class OTPcapAnalyzer:
         # IEC 61850
         before = len(self.session.findings)
         if not i61["rows_seen"]:
-            if any(t in env_type for t in ("power", "electrical", "substation")):
+            if any(t in env_type for t in ("power", "electrical", "substation")) or self._expected_protocol(["iec61850", "iec 61850", "goose", "mms"]):
                 self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected IEC 61850 traffic not observed",
-                    "The environment appears electrical/power-related, but no GOOSE or MMS traffic was observed.",
+                    "IEC 61850 / GOOSE / MMS was expected but no matching traffic was observed.",
                     ["No mms/goose/sv packets matched."], [], [], "IEC 61850", pcap_name_list, "absence::iec61850")
         else:
             for src_mac, values in i61["goose_by_mac"].items():
@@ -6487,9 +6486,9 @@ class OTPcapAnalyzer:
         # IEC 104
         before = len(self.session.findings)
         if not i104["rows_seen"]:
-            if any(t in env_type for t in ("power", "electrical", "utility", "substation", "grid")):
+            if any(t in env_type for t in ("power", "electrical", "utility", "substation", "grid")) or self._expected_protocol(["iec104", "iec 104", "iec60870"]):
                 self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected IEC 60870-5-104 traffic not observed",
-                    "The environment appears power/utility-related, but no IEC 104 traffic was observed on TCP/2404.",
+                    "IEC 60870-5-104 was expected but no traffic was observed on TCP/2404.",
                     ["No TCP/2404 packets matched."], [], [], "IEC 60870-5-104", pcap_name_list, "absence::iec104")
         print(colorize(f"[✓] IEC 60870-5-104 complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
 
@@ -6549,10 +6548,9 @@ class OTPcapAnalyzer:
         # Physical Security
         before = len(self.session.findings)
         if not phys["rows_seen"]:
-            phys_env = any(t in env_type for t in ("physical", "camera"))
-            if phys_env:
+            if any(t in env_type for t in ("physical", "camera")) or self._expected_protocol(["physical", "rtsp", "osdp", "onvif", "camera"]):
                 self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected physical security traffic not observed",
-                    "The environment appears related to physical security, but no RTSP/ONVIF/OSDP activity was observed.",
+                    "Physical security protocols (RTSP/ONVIF/OSDP) were expected but no matching traffic was observed.",
                     ["No physical security protocol packets matched."], [], [], "Physical Security", pcap_name_list, "absence::physical-security")
         print(colorize(f"[✓] Physical Security Protocols complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
 
@@ -6569,6 +6567,10 @@ class OTPcapAnalyzer:
                 [], [], "Omron FINS", sorted(fins["pcap_names"]),
                 "fins::cleartext", tags=["cleartext", "fins"],
             )
+        elif self._expected_protocol(["omron", "fins"]):
+            self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected Omron FINS traffic not observed",
+                "Omron FINS (TCP/UDP 9600) was declared as expected, but no traffic was observed on that port.",
+                ["No TCP/UDP 9600 packets matched."], [], [], "Omron FINS", pcap_name_list, "absence::fins")
         print(colorize(f"[✓] Omron FINS complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
 
         # GE SRTP
@@ -6584,6 +6586,10 @@ class OTPcapAnalyzer:
                 [], [], "GE SRTP", sorted(gertp["pcap_names"]),
                 "gertp::cleartext", tags=["cleartext", "ge_srtp"],
             )
+        elif self._expected_protocol(["srtp", "ge srtp", "ge"]):
+            self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected GE SRTP traffic not observed",
+                "GE SRTP (TCP 18245) was declared as expected, but no traffic was observed on that port.",
+                ["No TCP 18245 packets matched."], [], [], "GE SRTP", pcap_name_list, "absence::srtp")
         print(colorize(f"[✓] GE SRTP complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
 
         # Schneider UMAS
@@ -6599,6 +6605,10 @@ class OTPcapAnalyzer:
                 [], [], "Schneider UMAS", sorted(umas["pcap_names"]),
                 "umas::cleartext", tags=["cleartext", "umas", "schneider"],
             )
+        elif self._expected_protocol(["umas", "schneider", "modicon"]):
+            self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected Schneider UMAS traffic not observed",
+                "Schneider UMAS (TCP 1024) was declared as expected, but no traffic was observed on that port.",
+                ["No TCP 1024 packets matched."], [], [], "Schneider UMAS", pcap_name_list, "absence::umas")
         print(colorize(f"[✓] Schneider UMAS complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
 
         # Mitsubishi MELSEC
@@ -6614,6 +6624,10 @@ class OTPcapAnalyzer:
                 [], [], "Mitsubishi MELSEC", sorted(melsec["pcap_names"]),
                 "melsec::cleartext", tags=["cleartext", "melsec", "mitsubishi"],
             )
+        elif self._expected_protocol(["melsec", "mitsubishi", "slmp"]):
+            self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected Mitsubishi MELSEC traffic not observed",
+                "Mitsubishi MELSEC SLMP (TCP 5007) was declared as expected, but no traffic was observed on that port.",
+                ["No TCP 5007 packets matched."], [], [], "Mitsubishi MELSEC", pcap_name_list, "absence::melsec")
         print(colorize(f"[✓] Mitsubishi MELSEC complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
 
         # OSIsoft PI Server
@@ -6629,6 +6643,10 @@ class OTPcapAnalyzer:
                 [], [], "OSIsoft PI", sorted(pi_srv["pcap_names"]),
                 "pi_srv::presence", tags=["pi_server", "historian"],
             )
+        elif self._expected_protocol(["historian", "osisoft", "pi server"]):
+            self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected OSIsoft PI historian traffic not observed",
+                "OSIsoft PI Server (TCP 9001) was declared as expected, but no traffic was observed on that port.",
+                ["No TCP 9001 packets matched."], [], [], "OSIsoft PI", pcap_name_list, "absence::pi_srv")
         print(colorize(f"[✓] OSIsoft PI Server complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
 
         # Ignition Gateway
@@ -6644,6 +6662,10 @@ class OTPcapAnalyzer:
                 [], [], "Ignition Gateway", sorted(ignition["pcap_names"]),
                 "ignition::presence", tags=["ignition"],
             )
+        elif self._expected_protocol(["ignition"]):
+            self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected Ignition Gateway traffic not observed",
+                "Ignition Gateway (TCP 4592) was declared as expected, but no traffic was observed on that port.",
+                ["No TCP 4592 packets matched."], [], [], "Ignition Gateway", pcap_name_list, "absence::ignition")
         print(colorize(f"[✓] Ignition Gateway complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
 
         # Node-RED
@@ -6659,6 +6681,10 @@ class OTPcapAnalyzer:
                 [], [], "Node-RED", sorted(nodered["pcap_names"]),
                 "nodered::presence", tags=["cleartext", "nodered"],
             )
+        elif self._expected_protocol(["nodered", "node-red"]):
+            self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected Node-RED traffic not observed",
+                "Node-RED (TCP 1880) was declared as expected, but no traffic was observed on that port.",
+                ["No TCP 1880 packets matched."], [], [], "Node-RED", pcap_name_list, "absence::nodered")
         print(colorize(f"[✓] Node-RED complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
 
         # Store hygiene TCP state for check_network_hygiene to consume
