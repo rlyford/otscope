@@ -18,5 +18,8 @@ otscope/src/pcaps/*
 otscope/src/output/*
 !otscope/src/output/.gitkeep
 
+# Release packages — built by build_release.py, never committed
+dist/
+
 .claude/
 notes/
