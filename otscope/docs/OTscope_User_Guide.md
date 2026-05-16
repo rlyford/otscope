@@ -196,6 +196,9 @@ Type any of these keywords (comma-separated) to enable absence detection for tha
 | `ignition` | Ignition Gateway (TCP 4592) |
 | `nodered`, `node-red` | Node-RED (TCP 1880) |
 | `physical`, `rtsp`, `osdp`, `onvif`, `camera` | Physical Security (RTSP / ONVIF / OSDP) |
+| `zigbee`, `zbee`, `ieee 802.15.4` | Zigbee / IEEE 802.15.4 wireless |
+| `coap` | CoAP (UDP 5683 cleartext / 5684 DTLS) |
+| `zwave`, `z-wave` | Z-Wave wireless |
 
 Example entry: `modbus, dnp3, historian, ignition`
 
@@ -229,6 +232,9 @@ ONE combined tshark read per pcap with a single display filter that covers all p
 - OSIsoft PI Server (TCP 9001) — historian traffic presence, potential data exfiltration.
 - Ignition Gateway (TCP 4592) — OPC-UA without TLS indicators.
 - Node-RED (TCP 1880) — unauthenticated dashboard access, flow deployment events.
+- Zigbee / IEEE 802.15.4 — wireless presence, unencrypted frames (no zbee_nwk security header), ZCL write/control commands.
+- CoAP (UDP 5683/5684) — cleartext CoAP presence (5683), DTLS-protected traffic (5684), PUT/POST/DELETE write operations.
+- Z-Wave — wireless presence detection.
 - Physical Security — RTSP/ONVIF cleartext, ONVIF discovery storms.
 - Beaconing / C2 — low-jitter periodic flows.
 - DNS anomalies — DGA-like NXDOMAIN bursts, long names, large TXT, multi-resolver.
@@ -526,6 +532,16 @@ When the Word report opens, work top-down for fastest triage:
 ## 14. Version History
 
 Running log of capabilities added in each release. Newest at the top.
+
+### Version 2.6.0 · May 2026 (patch 5)
+
+IoT wireless protocol detection and output directory fix.
+
+- **Output directory fix** — reports, session files, and companion artifacts (JSON, SVGs) are now always written to `output\` (sibling of `otscope.py`) instead of the pcap source folder. Falls back to the pcap folder if `output\` is not accessible (e.g. read-only USB).
+- **Zigbee / IEEE 802.15.4 detection** — presence, unencrypted frames (`zbee_nwk.security == 0`), and ZCL write/control commands. Absence finding when declared via `expected_protocols`. Wireshark investigation guide added.
+- **CoAP detection** — cleartext CoAP (UDP/5683) vs. DTLS-protected (UDP/5684), PUT/POST/DELETE write operations. Absence finding when declared.
+- **Z-Wave detection** — presence detection with absence support when declared.
+- **`expected_protocols` prompt** updated with an `IoT:` section listing `zigbee`, `coap`, and `zwave` keywords.
 
 ### Version 2.6.0 · May 2026 (patch 4)
 

@@ -1578,6 +1578,30 @@ _WIRESHARK_GUIDE: List[Tuple[Tuple[str, ...], str, List[str]]] = [
          "Sort the Modbus stream by time and look for the specific poll interval where the value jump occurred — compare neighboring frames for injected/out-of-sequence responses.",
          "Cross-reference the anomalous value with the known engineering range for that register (check the P&ID or HMI configuration for expected min/max).",
      ]),
+    (("zigbee", "zbee", "ieee 802.15.4", "wpan"),
+     "zbee_nwk || zbee_aps || zbee_zcl || wpan",
+     [
+         "Filter to 'zbee_nwk || zbee_aps' to see all Zigbee network and application layer frames. Check the 'zbee_nwk.security' field — value 0 means no network-layer encryption.",
+         "Expand the ZigBee NWK tree in any frame to see source/destination short addresses, frame type (Data / Command / Beacon), and the security sub-field.",
+         "Use 'zbee_zcl' to filter for ZigBee Cluster Library frames. The 'zbee_zcl.cmd.id' field identifies the command (0x02 = Write Attributes, 0x00 = Read Attributes).",
+         "Cross-reference source MAC/extended addresses (wpan.src64) against your known device inventory. Unknown extended addresses indicate rogue or unregistered Zigbee devices.",
+     ]),
+    (("coap", "constrained application protocol"),
+     "coap || udp.port == 5683 || udp.port == 5684",
+     [
+         "Filter to 'coap' to see all CoAP frames. The 'coap.code' column shows the method (0.01=GET, 0.02=POST, 0.03=PUT, 0.04=DELETE) — PUT and POST are write operations.",
+         "Traffic on UDP/5683 is cleartext CoAP; UDP/5684 should be DTLS-protected. Presence of 5683 traffic means content is readable by any observer on the network.",
+         "Expand the CoAP tree and check 'coap.uri_path' to see which resource is being accessed. Control or configuration paths (e.g. /actuator, /config, /cmd) are high-priority.",
+         "Use Statistics → Endpoints to identify which devices are sending CoAP write operations (POST/PUT). Confirm each is an authorized controller.",
+     ]),
+    (("z-wave", "zwave"),
+     "zwave",
+     [
+         "Filter to 'zwave' to see all Z-Wave frames. Check the source and destination node IDs in the Z-Wave tree.",
+         "Look for Basic Set, Switch Binary Set, or Door Lock Operation commands — these are actuator control frames that can physically change device state.",
+         "Identify the Z-Wave Home ID in the frame header — each Z-Wave network has a unique Home ID. Multiple Home IDs in a single capture may indicate overlapping or rogue networks.",
+         "Z-Wave S2 security uses AES-128. If you see unencrypted command frames (no security encapsulation), the network is using S0 or no security — a significant risk for door locks and access control.",
+     ]),
 ]
 
 
@@ -1861,6 +1885,9 @@ BASE_PACKET_FIELDS = [
     # Modbus register value tracking — empty on non-Modbus frames; cheap to include.
     "modbus.reference_num",
     "modbus.regval_uint16",
+    # IoT wireless protocol fields — empty on non-matching frames; cheap to include.
+    "zbee_nwk.security",   # Zigbee: 0 = unencrypted, 1 = security header present
+    "coap.code",           # CoAP: method code (e.g. "0.03" PUT, "0.02" POST)
 ]
 
 # Superset used only for checks that need payload content (legacy, artifact extraction).
@@ -2064,8 +2091,9 @@ def discovery_questions() -> List[Tuple[str, str]]:
         ("environment_type", "Environment type (e.g., manufacturing, power, water, physical security, building automation)"),
         ("expected_protocols",
          "Expected OT protocols — enter any that apply, comma-separated\n"
-         "    Keywords: modbus  bacnet  dnp3  iec61850  iec104  mqtt  opcua  enip  s7\n"
-         "              omron   srtp    umas  melsec    historian  ignition  nodered  physical"),
+         "    OT:  modbus  bacnet  dnp3  iec61850  iec104  mqtt  opcua  enip  s7\n"
+         "         omron   srtp    umas  melsec    historian  ignition  nodered  physical\n"
+         "    IoT: zigbee  coap  zwave"),
         ("known_hmis", "Known HMI or engineering workstation IPs/hostnames (optional)"),
         ("air_gapped", "Is this environment air-gapped or isolated from the internet? (yes/no)"),
         ("baseline_file", "Baseline file to compare against (optional path, e.g. site_baseline.otpa_baseline)"),
@@ -5070,6 +5098,9 @@ class OTPcapAnalyzer:
         "dnp3 || mms || goose || sv || opcua || s7comm || pn_dcp || rtsp || "
         "tftp || "
         "arp || dns || icmp || tls || ssl || "
+        # IoT wireless and constrained-device protocols
+        "zbee_nwk || zbee_aps || wpan || zwave || coap || "
+        "udp.port in {5683,5684} || "
         "tcp.flags.reset==1 || (tcp.flags.syn==1 && tcp.flags.ack==0)"
     )
 
@@ -5232,6 +5263,18 @@ class OTPcapAnalyzer:
         pi_srv:   Dict[str, Any] = {"rows_seen": False, "pcap_names": set(), "samples": []}
         ignition: Dict[str, Any] = {"rows_seen": False, "pcap_names": set(), "samples": []}
         nodered:  Dict[str, Any] = {"rows_seen": False, "pcap_names": set(), "samples": []}
+        # IoT wireless / constrained-device protocol accumulators
+        zigbee:   Dict[str, Any] = {
+            "rows_seen": False, "pcap_names": set(), "samples": [],
+            "unencrypted_samples": [],   # frames without zbee_nwk.security
+            "write_samples": [],         # ZCL write / control frames
+        }
+        coap_acc: Dict[str, Any] = {
+            "rows_seen": False, "pcap_names": set(), "samples": [],
+            "write_samples": [],         # PUT / POST frames
+            "unencrypted_samples": [],   # traffic on port 5683 (not 5684/DTLS)
+        }
+        zwave:    Dict[str, Any] = {"rows_seen": False, "pcap_names": set(), "samples": []}
 
         # Per-pair (src, dst) ARP request timestamps — used to decide if a reply
         # was preceded by a request.  We use a short sliding window per pair.
@@ -5776,6 +5819,43 @@ class OTPcapAnalyzer:
                             f"modbus::mei::{src}::{dst}",
                             tags=["recon", "modbus"],
                         )
+
+                    # ---- Zigbee (IEEE 802.15.4 / ZigBee NWK / APS) ------
+                    if "zbee_nwk" in fp or "zbee_aps" in fp or "zbee_zcl" in fp or "wpan" in fp:
+                        zigbee["rows_seen"] = True
+                        zigbee["pcap_names"].add(pn)
+                        if len(zigbee["samples"]) < 5:
+                            zigbee["samples"].append(ev)
+                        sec = row.get("zbee_nwk.security", "")
+                        if sec == "0" or sec == "" and ("zbee_nwk" in fp or "zbee_aps" in fp):
+                            if len(zigbee["unencrypted_samples"]) < 5:
+                                zigbee["unencrypted_samples"].append(ev)
+                        if any(t in il for t in ("write", "command", "on/off", "level control", "thermostat", "door lock")):
+                            if len(zigbee["write_samples"]) < 5:
+                                zigbee["write_samples"].append(ev)
+
+                    # ---- CoAP (Constrained Application Protocol) ---------
+                    if "coap" in fp or dport in {5683, 5684} or sport in {5683, 5684}:
+                        coap_acc["rows_seen"] = True
+                        coap_acc["pcap_names"].add(pn)
+                        if len(coap_acc["samples"]) < 5:
+                            coap_acc["samples"].append(ev)
+                        code = row.get("coap.code", "")
+                        # CoAP PUT = 0.03, POST = 0.02, DELETE = 0.04
+                        if code in {"0.02", "0.03", "0.04"} or any(t in il for t in ("put", "post", "delete")):
+                            if len(coap_acc["write_samples"]) < 5:
+                                coap_acc["write_samples"].append(ev)
+                        # Unencrypted CoAP runs on 5683; DTLS-protected on 5684
+                        if dport == 5683 or sport == 5683:
+                            if len(coap_acc["unencrypted_samples"]) < 5:
+                                coap_acc["unencrypted_samples"].append(ev)
+
+                    # ---- Z-Wave ------------------------------------------
+                    if "zwave" in fp:
+                        zwave["rows_seen"] = True
+                        zwave["pcap_names"].add(pn)
+                        if len(zwave["samples"]) < 5:
+                            zwave["samples"].append(ev)
 
                     # ---- OMRON FINS (TCP/UDP 9600) -----------------------
                     # Factory Interface Network Service — proprietary Omron
@@ -6686,6 +6766,110 @@ class OTPcapAnalyzer:
                 "Node-RED (TCP 1880) was declared as expected, but no traffic was observed on that port.",
                 ["No TCP 1880 packets matched."], [], [], "Node-RED", pcap_name_list, "absence::nodered")
         print(colorize(f"[✓] Node-RED complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
+
+        # Zigbee
+        before = len(self.session.findings)
+        if zigbee["rows_seen"]:
+            sev = SEVERITY_HIGH
+            desc = (
+                "Zigbee (IEEE 802.15.4) wireless traffic was observed in the capture. "
+                "Zigbee is a low-power wireless mesh protocol common in building automation, "
+                "smart meters, and industrial wireless sensor networks. Its presence on an OT "
+                "network expands the attack surface beyond wired infrastructure — any device "
+                "within RF range with a Zigbee radio can observe or inject traffic."
+            )
+            samples = zigbee["samples"] or ["See pcap evidence"]
+            self.add_finding(
+                sev, "Zigbee / IEEE 802.15.4",
+                "Zigbee wireless traffic observed",
+                desc, samples, [], [], "Zigbee", sorted(zigbee["pcap_names"]),
+                "zigbee::presence", tags=["wireless", "zigbee"],
+            )
+            if zigbee["unencrypted_samples"]:
+                self.add_finding(
+                    SEVERITY_HIGH, "Zigbee / IEEE 802.15.4",
+                    "Unencrypted Zigbee frames observed",
+                    "Zigbee frames without a network-layer security header were observed. "
+                    "Unencrypted Zigbee traffic can be captured and replayed by any nearby device "
+                    "with a compatible radio. Network-layer encryption should be enabled on all "
+                    "Zigbee coordinators and end devices.",
+                    zigbee["unencrypted_samples"], [], [], "Zigbee", sorted(zigbee["pcap_names"]),
+                    "zigbee::unencrypted", tags=["cleartext", "wireless", "zigbee"],
+                )
+            if zigbee["write_samples"]:
+                self.add_finding(
+                    SEVERITY_HIGH, "Zigbee / IEEE 802.15.4",
+                    "Zigbee control or write commands observed",
+                    "Zigbee ZCL write or control-class commands were observed. These commands can "
+                    "actuate physical devices (lights, locks, thermostats, valves). Confirm the "
+                    "initiating device is authorized and expected.",
+                    zigbee["write_samples"], [], [], "Zigbee", sorted(zigbee["pcap_names"]),
+                    "zigbee::write", tags=["write", "wireless", "zigbee"],
+                )
+        elif self._expected_protocol(["zigbee", "zbee", "ieee 802.15.4"]):
+            self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected Zigbee traffic not observed",
+                "Zigbee / IEEE 802.15.4 was declared as expected, but no matching frames were observed.",
+                ["No zbee_nwk / zbee_aps / wpan packets matched."], [], [], "Zigbee", pcap_name_list, "absence::zigbee")
+        print(colorize(f"[✓] Zigbee complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
+
+        # CoAP
+        before = len(self.session.findings)
+        if coap_acc["rows_seen"]:
+            self.add_finding(
+                SEVERITY_MEDIUM, "CoAP",
+                "CoAP (Constrained Application Protocol) traffic observed",
+                "CoAP traffic was observed. CoAP is a lightweight REST-like protocol used by "
+                "constrained IoT/ICS devices (sensors, actuators, smart meters). Verify that "
+                "devices are using DTLS-protected CoAP (UDP/5684) rather than cleartext CoAP "
+                "(UDP/5683), and that write operations originate from authorized controllers.",
+                coap_acc["samples"] or ["See pcap evidence"],
+                [], [], "CoAP", sorted(coap_acc["pcap_names"]),
+                "coap::presence", tags=["coap"],
+            )
+            if coap_acc["unencrypted_samples"]:
+                self.add_finding(
+                    SEVERITY_HIGH, "CoAP",
+                    "Cleartext CoAP traffic observed (UDP/5683)",
+                    "CoAP traffic was observed on UDP/5683, the unencrypted port. Sensitive device "
+                    "state and control commands are visible to any observer on the network. Migrate "
+                    "to DTLS-protected CoAP on UDP/5684.",
+                    coap_acc["unencrypted_samples"], [], [], "CoAP", sorted(coap_acc["pcap_names"]),
+                    "coap::cleartext", tags=["cleartext", "coap"],
+                )
+            if coap_acc["write_samples"]:
+                self.add_finding(
+                    SEVERITY_MEDIUM, "CoAP",
+                    "CoAP write or control operations observed",
+                    "CoAP PUT, POST, or DELETE requests were observed. These can modify device state "
+                    "or configuration. Confirm the requesting device is authorized.",
+                    coap_acc["write_samples"], [], [], "CoAP", sorted(coap_acc["pcap_names"]),
+                    "coap::write", tags=["write", "coap"],
+                )
+        elif self._expected_protocol(["coap"]):
+            self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected CoAP traffic not observed",
+                "CoAP (UDP 5683/5684) was declared as expected, but no matching traffic was observed.",
+                ["No CoAP packets matched."], [], [], "CoAP", pcap_name_list, "absence::coap")
+        print(colorize(f"[✓] CoAP complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
+
+        # Z-Wave
+        before = len(self.session.findings)
+        if zwave["rows_seen"]:
+            self.add_finding(
+                SEVERITY_MEDIUM, "Z-Wave",
+                "Z-Wave wireless traffic observed",
+                "Z-Wave wireless protocol traffic was observed. Z-Wave is commonly used in building "
+                "automation and physical security systems (door locks, sensors, lighting). Its presence "
+                "indicates wireless-accessible control devices on or near the OT network. Verify that "
+                "all Z-Wave controllers use S2 security and that network inclusion is properly managed.",
+                zwave["samples"] or ["See pcap evidence"],
+                [], [], "Z-Wave", sorted(zwave["pcap_names"]),
+                "zwave::presence", tags=["wireless", "zwave"],
+            )
+        elif self._expected_protocol(["zwave", "z-wave"]):
+            self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected Z-Wave traffic not observed",
+                "Z-Wave was declared as expected, but no matching frames were observed.",
+                ["No Z-Wave packets matched."], [], [], "Z-Wave", pcap_name_list, "absence::zwave")
+        print(colorize(f"[✓] Z-Wave complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
 
         # Store hygiene TCP state for check_network_hygiene to consume
         self._hygiene_tcp_state: Dict[str, Any] = hyg
@@ -8945,7 +9129,8 @@ def scan_flow(analyzer: OTPcapAnalyzer, config: Dict[str, Any], args: argparse.N
     print(f"[>] Assessor: {assessor}   Site: {site}   Session: {session_name}")
     print(f"[>] Report format: {getattr(args, 'report_format', 'word')}")
 
-    session = analyzer.create_session(folder, session_name, site, assessor, env_answers)
+    out_folder = _OUTPUT_ROOT if _OUTPUT_ROOT.is_dir() else folder
+    session = analyzer.create_session(out_folder, session_name, site, assessor, env_answers)
     config["last_pcap_folder"] = str(folder)
     config["last_assessor_name"] = assessor
     config["last_site_name"] = site
@@ -8991,7 +9176,8 @@ def new_session_flow(
     if env_hint:
         existing_env["environment_type"] = env_hint
     env_answers = ask_environment_questions(existing_env)
-    session = analyzer.create_session(folder, session_name, site, assessor, env_answers)
+    out_folder = _OUTPUT_ROOT if _OUTPUT_ROOT.is_dir() else folder
+    session = analyzer.create_session(out_folder, session_name, site, assessor, env_answers)
     config["last_pcap_folder"] = str(folder)
     config["last_assessor_name"] = assessor
     config["last_site_name"] = site
