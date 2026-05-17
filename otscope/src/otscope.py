@@ -6859,18 +6859,28 @@ class OTPcapAnalyzer:
         # Z-Wave — dedicated pass (cannot share the combined filter with wpan/zbee_nwk
         # because the zwave tshark dissector conflicts with the wpan dissector and
         # causes Zigbee frames to be silently dropped from the combined output).
+        # The zwave dissector is not included in all tshark builds; if it is
+        # unavailable, TSharkError is caught and Z-Wave detection is skipped
+        # gracefully rather than crashing the analysis run.
+        _zwave_dissector_available = True
         before = len(self.session.findings)
         for pcap in pcaps:
             pn = pcap.name
-            for row in iter_tshark_rows("zwave", ["frame.protocols", "frame.len"], pcap):
-                fp = row.get("frame.protocols", "").lower()
-                if "zwave" in fp:
-                    zwave["rows_seen"] = True
-                    zwave["pcap_names"].add(pn)
-                    ev = f"{pn} | zwave frame len={row.get('frame.len', '?')}"
-                    if len(zwave["samples"]) < 5:
-                        zwave["samples"].append(ev)
-        if zwave["rows_seen"]:
+            try:
+                for row in iter_tshark_rows("zwave", ["frame.protocols", "frame.len"], pcap):
+                    fp = row.get("frame.protocols", "").lower()
+                    if "zwave" in fp:
+                        zwave["rows_seen"] = True
+                        zwave["pcap_names"].add(pn)
+                        ev = f"{pn} | zwave frame len={row.get('frame.len', '?')}"
+                        if len(zwave["samples"]) < 5:
+                            zwave["samples"].append(ev)
+            except TSharkError:
+                _zwave_dissector_available = False
+                break  # no point trying remaining pcaps
+        if not _zwave_dissector_available:
+            print(colorize("[i] Z-Wave dissector not available in this tshark build — skipping Z-Wave detection.", "INFO"))
+        elif zwave["rows_seen"]:
             self.add_finding(
                 SEVERITY_MEDIUM, "Z-Wave",
                 "Z-Wave wireless traffic observed",
@@ -6882,7 +6892,7 @@ class OTPcapAnalyzer:
                 [], [], "Z-Wave", sorted(zwave["pcap_names"]),
                 "zwave::presence", tags=["wireless", "zwave"],
             )
-        elif self._expected_protocol(["zwave", "z-wave"]):
+        elif _zwave_dissector_available and self._expected_protocol(["zwave", "z-wave"]):
             self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected Z-Wave traffic not observed",
                 "Z-Wave was declared as expected, but no matching frames were observed.",
                 ["No Z-Wave packets matched."], [], [], "Z-Wave", pcap_name_list, "absence::zwave")
