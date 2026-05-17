@@ -147,12 +147,12 @@ tshark is invoked with `-n` on every call, so it never resolves any IP, MAC, or 
 
 ## Documentation
 
-The complete operator manual is **[OTscope_User_Guide.md](./OTscope_User_Guide.md)** (also distributed as `.docx`). It covers:
+The complete operator manual is **[OTscope_User_Guide.md](./otscope/docs/OTscope_User_Guide.md)** (also distributed as `.docx`). It covers:
 
 - Installation, dependencies, first-run walkthrough
 - All operating modes and CLI flags
 - Network-safety contract
-- The 11-question discovery questionnaire
+- The 6-question discovery questionnaire
 - Five-phase analysis pipeline (calibration, streaming, per-category, correlation, scoring)
 - Word report structure and severity color coding
 - Purdue-Model SVG diagrams (Summary always, Detail for ≤50 devices)
