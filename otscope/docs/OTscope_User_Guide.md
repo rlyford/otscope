@@ -51,6 +51,8 @@ It is designed for the case where you receive a pile of pcap files from a site y
 
 `scapy` and `capinfos` are optional. SVG diagrams require no additional dependencies — pure stdlib.
 
+> **tshark build note:** The standard Wireshark installer includes dissectors for all supported protocols. Z-Wave detection specifically requires a tshark build that includes the `zwave` dissector — if it is absent, OTscope prints an informational message and skips Z-Wave detection gracefully. All other protocols (including Zigbee/IEEE 802.15.4 and CoAP) work with any standard tshark 4.6.4+ install.
+
 ### 2.1 Field Deployment (Standalone)
 
 When distributing OTscope as a standalone file (without the full repository), the recommended layout is:
@@ -536,6 +538,8 @@ When the Word report opens, work top-down for fastest triage:
 - Passive OS fingerprinting is heuristic (TCP SYN TTL + window) — accurate for Windows / Linux / BSD / IoT-class but not deterministic.
 - Public-IP RDAP/PTR enrichment is best-effort and skipped entirely under `--offline`. Reports under offline mode omit the "owner / network / country" fields on public IP findings.
 - Purdue Detail SVG is only emitted for ≤50 devices. Above that threshold the Summary SVG plus the Device Inventory CSV cover the picture.
+- Z-Wave detection requires the `zwave` tshark dissector, which is not included in all tshark builds. If unavailable, OTscope skips Z-Wave detection and prints an informational message — no other functionality is affected. Z-Wave is rare in industrial OT environments; upgrade to the latest full Wireshark install if Z-Wave capture analysis is needed.
+- Zigbee (IEEE 802.15.4) and Z-Wave dissectors conflict at the tshark filter level and cannot share a single analysis pass. OTscope runs Z-Wave as a separate dedicated tshark pass to avoid this — adding latency only on pcaps that are large enough for it to matter.
 
 ---
 
