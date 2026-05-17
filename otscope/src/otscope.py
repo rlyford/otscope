@@ -7797,6 +7797,7 @@ class OTPcapAnalyzer:
         correlation_lines = correlation_summary_lines(self.session)
         protection_findings = [finding for finding in self.session.findings if finding.category == "Protection Guidance"]
         report_issues = aggregated_report_issues(self.session, categories=[
+            # Core OT protocols
             "Modbus TCP",
             "BACnet/IP",
             "DNP3",
@@ -7805,6 +7806,19 @@ class OTPcapAnalyzer:
             "OPC-UA",
             "EtherNet/IP",
             "Siemens S7 / PROFINET",
+            # Vendor-specific OT protocols (v2.5.0+)
+            "Omron FINS",
+            "GE SRTP",
+            "Schneider UMAS",
+            "Mitsubishi MELSEC",
+            "OSIsoft PI Server",
+            "Ignition Gateway",
+            "Node-RED",
+            # IoT wireless protocols (v2.6.0 patch 5+)
+            "Zigbee / IEEE 802.15.4",
+            "CoAP",
+            "Z-Wave",
+            # Cross-cutting categories
             "Physical Security",
             "Cleartext and Legacy Protocols",
             "Artifact Extraction",
@@ -9089,9 +9103,11 @@ def prompt_report_generation(
     mode the generation prompt is also skipped.
     """
     if fmt is None and not NON_INTERACTIVE:
-        if not prompt_yes_no(prompt_text, True):
+        fmt = prompt_input(
+            f"{prompt_text} — format: Word / JSON / Both / Skip [W/J/B/S]", "W"
+        ).strip().lower()
+        if fmt in {"s", "skip", "n", "no"}:
             return
-        fmt = prompt_input("Report format: Word / JSON / Both [W/J/B]", "W").strip().lower()
     fmt = (fmt or "word").lower()
     if fmt in {"j", "json"}:
         # JSON-only: skip Word report but still generate JSON + SVGs.
