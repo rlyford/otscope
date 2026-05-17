@@ -29,12 +29,20 @@ It is designed for the case where you receive a pile of pcap files from a site y
 ## Quick Start
 
 ```bash
-# Install dependencies
+# Install Python dependencies (all platforms)
 pip install -r requirements.txt
-# tshark is a separate system install:
-sudo apt install tshark        # Debian / Ubuntu / Kali
-brew install wireshark         # macOS
 
+# tshark is a separate system install:
+winget install WiresharkFoundation.Wireshark   # Windows (winget)
+                                               # or download from wireshark.org/download.html
+sudo apt install tshark                        # Debian / Ubuntu / Kali
+brew install wireshark                         # macOS
+```
+
+> **Windows note:** Use `python` in place of `python3` in all commands below.
+> On Linux/macOS, `python` may point to Python 2 — use `python3` to be safe.
+
+```bash
 # Non-interactive: scan a folder of pcaps, no prompts, auto-generate Word report
 python3 otscope.py --scan /path/to/pcaps/
 
