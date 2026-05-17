@@ -45,11 +45,26 @@ It is designed for the case where you receive a pile of pcap files from a site y
 
 | Component | Notes |
 | --- | --- |
-| Python 3.8+ | Standard on Kali / most Linux distros and macOS. |
-| tshark 4.6.4+ | Display-filter set-membership syntax. `apt install tshark` / `brew install wireshark`. |
+| Python 3.8+ | Standard on Kali / most Linux distros and macOS. Windows: download from python.org — check "Add Python to PATH" during install. |
+| tshark 4.6.4+ | Installed as part of Wireshark. See install commands below. |
 | python-docx | `pip install python-docx` — Word report writer. |
 
 `scapy` and `capinfos` are optional. SVG diagrams require no additional dependencies — pure stdlib.
+
+**Install dependencies:**
+
+```bash
+# Python packages (all platforms)
+pip install -r requirements.txt
+
+# tshark — installed separately as a system package:
+winget install WiresharkFoundation.Wireshark   # Windows (winget)
+                                               # or download from wireshark.org/download.html
+sudo apt install tshark                        # Debian / Ubuntu / Kali
+brew install wireshark                         # macOS
+```
+
+> **Windows note:** The standard Wireshark installer for Windows includes tshark. During installation, ensure the "TShark" component is selected (it is included by default). After install, you may need to add the Wireshark folder (e.g. `C:\Program Files\Wireshark`) to your system PATH, or restart your terminal.
 
 > **tshark build note:** The standard Wireshark installer includes dissectors for all supported protocols. Z-Wave detection specifically requires a tshark build that includes the `zwave` dissector — if it is absent, OTscope prints an informational message and skips Z-Wave detection gracefully. All other protocols (including Zigbee/IEEE 802.15.4 and CoAP) work with any standard tshark 4.6.4+ install.
 
