@@ -76,8 +76,14 @@ python build_release.py --dry-run # preview file list without writing
 ### 2.2 First Run
 
 ```bash
+# Windows (PowerShell or Command Prompt)
+python otscope.py
+
+# Linux / macOS
 python3 otscope.py
 ```
+
+> **Note — `python` vs `python3`:** On Windows, the Python launcher is typically on the PATH as `python`. On Linux and macOS, `python` may point to Python 2, so `python3` is the safe default. All examples below use `python3`; substitute `python` when running in PowerShell or Command Prompt.
 
 On startup OTscope prints a banner, the network-safety status (see §4), and prompts for: NEW session, RESUME existing session, or ADD pcaps to an existing session `[N/R/A]`.
 
@@ -122,8 +128,12 @@ python3 otscope.py --scan /captures/site-a/
 # Single pcap with metadata
 python3 otscope.py --scan /captures/site-a/capture.pcap --assessor "Ryan" --site "Plant-A"
 
-# Folder scan, both Word and JSON, offline, environment hint
+# Folder scan, both Word and JSON, offline, environment hint (Linux/macOS — backslash continuation)
 python3 otscope.py --scan /captures/site-a/ --assessor "Ryan" --site "Plant-A" \
+    --env manufacturing --format both --offline
+
+# Same command on Windows PowerShell (backtick continuation, forward slashes or backslashes both work)
+python otscope.py --scan C:\captures\site-a\ --assessor "Ryan" --site "Plant-A" `
     --env manufacturing --format both --offline
 ```
 
