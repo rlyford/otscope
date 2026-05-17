@@ -7661,7 +7661,9 @@ class OTPcapAnalyzer:
         detail_path = folder / f"OTscope_Purdue_Detail_{slug}_{report_date}.svg"
 
         # Assign grid positions for devices within each layer
-        DW = 1100
+        DW = 1100       # device-area width
+        PANEL_W = 230   # right panel (top-connections list)
+        TOTAL_W = DW + PANEL_W
         DPAD = 32
         D_TITLE_H = 44
         D_LAYER_HEAD = 26
@@ -7712,19 +7714,30 @@ class OTPcapAnalyzer:
 
         total_detail_h = curr_y + DPAD
 
+        # Build ip → layer map (used for panel content later)
+        ip_to_layer: Dict[str, str] = {}
+        for _zone in active_layers:
+            for _dev in layers[_zone]:
+                ip_to_layer[_dev.ip] = _zone
+
         d_lines: List[str] = []
         d_lines.append(
-            f'<svg xmlns="http://www.w3.org/2000/svg" width="{DW}" height="{total_detail_h}" '
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{TOTAL_W}" height="{total_detail_h}" '
             f'font-family="Segoe UI,Arial,sans-serif">'
         )
         d_lines.append(
             '<defs><marker id="arr" markerWidth="8" markerHeight="8" '
             'refX="4" refY="4" orient="auto">'
-            '<path d="M0,0 L8,4 L0,8 Z" fill="#AAAAAA"/></marker></defs>'
+            '<path d="M0,0 L8,4 L0,8 Z" fill="#888"/></marker></defs>'
         )
-        d_lines.append(f'<rect width="{DW}" height="{total_detail_h}" fill="#FAFAFA" rx="6"/>')
+        d_lines.append(f'<rect width="{TOTAL_W}" height="{total_detail_h}" fill="#FAFAFA" rx="6"/>')
+        # Vertical separator between device area and panel
         d_lines.append(
-            f'<text x="{DW//2}" y="28" text-anchor="middle" font-size="15" '
+            f'<line x1="{DW + 5}" y1="{D_TITLE_H}" x2="{DW + 5}" y2="{total_detail_h - DPAD}" '
+            f'stroke="#DDDDDD" stroke-width="1.5"/>'
+        )
+        d_lines.append(
+            f'<text x="{TOTAL_W//2}" y="28" text-anchor="middle" font-size="15" '
             f'font-weight="bold" fill="#1A1A1A">'
             f'OTscope Purdue Detail — {self.session.site}</text>'
         )
@@ -7740,26 +7753,85 @@ class OTPcapAnalyzer:
                 f'font-weight="bold" fill="#222">{label}</text>'
             )
 
-        # Flow arrows (top 30 by packet count)
-        top_flows = sorted(
+        # ── Right panel: Top Connections list ─────────────────────────────
+        # Individual bezier curves between device centres overlap badly when
+        # many devices are present.  Instead, list the top connections in a
+        # readable panel to the right of the device grid.
+        PX = DW + 14   # left edge of panel text content
+        PW = PANEL_W - 18  # usable panel width
+
+        d_lines.append(
+            f'<text x="{DW + PANEL_W // 2}" y="{D_TITLE_H + 18}" '
+            f'text-anchor="middle" font-size="11" font-weight="bold" fill="#444">'
+            f'Top Connections</text>'
+        )
+        d_lines.append(
+            f'<line x1="{PX - 2}" y1="{D_TITLE_H + 24}" '
+            f'x2="{DW + PANEL_W - 10}" y2="{D_TITLE_H + 24}" '
+            f'stroke="#CCCCCC" stroke-width="1"/>'
+        )
+
+        _top_conns = sorted(
             self.session.connections.values(),
             key=lambda c: c.packet_count,
             reverse=True,
-        )[:30]
-        for conn in top_flows:
-            if conn.source_ip not in dev_pos or conn.destination_ip not in dev_pos:
-                continue
-            x1, y1 = dev_pos[conn.source_ip]
-            x2, y2 = dev_pos[conn.destination_ip]
-            if x1 == x2 and y1 == y2:
-                continue
-            # Bezier control point offset
-            mx = (x1 + x2) / 2 + (y2 - y1) * 0.18
-            my = (y1 + y2) / 2 - (x2 - x1) * 0.08
+        )
+
+        _entry_h = 38
+        _ey = D_TITLE_H + 32
+        _max_entries = max(1, (total_detail_h - _ey - DPAD) // _entry_h)
+        _max_entries = min(_max_entries, 16)
+        _shown = 0
+
+        for _conn in _top_conns:
+            if _shown >= _max_entries:
+                break
+            # Alternating row background
+            if _shown % 2 == 0:
+                d_lines.append(
+                    f'<rect x="{PX - 4}" y="{_ey}" width="{PW + 4}" height="{_entry_h}" '
+                    f'fill="#F0F4FF" rx="2"/>'
+                )
+            # Source IP → Dest IP
+            _src = _conn.source_ip if len(_conn.source_ip) <= 14 else _conn.source_ip[:12] + "…"
+            _dst = _conn.destination_ip if len(_conn.destination_ip) <= 14 else _conn.destination_ip[:12] + "…"
             d_lines.append(
-                f'<path d="M{x1},{y1} Q{mx:.0f},{my:.0f} {x2},{y2}" '
-                f'fill="none" stroke="#AAAAAA" stroke-width="1.2" '
-                f'opacity="0.5" marker-end="url(#arr)"/>'
+                f'<text x="{PX}" y="{_ey + 13}" font-size="9" font-weight="bold" fill="#111">'
+                f'{_src} → {_dst}</text>'
+            )
+            # Protocol · port · packet count
+            _proto = (_conn.protocol or "TCP")[:10]
+            _port_str = f":{_conn.destination_port}" if _conn.destination_port else ""
+            _pkts = f"{_conn.packet_count:,} pkts"
+            d_lines.append(
+                f'<text x="{PX}" y="{_ey + 25}" font-size="8" fill="#555">'
+                f'{_proto}{_port_str} · {_pkts}</text>'
+            )
+            # Layer info (src layer short label)
+            _sl = ip_to_layer.get(_conn.source_ip, "")
+            _dl = ip_to_layer.get(_conn.destination_ip, "")
+            _sl_short = {
+                "External / Public":           "Ext",
+                "Purdue L4/L5":                "L4/L5",
+                "Purdue L3/L3.5 Boundary":     "L3",
+                "Purdue L2/L3":                "L2/3",
+                "Purdue L1/L2":                "L1/2",
+                "Physical Security / OT Edge": "OT Edge",
+                "Unknown":                     "?",
+            }
+            _sl_lbl = _sl_short.get(_sl, _sl[:6] if _sl else "?")
+            _dl_lbl = _sl_short.get(_dl, _dl[:6] if _dl else "?")
+            d_lines.append(
+                f'<text x="{PX}" y="{_ey + 35}" font-size="7.5" fill="#999">'
+                f'{_sl_lbl} → {_dl_lbl}</text>'
+            )
+            _ey += _entry_h
+            _shown += 1
+
+        if _shown == 0:
+            d_lines.append(
+                f'<text x="{DW + PANEL_W // 2}" y="{D_TITLE_H + 60}" '
+                f'text-anchor="middle" font-size="10" fill="#AAAAAA">—</text>'
             )
 
         # Device boxes (drawn on top of arrows)
