@@ -5098,9 +5098,14 @@ class OTPcapAnalyzer:
         "dnp3 || mms || goose || sv || opcua || s7comm || pn_dcp || rtsp || "
         "tftp || "
         "arp || dns || icmp || tls || ssl || "
-        # IoT wireless and constrained-device protocols
-        "zbee_nwk || zbee_aps || wpan || zwave || coap || "
-        "udp.port in {5683,5684} || "
+        # Zigbee / IEEE 802.15.4 wireless — wpan must come before the port/flag
+        # checks.  NOTE: do NOT include 'zwave' here — the Z-Wave tshark
+        # dissector conflicts with the wpan dissector and causes wpan frames to
+        # be silently dropped from the combined filter output.  Z-Wave detection
+        # is handled via a dedicated Phase-3 pass (_check_zwave).
+        "wpan || zbee_nwk || zbee_aps || "
+        # CoAP (IP-based constrained-device protocol)
+        "coap || udp.port in {5683,5684} || "
         "tcp.flags.reset==1 || (tcp.flags.syn==1 && tcp.flags.ack==0)"
     )
 
@@ -6851,8 +6856,20 @@ class OTPcapAnalyzer:
                 ["No CoAP packets matched."], [], [], "CoAP", pcap_name_list, "absence::coap")
         print(colorize(f"[✓] CoAP complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
 
-        # Z-Wave
+        # Z-Wave — dedicated pass (cannot share the combined filter with wpan/zbee_nwk
+        # because the zwave tshark dissector conflicts with the wpan dissector and
+        # causes Zigbee frames to be silently dropped from the combined output).
         before = len(self.session.findings)
+        for pcap in pcaps:
+            pn = pcap.name
+            for row in iter_tshark_rows("zwave", ["frame.protocols", "frame.len"], pcap):
+                fp = row.get("frame.protocols", "").lower()
+                if "zwave" in fp:
+                    zwave["rows_seen"] = True
+                    zwave["pcap_names"].add(pn)
+                    ev = f"{pn} | zwave frame len={row.get('frame.len', '?')}"
+                    if len(zwave["samples"]) < 5:
+                        zwave["samples"].append(ev)
         if zwave["rows_seen"]:
             self.add_finding(
                 SEVERITY_MEDIUM, "Z-Wave",
