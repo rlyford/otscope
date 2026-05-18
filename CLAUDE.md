@@ -4,7 +4,7 @@
 
 This repo contains **OTscope**, an offline OT/ICS packet-capture analysis tool.
 
-Primary file: `otscope/src/otscope.py` — an intentionally single-file Python application (~7,700 lines).
+Primary file: `otscope/src/otscope.py` — an intentionally single-file Python application (~9,400 lines).
 
 Supporting docs:
 - `otscope/README.md` — quick-start and feature overview

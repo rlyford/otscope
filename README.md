@@ -147,7 +147,7 @@ tshark is invoked with `-n` on every call, so it never resolves any IP, MAC, or 
 
 ## Documentation
 
-The complete operator manual is **[OTscope_User_Guide.md](./otscope/docs/OTscope_User_Guide.md)** (also distributed as `.docx`). It covers:
+The complete operator manual is **[OTscope_User_Guide.md](./otscope/docs/OTscope_User_Guide.md)**. It covers:
 
 - Installation, dependencies, first-run walkthrough
 - All operating modes and CLI flags
