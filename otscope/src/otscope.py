@@ -33,7 +33,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import hashlib
+import io
 import json
 import math
 import os
@@ -855,6 +857,24 @@ def safe_slug(value: str) -> str:
     """Make a string filename-safe."""
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
     return cleaned.strip("_") or "session"
+
+
+def _versioned_path(folder: Path, base_name: str, ext: str) -> Path:
+    """Return the first non-existent path of the form <folder>/<base_name>[_vN].<ext>.
+
+    If <base_name>.<ext> does not exist, return it directly.  Otherwise
+    increment a _v2, _v3 … suffix until a free slot is found.  This avoids
+    silently overwriting artifacts from earlier runs in the same output folder.
+    """
+    candidate = folder / f"{base_name}.{ext}"
+    if not candidate.exists():
+        return candidate
+    version = 2
+    while True:
+        candidate = folder / f"{base_name}_v{version}.{ext}"
+        if not candidate.exists():
+            return candidate
+        version += 1
 
 
 def colorize(text: str, severity: Optional[str] = None, bold: bool = False) -> str:
@@ -7883,14 +7903,7 @@ class OTPcapAnalyzer:
         report_date = datetime.now().strftime("%Y%m%d")
         folder = Path(self.session.folder)
         base_name = f"OT_PCAP_Analysis_{safe_slug(self.session.site)}_{report_date}"
-        version = 1
-        while True:
-            suffix = "" if version == 1 else f"_v{version}"
-            candidate = folder / f"{base_name}{suffix}.docx"
-            if not candidate.exists():
-                report_path = candidate
-                break
-            version += 1
+        report_path = _versioned_path(folder, base_name, "docx")
         network_map = self.generate_network_map()
         risk = self.compute_risk_summary()
         correlation_lines = correlation_summary_lines(self.session)
@@ -8771,14 +8784,7 @@ class OTPcapAnalyzer:
         report_date = datetime.now().strftime("%Y%m%d")
         folder = Path(self.session.folder)
         base_name = f"OT_PCAP_Analysis_{safe_slug(self.session.site)}_{report_date}"
-        version = 1
-        while True:
-            suffix = "" if version == 1 else f"_v{version}"
-            candidate = folder / f"{base_name}{suffix}.json"
-            if not candidate.exists():
-                report_path = candidate
-                break
-            version += 1
+        report_path = _versioned_path(folder, base_name, "json")
         risk = self.compute_risk_summary()
         report_data: Dict[str, Any] = {
             "tool": TOOL_NAME,
@@ -8821,28 +8827,13 @@ class OTPcapAnalyzer:
         report_date = datetime.now().strftime("%Y%m%d")
         folder = Path(self.session.folder)
         base_name = f"OT_Device_Inventory_{safe_slug(self.session.site)}_{report_date}"
-        version = 1
-        while True:
-            suffix = "" if version == 1 else f"_v{version}"
-            candidate = folder / f"{base_name}{suffix}.csv"
-            if not candidate.exists():
-                inventory_path = candidate
-                break
-            version += 1
+        inventory_path = _versioned_path(folder, base_name, "csv")
         # Pre-compute critical-IP set once for the marker column.
         critical_ips: set = set()
         for finding in self.session.findings:
             if finding.severity in {SEVERITY_CRITICAL, SEVERITY_INTRUSION}:
                 critical_ips.update(finding.source_ips)
                 critical_ips.update(finding.destination_ips)
-        # CSV header
-        header = (
-            "ip,role,zone,vendors,os_fingerprint,"
-            "outgoing_pkts,incoming_pkts,total_pkts,"
-            "protocols,ports,vlans,mac_addresses,subnets,source_pcaps,"
-            "is_critical_in_findings"
-        )
-        lines: List[str] = [header]
         # Sort by total traffic descending so flood sources fall to the bottom of
         # the natural sort but are still present.
         all_devices = sorted(
@@ -8850,27 +8841,34 @@ class OTPcapAnalyzer:
             key=lambda d: (d.outgoing_count + d.incoming_count),
             reverse=True,
         )
+        buf = io.StringIO()
+        writer = csv.writer(buf, lineterminator="\n")
+        writer.writerow([
+            "ip", "role", "zone", "vendors", "os_fingerprint",
+            "outgoing_pkts", "incoming_pkts", "total_pkts",
+            "protocols", "ports", "vlans", "mac_addresses", "subnets",
+            "source_pcaps", "is_critical_in_findings",
+        ])
         for d in all_devices:
             total_pkts = d.outgoing_count + d.incoming_count
-            row = [
+            writer.writerow([
                 d.ip,
-                d.inferred_role.replace(",", ";"),
-                d.inferred_zone.replace(",", ";"),
-                ("/".join(d.vendors[:5])).replace(",", ";"),
-                d.os_fingerprint.replace(",", ";"),
+                d.inferred_role,
+                d.inferred_zone,
+                "/".join(d.vendors[:5]),
+                d.os_fingerprint,
                 str(d.outgoing_count),
                 str(d.incoming_count),
                 str(total_pkts),
-                ("|".join(d.protocols)).replace(",", ";"),
+                "|".join(d.protocols),
                 "|".join(str(p) for p in sorted(d.ports)),
-                ("|".join(sorted(d.vlans))).replace(",", ";"),
-                "|".join(sorted(d.macs)).replace(",", ";"),
-                ("|".join(sorted(d.subnets))).replace(",", ";"),
-                ("|".join(sorted(d.source_pcaps))).replace(",", ";"),
+                "|".join(sorted(d.vlans)),
+                "|".join(sorted(d.macs)),
+                "|".join(sorted(d.subnets)),
+                "|".join(sorted(d.source_pcaps)),
                 "yes" if d.ip in critical_ips else "no",
-            ]
-            lines.append(",".join(f'"{c}"' if (' ' in c or ',' in c or '"' in c) else c for c in row))
-        inventory_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            ])
+        inventory_path.write_text(buf.getvalue(), encoding="utf-8")
         print(colorize(
             f"[✓] Device inventory CSV addendum: {inventory_path} ({len(all_devices):,} devices)",
             "SUCCESS"))
@@ -8889,14 +8887,7 @@ class OTPcapAnalyzer:
         report_date = datetime.now().strftime("%Y%m%d")
         folder = Path(self.session.folder)
         base_name = f"OT_Flow_Allowlist_{safe_slug(self.session.site)}_{report_date}"
-        version = 1
-        while True:
-            suffix = "" if version == 1 else f"_v{version}"
-            candidate = folder / f"{base_name}{suffix}.csv"
-            if not candidate.exists():
-                allowlist_path = candidate
-                break
-            version += 1
+        allowlist_path = _versioned_path(folder, base_name, "csv")
         rows: List[Tuple[int, str, str, int, str, str, str]] = []
         for conn in self.session.connections.values():
             src_dev = self.session.devices.get(conn.source_ip)
@@ -8913,11 +8904,14 @@ class OTPcapAnalyzer:
                 dst_role,
             ))
         rows.sort(key=lambda r: r[0], reverse=True)
-        lines = ["packets,src_ip,dst_ip,dst_port,protocol,src_role,dst_role,action"]
+        buf = io.StringIO()
+        writer = csv.writer(buf, lineterminator="\n")
+        writer.writerow(["packets", "src_ip", "dst_ip", "dst_port", "protocol",
+                         "src_role", "dst_role", "action"])
         for pkts, s, d, p, proto, sr, dr in rows:
             # default action is ALLOW; asset owner edits before enforcement
-            lines.append(f"{pkts},{s},{d},{p},{proto},\"{sr}\",\"{dr}\",ALLOW")
-        allowlist_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            writer.writerow([pkts, s, d, p, proto, sr, dr, "ALLOW"])
+        allowlist_path.write_text(buf.getvalue(), encoding="utf-8")
         print(colorize(f"[✓] Flow allowlist CSV generated: {allowlist_path} ({len(rows)} flows)", "SUCCESS"))
         return allowlist_path
 

@@ -523,8 +523,8 @@ Net result: a 1.4M-device flood capture renders as a ~50-page Word report with t
 | `<session_folder>/OT_PCAP_Analysis_<site>_<YYYYMMDD>.json` | JSON report (auto-generated alongside every Word report). |
 | `<session_folder>/OT_Device_Inventory_<site>_<YYYYMMDD>.csv` | Full device inventory. |
 | `<session_folder>/OT_Flow_Allowlist_<site>_<YYYYMMDD>.csv` | Observed flows for segmentation policy. |
-| `<session_folder>/OTscope_Purdue_Summary_<session>.svg` | Visual Purdue diagram (always). |
-| `<session_folder>/OTscope_Purdue_Detail_<session>.svg` | Visual per-device diagram (≤50 devices only). |
+| `<session_folder>/OTscope_Purdue_Summary_<site>_<YYYYMMDD>.svg` | Visual Purdue diagram (always). |
+| `<session_folder>/OTscope_Purdue_Detail_<site>_<YYYYMMDD>.svg` | Visual per-device diagram (≤50 devices only). |
 
 > **Field deployment note:** When running from the standard field layout, `pcaps\` is the default pcap drop folder and `output\` is the default session folder — both are siblings of `otscope.py` and are auto-created on first run.
 
