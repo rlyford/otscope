@@ -562,6 +562,20 @@ When the Word report opens, work top-down for fastest triage:
 
 Running log of capabilities added in each release. Newest at the top.
 
+### Version 2.6.0 · May 2026 (patch 7)
+
+Code quality and correctness fixes. No user-facing behavior changes.
+
+- **CSV output correctness** — `export_flow_allowlist` and `export_device_inventory_csv` now use Python's `csv.writer` module instead of hand-built CSV strings. Fixes malformed output when device role or vendor fields contain double-quotes, commas, or newlines.
+- **Purdue Detail SVG** — replaced overlapping bezier flow-arrow curves with a clean right-side panel listing the top connections in a readable striped table (Source IP → Dest IP, protocol, port, packet count, layer labels). SVG canvas width extended to 1330 px to accommodate the panel.
+- **Documentation** — Purdue SVG filename tokens corrected in the output-files reference table (§10); tshark and Python installation instructions updated with Windows-specific steps in the User Guide and README.
+
+### Version 2.6.0 · May 2026 (patch 6)
+
+Purdue Detail SVG connection diagram redesigned.
+
+- **Purdue Detail SVG flow arrows replaced** — the previous design drew up to 30 individual bezier curves between device centres, which overlapped into an unreadable tangle when many devices were present. The new design adds a 230 px right panel (separated by a vertical rule) listing the top connections in a striped table: Source IP → Dest IP, Protocol:Port, packet count, and source/destination layer labels. Scales to available diagram height (up to 16 rows).
+
 ### Version 2.6.0 · May 2026 (patch 5)
 
 IoT wireless protocol detection and output directory fix.
