@@ -22,4 +22,4 @@ otscope/src/output/*
 dist/
 
 .claude/
-notes/
+otscope-vault/

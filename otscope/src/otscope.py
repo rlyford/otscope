@@ -202,9 +202,6 @@ OUI_VENDOR_MAP: Dict[str, str] = {
     "00:23:04": "Cisco",
     "00:25:45": "Cisco",
     "cc:46:d6": "Cisco",
-    "00:50:56": "VMware",
-    "00:0c:29": "VMware",
-    "00:05:69": "VMware",
     "00:15:5d": "Microsoft Hyper-V",
     "b8:27:eb": "Raspberry Pi",
     "dc:a6:32": "Raspberry Pi",
@@ -212,7 +209,7 @@ OUI_VENDOR_MAP: Dict[str, str] = {
     "00:a0:91": "Yokogawa",
     "00:50:c2": "IEEE Reg Auth",
     "00:1c:42": "Parallels",
-    "00:0a:dc": "Schneider/Modicon",
+    "00:0a:dc": "Rad Data Communications",
     "00:60:d5": "Mitsubishi Electric",
     "00:21:47": "Omron",
     "00:00:0d": "Fibronics",
@@ -226,14 +223,9 @@ OUI_VENDOR_MAP: Dict[str, str] = {
     "28:63:36": "Siemens",
     "00:1c:b3": "Siemens",
     # Rockwell / Allen-Bradley additional
-    "00:0b:db": "Rockwell/Allen-Bradley",
-    "00:0a:dc": "Rockwell/Allen-Bradley",
-    "00:1c:14": "Rockwell/Allen-Bradley",
     "00:1f:9c": "Rockwell/Allen-Bradley",
     "00:24:51": "Rockwell/Allen-Bradley",
     # Schneider Electric additional
-    "00:00:54": "Schneider Electric",
-    "00:80:f4": "Schneider Electric",
     "00:30:f6": "Schneider Electric",
     "00:50:ba": "Schneider Electric",
     # ABB additional
@@ -251,7 +243,6 @@ OUI_VENDOR_MAP: Dict[str, str] = {
     # Yokogawa additional
     "00:00:64": "Yokogawa",
     # Emerson / Fisher / Rosemount
-    "00:1c:c4": "Emerson",
     "00:30:9d": "Emerson",
     "00:e0:dc": "Emerson",
     # Hirschmann additional
@@ -260,7 +251,6 @@ OUI_VENDOR_MAP: Dict[str, str] = {
     "00:0e:c6": "Moxa",
     "00:1f:e4": "Moxa",
     # Phoenix Contact additional
-    "00:0b:db": "Phoenix Contact",
     "a8:74:1d": "Phoenix Contact",
     # Beckhoff additional
     "00:01:e8": "Beckhoff",
@@ -335,6 +325,7 @@ OUI_VENDOR_MAP: Dict[str, str] = {
     "00:1d:0f": "TP-Link",
     "00:14:78": "TP-Link",
     "00:23:cd": "TP-Link",
+    "00:0b:db": "Dell",
     "f0:1f:af": "Dell",
     "00:14:22": "Dell",
     "00:1d:09": "Dell",
@@ -370,7 +361,6 @@ OUI_VENDOR_MAP: Dict[str, str] = {
     "00:1a:64": "IBM",
     "00:21:5e": "IBM",
     "00:60:97": "3Com",
-    "00:0d:88": "Juniper",
     "00:14:f6": "Juniper",
     "00:23:9c": "Juniper",
     "00:24:dc": "Juniper",
@@ -4260,7 +4250,6 @@ class OTPcapAnalyzer:
                     info_lower = info.lower()
                     payload_strings = printable_strings_from_bytes(payload_bytes_from_row(row), minimum_length=4)
                     combined_strings = payload_strings + ([info] if info else [])
-                    evidence = f"{pcap.name}: {source_ip or row.get('eth.src', '')} -> {destination_ip or row.get('eth.dst', '')} | {info}"
 
                     if "bacnet" in protocol.lower() or "bacnet" in (row.get("frame.protocols") or "").lower():
                         for text in combined_strings:
@@ -4325,7 +4314,7 @@ class OTPcapAnalyzer:
                 SEVERITY_HIGH,
                 "Artifact Extraction",
                 "Possible PLC project or ladder-logic file transfer",
-                f"A file name consistent with PLC project or ladder logic content was observed in traffic. This can indicate program retrieval, upload, or distribution activity.",
+                "A file name consistent with PLC project or ladder logic content was observed in traffic. This can indicate program retrieval, upload, or distribution activity.",
                 [f"{pcap_name}: {file_name}", f"{source_ip} -> {destination_ip} via {protocol}"],
                 [source_ip],
                 [destination_ip],
@@ -4340,7 +4329,7 @@ class OTPcapAnalyzer:
                 SEVERITY_HIGH,
                 "Artifact Extraction",
                 "Possible firmware file transfer or firmware reference",
-                f"A firmware-like file name was observed in traffic. This may support forensics workflows or indicate software distribution from a corporate or staging system.",
+                "A firmware-like file name was observed in traffic. This may support forensics workflows or indicate software distribution from a corporate or staging system.",
                 [f"{pcap_name}: {file_name}", f"{source_ip} -> {destination_ip} via {protocol}"],
                 [source_ip],
                 [destination_ip],
@@ -4976,7 +4965,6 @@ class OTPcapAnalyzer:
         # exceeded the per-type emission cap.  Lets the report stay
         # readable on extreme datasets without losing the signal entirely.
         for finding_type, bucket in rollup_buckets.items():
-            extra_count = max(0, sum(emit_count.values()) - EMIT_CAP * len(emit_count))
             self.add_finding(
                 bucket["severity"], "Network Hygiene and Segmentation",
                 f"{bucket['title']} (+ {len(bucket['src_ips'])} more sources rolled up)",
@@ -6236,7 +6224,6 @@ class OTPcapAnalyzer:
                     if arp_op:
                         arp_src_mac = (row.get("arp.src.hw_mac") or "").lower()
                         arp_src_ip  = row.get("arp.src.proto_ipv4") or ""
-                        arp_dst_mac = (row.get("arp.dst.hw_mac") or "").lower()
                         arp_dst_ip  = row.get("arp.dst.proto_ipv4") or ""
                         eth_src_mac = (row.get("eth.src") or "").lower()
                         # Per-(IP, MAC) first/last-seen epoch tracking so
@@ -6367,7 +6354,7 @@ class OTPcapAnalyzer:
                         [
                             f"Top register: {top_reg} ({top_count:,} reads)",
                             f"Distinct registers polled: {distinct}",
-                            f"Top 5 registers: " + ", ".join(
+                            "Top 5 registers: " + ", ".join(
                                 f"{r}({c})" for r, c in reg_counts.most_common(5)),
                         ],
                         [src], [dst], "Modbus TCP", sorted(mb["pcap_names"]),
@@ -6465,8 +6452,8 @@ class OTPcapAnalyzer:
                 self.add_finding(
                     SEVERITY_MEDIUM, "Modbus TCP",
                     "Modbus register value anomaly detected",
-                    f"One or more Modbus registers showed a sudden large value jump "
-                    f"(≥50% of observed range in a single poll interval). Legitimate "
+                    "One or more Modbus registers showed a sudden large value jump "
+                    "(≥50% of observed range in a single poll interval). Legitimate "
                     "process variables rarely change that abruptly; this may indicate "
                     "a spoofed response, an injected packet, or a rapid unexpected "
                     "set-point change that warrants investigation.",
@@ -7581,7 +7568,6 @@ class OTPcapAnalyzer:
         PAD = 28
         BOX_H = 80
         GAP = 14
-        ARROW_W = 18
         title_h = 44
         legend_h = 32
         total_h = title_h + legend_h + PAD + len(active_layers) * (BOX_H + GAP) + PAD
@@ -9239,7 +9225,7 @@ def scan_flow(analyzer: OTPcapAnalyzer, config: Dict[str, Any], args: argparse.N
     print(f"[>] Report format: {getattr(args, 'report_format', 'word')}")
 
     out_folder = _OUTPUT_ROOT if _OUTPUT_ROOT.is_dir() else folder
-    session = analyzer.create_session(out_folder, session_name, site, assessor, env_answers)
+    analyzer.create_session(out_folder, session_name, site, assessor, env_answers)
     config["last_pcap_folder"] = str(folder)
     config["last_assessor_name"] = assessor
     config["last_site_name"] = site
@@ -9286,7 +9272,7 @@ def new_session_flow(
         existing_env["environment_type"] = env_hint
     env_answers = ask_environment_questions(existing_env)
     out_folder = _OUTPUT_ROOT if _OUTPUT_ROOT.is_dir() else folder
-    session = analyzer.create_session(out_folder, session_name, site, assessor, env_answers)
+    analyzer.create_session(out_folder, session_name, site, assessor, env_answers)
     config["last_pcap_folder"] = str(folder)
     config["last_assessor_name"] = assessor
     config["last_site_name"] = site
@@ -9387,8 +9373,8 @@ def run_application(args: argparse.Namespace) -> None:
         if f.is_file()
     ):
         print(colorize(f"[i] No capture files found in {_PCAPS_ROOT}", "INFO"))
-        print(colorize(f"    Drop your .pcap / .pcapng files into that folder, then run OTscope again.", "INFO"))
-        print(colorize(f"    (You can also enter any full path at the prompt below.)", "INFO"))
+        print(colorize("    Drop your .pcap / .pcapng files into that folder, then run OTscope again.", "INFO"))
+        print(colorize("    (You can also enter any full path at the prompt below.)", "INFO"))
         print()
     print_banner()
     print_network_safety_banner()

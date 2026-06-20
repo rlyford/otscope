@@ -51,10 +51,10 @@ After **any** change to `otscope.py`, ask: does this affect something documented
 - Any other user-facing behavior changes → find the relevant section and update it.
 - The version is bumped → add a version history entry at the top of §14.
 
-**Obsidian Vault** (`notes/`) must stay current after every task:
-- `notes/Dev Log.md` — add an entry (newest at top) summarizing what changed and why.
-- `notes/Feature Backlog.md` — check off completed items; add new ideas surfaced during the work.
-- `notes/Architecture Decisions.md` — add an entry if a meaningful design decision was made.
+**Obsidian Vault** (`otscope-vault/`) must stay current after every task:
+- `otscope-vault/Dev Log.md` — add an entry (newest at top) summarizing what changed and why.
+- `otscope-vault/Feature Backlog.md` — check off completed items; add new ideas surfaced during the work.
+- `otscope-vault/Architecture Decisions.md` — add an entry if a meaningful design decision was made.
 
 Both the User Guide update and the vault update must be done **before** creating the PR commit.
 
@@ -92,7 +92,7 @@ pip install -r otscope/requirements.txt
 
 ## Obsidian Vault
 
-An Obsidian vault lives at `notes/` in the repo root (gitignored — never commit it). See the **Documentation — Keep in Sync** section above for what to update and when.
+An Obsidian vault lives at `otscope-vault/` in the repo root (gitignored — never commit it). See the **Documentation — Keep in Sync** section above for what to update and when.
 
 ---
 
