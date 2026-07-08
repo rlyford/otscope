@@ -30,8 +30,8 @@ QUICK REFERENCE
 OUTPUT FILES
   output\OT_PCAP_Analysis_<site>_<date>.docx   Word report
   output\OT_PCAP_Analysis_<site>_<date>.json   Machine-readable findings
-  output\OTscope_Purdue_Summary_<session>.svg  Network diagram (all devices)
-  output\OTscope_Purdue_Detail_<session>.svg   Network diagram (<=50 devices)
+  output\OTscope_Purdue_Summary_<site>_<date>.svg  Network diagram (all devices)
+  output\OTscope_Purdue_Detail_<site>_<date>.svg   Network diagram (<=50 devices)
 
 FULL DOCUMENTATION
   See OTscope_User_Guide.pdf for the complete operator manual.

@@ -18,6 +18,10 @@ otscope/src/pcaps/*
 otscope/src/output/*
 !otscope/src/output/.gitkeep
 
+# First-run bootstrap artifacts (generated next to otscope.py by _bootstrap_workspace)
+otscope/src/requirements.txt
+otscope/src/README_FIRST.txt
+
 # Release packages — built by build_release.py, never committed
 dist/
 

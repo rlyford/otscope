@@ -4,7 +4,7 @@
 
 Interactive multi-pcap OT/ICS traffic analysis with session persistence, role inference, attack-chain correlation, MITRE ATT&CK for ICS mapping, Wireshark investigation guidance, Purdue-Model architecture diagrams, and machine-readable artifacts.
 
-> **Version 2.6.0**  ·  May 2026
+> **Version 2.7.0**  ·  July 2026
 > Authored by Ryan Lyford  ·  © 2026 Ryan Lyford. All rights reserved.
 
 ---
@@ -70,18 +70,18 @@ brew install wireshark                         # macOS
 
 ### 2.1 Field Deployment (Standalone)
 
-When distributing OTscope as a standalone file (without the full repository), the recommended layout is:
+OTscope is fully self-provisioning: drop `otscope.py` — just the one file — into any empty folder and run it. On first run it creates everything else it needs next to itself:
 
 ```
 OTscope\
-    otscope.py
-    requirements.txt
-    README.txt          ← plain-text quick-start
-    pcaps\              ← drop capture files here
-    output\             ← reports appear here
+    otscope.py          ← the only file you need to copy
+    requirements.txt    ← auto-generated (pip dependency list)
+    README_FIRST.txt    ← auto-generated plain-text quick-start
+    pcaps\              ← auto-created; drop capture files here
+    output\             ← auto-created; reports appear here
 ```
 
-On first run, OTscope automatically creates `pcaps\` and `output\` next to the script if they do not exist. If `pcaps\` is empty, the startup message will prompt you to drop capture files there before proceeding.
+If `pcaps\` is empty, the startup message will prompt you to drop capture files there before proceeding. If Python packages are missing, the startup dependency check prints the exact `pip install -r requirements.txt` command pointing at the generated file.
 
 Use `build_release.py` (at the repo root) to package this layout into a zip:
 
@@ -226,6 +226,7 @@ Type any of these keywords (comma-separated) to enable absence detection for tha
 | `zigbee`, `zbee`, `ieee 802.15.4` | Zigbee / IEEE 802.15.4 wireless |
 | `coap` | CoAP (UDP 5683 cleartext / 5684 DTLS) |
 | `zwave`, `z-wave` | Z-Wave wireless |
+| `voip`, `video`, `audio`, `cctv`, `sip`, `camera`, `rtsp` | Audio/Video streaming (SIP/RTP, RTSP, MPEG-TS, CCTV) |
 
 Example entry: `modbus, dnp3, historian, ignition`
 
@@ -263,6 +264,7 @@ ONE combined tshark read per pcap with a single display filter that covers all p
 - CoAP (UDP 5683/5684) — cleartext CoAP presence (5683), DTLS-protected traffic (5684), PUT/POST/DELETE write operations.
 - Z-Wave — wireless presence detection.
 - Physical Security — RTSP/ONVIF cleartext, ONVIF discovery storms.
+- Audio/Video streaming — signaled RTP flows classified audio vs. video (payload type + bitrate), SIP/VoIP call signaling, active RTSP stream requests, MPEG-TS distribution (IPTV/CCTV multicast), RTMP, sustained multicast UDP, unsignaled media-like UDP heuristic, GigE Vision machine-vision cameras, CCTV DVR/NVR vendor ports (Hikvision 8000 / Dahua 37777).
 - Beaconing / C2 — low-jitter periodic flows.
 - DNS anomalies — DGA-like NXDOMAIN bursts, long names, large TXT, multi-resolver.
 - SNMP — walks, SETs, plaintext communities.
@@ -437,7 +439,7 @@ Observation window: first seen @1745801234.567890, last seen @1745801999.123456
 
 ### 8.3 Appendix A — Per-Category Guides
 
-Each category that fired at least one finding gets a guide entry in Appendix A of the Word report, with a recommended display filter and 4-5 concrete steps (column suggestions, Follow Stream targets, Statistics menu paths). Categories covered include ARP/MITM, Modbus, DNP3, BACnet, IEC 104 / IEC 61850 / GOOSE / MMS, OPC-UA, EtherNet/IP/CIP, Siemens S7, PROFINET, cleartext/legacy/credentials, TLS weakness, beaconing/C2, DNS anomalies, SNMP, ARP/RST/SYN/ICMP scans, mDNS/LLMNR/NBNS/SSDP, DHCP rogue, suspicious UA / EOL banners, auth-failure bursts, public IP exposure, baseline drift, and capture-integrity / no-NTP.
+Each category that fired at least one finding gets a guide entry in Appendix A of the Word report, with a recommended display filter and 4-5 concrete steps (column suggestions, Follow Stream targets, Statistics menu paths). Categories covered include ARP/MITM, Modbus, DNP3, BACnet, IEC 104 / IEC 61850 / GOOSE / MMS, OPC-UA, EtherNet/IP/CIP, Siemens S7, PROFINET, cleartext/legacy/credentials, TLS weakness, beaconing/C2, DNS anomalies, SNMP, ARP/RST/SYN/ICMP scans, mDNS/LLMNR/NBNS/SSDP, DHCP rogue, suspicious UA / EOL banners, auth-failure bursts, public IP exposure, baseline drift, audio/video streaming (RTP/SIP/RTSP/MPEG-TS), and capture-integrity / no-NTP.
 
 ---
 
@@ -526,7 +528,7 @@ Net result: a 1.4M-device flood capture renders as a ~50-page Word report with t
 | `<session_folder>/OTscope_Purdue_Summary_<site>_<YYYYMMDD>.svg` | Visual Purdue diagram (always). |
 | `<session_folder>/OTscope_Purdue_Detail_<site>_<YYYYMMDD>.svg` | Visual per-device diagram (≤50 devices only). |
 
-> **Field deployment note:** When running from the standard field layout, `pcaps\` is the default pcap drop folder and `output\` is the default session folder — both are siblings of `otscope.py` and are auto-created on first run.
+> **Field deployment note:** When running from the standard field layout, `pcaps\` is the default pcap drop folder and `output\` is the default session folder — both are siblings of `otscope.py` and are auto-created on first run, along with `requirements.txt` and `README_FIRST.txt` (see §2.1). Existing files are never overwritten.
 
 ---
 
@@ -561,6 +563,15 @@ When the Word report opens, work top-down for fastest triage:
 ## 14. Version History
 
 Running log of capabilities added in each release. Newest at the top.
+
+### Version 2.7.0 · July 2026
+
+- **Audio/Video streaming detection** — new `Audio/Video Streaming` category (`AVMEDIA-###` finding IDs) answering "is there video or audio running on this network?": signaled RTP flows classified audio vs. video from payload type and bitrate; SIP/VoIP call signaling (INVITE / 200 OK with SDP); active RTSP `SETUP`/`PLAY` stream requests; MPEG Transport Stream distribution (IPTV/CCTV multicast); RTMP; sustained multicast UDP streams; unsignaled media-like UDP heuristic; GigE Vision machine-vision camera control (GVCP, UDP 3956); CCTV DVR/NVR vendor-port traffic (Hikvision TCP 8000, Dahua TCP 37777). Absence detection via `voip` / `video` / `audio` / `cctv` keywords in the expected-protocols question. Global RTP heuristics are deliberately left OFF in tshark so media decoding can never hijack OT UDP dissection.
+- **Drop-in self-provisioning** — a bare `otscope.py` in an empty folder now creates its full workspace on first run: `pcaps\`, `output\`, `requirements.txt`, and `README_FIRST.txt`. Nothing to pre-create, nothing overwritten if already present; read-only media never blocks startup.
+- **UTF-8 console output** — stdout/stderr are reconfigured to UTF-8 with replacement at startup, fixing a crash (`UnicodeEncodeError: 'charmap' codec…`) when output was piped or redirected on Windows (legacy cp1252 code page).
+- **Dead code removal** — the ten legacy per-protocol `check_*` methods superseded by the streaming combined pass (Modbus, BACnet, DNP3, IEC 61850, IEC 104, MQTT, OPC-UA, EtherNet/IP, Siemens, Physical Security) were removed (~500 lines); all detection logic lives in the streaming pass only, eliminating drift risk between two implementations.
+- **Slimmed `requirements.txt`** — trimmed from a 17-package pip-freeze to the two real dependencies (`python-docx`, `scapy`); release packages and the first-run bootstrap now agree.
+- Finding-ID prefixes registered for Zigbee (`ZIGBEE-###`), CoAP (`COAP-###`), and Z-Wave (`ZWAVE-###`) categories, which previously fell back to the generic `FIND-###`.
 
 ### Version 2.6.0 · May 2026 (patch 7)
 

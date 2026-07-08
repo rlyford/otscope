@@ -28,6 +28,8 @@ It is designed for the case where you receive a pile of pcap files from a site y
 
 ## Quick Start
 
+> **Field deployment:** `otscope.py` is fully self-provisioning — drop the single file into any empty folder and run it. It creates `pcaps\`, `output\`, `requirements.txt`, and a `README_FIRST.txt` quick-start on first run.
+
 ```bash
 # Install Python dependencies (all platforms)
 pip install -r requirements.txt
@@ -92,6 +94,8 @@ OT/ICS protocols, attack patterns, and hygiene anomalies are detected in a singl
 - **Ignition Gateway (TCP 4592)** — OPC-UA without TLS indicators.
 - **Node-RED (TCP 1880)** — unauthenticated dashboard access and flow deployment events.
 - **Physical Security** — RTSP/ONVIF cleartext, ONVIF discovery storms.
+- **IoT wireless** — Zigbee / IEEE 802.15.4 (presence, unencrypted frames, ZCL write/control), CoAP (cleartext presence, DTLS, PUT/POST/DELETE writes), Z-Wave (presence).
+- **Audio/Video streaming** — RTP flows classified audio vs. video (payload type + bitrate), SIP/VoIP call signaling, active RTSP stream requests, MPEG-TS distribution (IPTV/CCTV multicast), RTMP, sustained multicast UDP, unsignaled media-like UDP heuristic, GigE Vision machine-vision cameras (UDP 3956), CCTV DVR/NVR vendor ports (Hikvision 8000 / Dahua 37777).
 
 ### Attack and Anomaly Patterns
 

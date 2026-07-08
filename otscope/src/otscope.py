@@ -58,9 +58,19 @@ from pathlib import Path
 from statistics import median
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+# On Windows, piped/redirected stdout falls back to the legacy code page
+# (cp1252), which cannot encode characters like "✓" and aborts the run
+# mid-scan with UnicodeEncodeError.  Force UTF-8 with replacement so
+# output never kills an analysis, regardless of console or pipe target.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
+
 
 TOOL_NAME = "OTscope"
-VERSION = "2.6.0"
+VERSION = "2.7.0"
 __author__ = "Ryan Lyford"
 __copyright__ = "© 2026 Ryan Lyford. All rights reserved."
 
@@ -160,9 +170,12 @@ KNOWN_OT_PORTS = {
     34962: "PROFINET DCP",
     34963: "PROFINET DCP",
     34964: "PROFINET DCP",
+    3956: "GigE Vision GVCP",
 }
 
-IT_PORTS = {21, 23, 53, 69, 80, 88, 123, 135, 137, 138, 139, 161, 389, 443, 445, 512, 513, 554, 636, 3389, 5900, 8080, 8554}
+# 1935 RTMP, 5060/5061 SIP, 8000 Hikvision DVR / HTTP-alt, 37777 Dahua DVR —
+# A/V endpoints are IT-class gear, not OT devices.
+IT_PORTS = {21, 23, 53, 69, 80, 88, 123, 135, 137, 138, 139, 161, 389, 443, 445, 512, 513, 554, 636, 1935, 3389, 5060, 5061, 5900, 8000, 8080, 8554, 37777}
 
 # ------------------------------------------------------------------
 # OUI → vendor table.  Key is the first three octets of the MAC in
@@ -1204,6 +1217,62 @@ def save_config(config: Dict[str, Any]) -> None:
     CONFIG_PATH.write_text(pretty_json(config), encoding="utf-8")
 
 
+# Direct runtime dependencies only — everything else the tool uses is stdlib.
+_FIELD_REQUIREMENTS = "python-docx>=1.1.0\nscapy>=2.5.0\n"
+
+
+def _workspace_readme_text() -> str:
+    return (
+        f"{TOOL_NAME} v{VERSION} — offline OT/ICS packet-capture analysis\n"
+        f"{__copyright__}\n"
+        "\n"
+        "This workspace was set up automatically on first run:\n"
+        "\n"
+        "  pcaps/    drop your .pcap / .pcapng capture files here\n"
+        "  output/   reports, session files, and diagrams are written here\n"
+        "\n"
+        "Quick start\n"
+        "  1. Install Python dependencies:\n"
+        "       pip install -r requirements.txt\n"
+        "  2. Install tshark (part of the Wireshark suite):\n"
+        "       Windows:        winget install WiresharkFoundation.Wireshark\n"
+        "       Debian/Ubuntu:  sudo apt install tshark\n"
+        "       macOS:          brew install wireshark\n"
+        "  3. Put capture files in pcaps/ and run:\n"
+        "       python otscope.py                 (interactive)\n"
+        "       python otscope.py --scan pcaps    (non-interactive quick scan)\n"
+        "       python otscope.py --offline       (hard-lock all outbound network calls)\n"
+        "\n"
+        "Nothing leaves this machine: analysis is fully offline and reports are\n"
+        "written to the output/ folder next to this file.\n"
+    )
+
+
+def _bootstrap_workspace() -> None:
+    """Self-provision the workspace next to the script on first run.
+
+    Lets a bare otscope.py dropped into an empty folder create everything
+    it needs: pcaps/ and output/ folders, a minimal requirements.txt, and
+    a README_FIRST.txt quick-start.  Every step is best-effort — a
+    read-only location (e.g. a locked USB drive) must never stop the tool.
+    """
+    try:
+        _PCAPS_ROOT.mkdir(parents=True, exist_ok=True)
+        _OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    for name, content in (
+        ("requirements.txt", _FIELD_REQUIREMENTS),
+        ("README_FIRST.txt", _workspace_readme_text()),
+    ):
+        target = _SCRIPT_DIR / name
+        try:
+            if not target.exists():
+                target.write_text(content, encoding="utf-8")
+        except OSError:
+            pass
+
+
 def ensure_runtime_dependencies() -> None:
     """Check for required runtime tools and packages."""
     missing = []
@@ -1223,14 +1292,15 @@ def ensure_runtime_dependencies() -> None:
         for name in missing:
             print(f"    - {name}")
         print("\nInstall guidance:")
-        print("    pip install -r requirements.txt")
+        print(f'    pip install -r "{_SCRIPT_DIR / "requirements.txt"}"')
         print("")
-        print("    Linux / macOS alternative:")
+        print("    Debian/Ubuntu alternative:")
         print("    sudo apt install tshark python3-scapy python3-docx")
         print("")
-        print("    tshark must also be installed separately if missing:")
-        print("      Windows: https://www.wireshark.org/download.html")
-        print("      macOS:   brew install wireshark")
+        print("    tshark (part of the Wireshark suite) if missing:")
+        print("      Windows:        winget install WiresharkFoundation.Wireshark")
+        print("      Debian/Ubuntu:  sudo apt install tshark")
+        print("      macOS:          brew install wireshark")
         raise SystemExit(1)
 
 
@@ -1288,6 +1358,8 @@ def why_this_matters_for_finding(finding: "Finding") -> str:
         return "This finding matters because it weakens OT segmentation and increases the chance that IT-side compromise or internet exposure can directly reach control systems."
     if any(term in text for term in ("project file", "ladder", "firmware", "credential", "artifact")):
         return "This finding matters because it exposes engineering artifacts, credentials, or controller-specific metadata that can be reused for offline analysis, replay, unauthorized uploads, or follow-on access."
+    if "av_media" in text:
+        return "This finding matters because audio/video systems on a control network are usually unmanaged, rarely patched endpoints whose continuous high-bandwidth streams share switching capacity with control traffic — and camera/DVR platforms are a frequent initial foothold for attackers."
     if "absence" in text:
         return "This finding matters because missing expected traffic can mean the capture point had limited visibility, a device was offline, or segmentation is preventing expected communications."
     if finding.severity == SEVERITY_INTRUSION:
@@ -1320,6 +1392,8 @@ def recommended_fix_for_finding(finding: "Finding") -> str:
         return "Limit file-transfer paths between corporate, engineering, and control assets; disable unnecessary FTP, TFTP, SMB, or web download functions on PLC-facing systems; and require authenticated engineering workstations for any program transfer."
     if any(term in text for term in ("credential", "password", "web user")):
         return "Rotate the exposed credentials, remove any default or shared administrative passwords, enforce unique role-based accounts, and disable any management interface that exposes authentication material in cleartext."
+    if "av_media" in text:
+        return "Inventory the audio/video endpoints, move cameras, DVR/NVR platforms, and VoIP systems onto a dedicated VLAN separated from control traffic, enable IGMP snooping where multicast video is used, and bring camera and DVR firmware under patch management."
     if "absence" in text:
         return "Retake the capture from a better vantage point, confirm the device was online during collection, and compare expected protocol flows against firewall rules and switch topology."
     if "dns" in text:
@@ -1612,6 +1686,15 @@ _WIRESHARK_GUIDE: List[Tuple[Tuple[str, ...], str, List[str]]] = [
          "Identify the Z-Wave Home ID in the frame header — each Z-Wave network has a unique Home ID. Multiple Home IDs in a single capture may indicate overlapping or rogue networks.",
          "Z-Wave S2 security uses AES-128. If you see unencrypted command frames (no security encapsulation), the network is using S0 or no security — a significant risk for door locks and access control.",
      ]),
+    (("av_media", "rtsp", "onvif", "sip (voip)", "rtp media", "mpeg-ts", "rtmp"),
+     "sip || rtp || rtsp || mp2t || rtmpt",
+     [
+         "Use 'Telephony → RTP → RTP Streams' to list every detected stream with source, destination, payload type, packet count, and jitter — this is the fastest inventory of who is streaming to whom.",
+         "For SIP calls, use 'Telephony → VoIP Calls' to see call setup, parties, and duration; select a call and press 'Flow Sequence' for the full signaling ladder.",
+         "For camera traffic, filter 'rtsp' and Follow → TCP Stream on a SETUP/PLAY exchange — the stream URI reveals the camera channel, and the Transport header shows the ports the video will use.",
+         "For unclassified UDP streams, right-click a packet → 'Decode As → RTP' to test whether it is unsignaled RTP; then check 'Statistics → Conversations → UDP' sorted by bytes to gauge bandwidth.",
+         "For multicast video, filter 'ip.dst >= 224.0.0.0' and check IGMP membership reports to see which hosts subscribed to the stream.",
+     ]),
 ]
 
 
@@ -1898,6 +1981,9 @@ BASE_PACKET_FIELDS = [
     # IoT wireless protocol fields — empty on non-matching frames; cheap to include.
     "zbee_nwk.security",   # Zigbee: 0 = unencrypted, 1 = security header present
     "coap.code",           # CoAP: method code (e.g. "0.03" PUT, "0.02" POST)
+    # Audio/Video streaming — RTP payload type (empty on non-RTP frames).
+    # 0-23 audio, 24-34 video (33 = MPEG-TS mux), >=96 dynamic (H.264/Opus/...).
+    "rtp.p_type",
 ]
 
 # Superset used only for checks that need payload content (legacy, artifact extraction).
@@ -2006,6 +2092,18 @@ def protocol_family_from_row(row: Dict[str, str]) -> str:
         return "IEC 61850 MMS"
     if "rtsp" in protocol_text.lower():
         return "RTSP"
+    if "sip" in protocol_text.lower():
+        return "SIP (VoIP)"
+    if "rtcp" in protocol_text.lower():
+        return "RTP Media"
+    if "rtmp" in protocol_text.lower():
+        return "RTMP"
+    if "rtp" in protocol_text.lower():
+        return "RTP Media"
+    if "mp2t" in protocol_text.lower() or "mp2t" in frame_protocols:
+        return "MPEG-TS"
+    if "gvcp" in protocol_text.lower() or "gvsp" in protocol_text.lower():
+        return "GigE Vision"
     if "http" in protocol_text.lower():
         return "HTTP"
     if "tls" in protocol_text.lower() or "ssl" in protocol_text.lower():
@@ -2103,7 +2201,8 @@ def discovery_questions() -> List[Tuple[str, str]]:
          "Expected OT protocols — enter any that apply, comma-separated\n"
          "    OT:  modbus  bacnet  dnp3  iec61850  iec104  mqtt  opcua  enip  s7\n"
          "         omron   srtp    umas  melsec    historian  ignition  nodered  physical\n"
-         "    IoT: zigbee  coap  zwave"),
+         "    IoT: zigbee  coap  zwave\n"
+         "    A/V: voip  video  camera  cctv"),
         ("known_hmis", "Known HMI or engineering workstation IPs/hostnames (optional)"),
         ("air_gapped", "Is this environment air-gapped or isolated from the internet? (yes/no)"),
         ("baseline_file", "Baseline file to compare against (optional path, e.g. site_baseline.otpa_baseline)"),
@@ -2152,7 +2251,11 @@ _CATEGORY_PREFIX_MAP: Dict[str, str] = {
     "OSIsoft PI Server":                 "PI",
     "Ignition Gateway":                  "IGNITION",
     "Node-RED":                          "NODERED",
+    "Zigbee / IEEE 802.15.4":            "ZIGBEE",
+    "CoAP":                              "COAP",
+    "Z-Wave":                            "ZWAVE",
     "Physical Security":                 "PHYSSEC",
+    "Audio/Video Streaming":             "AVMEDIA",
     "Cleartext and Legacy Protocols":    "LEGACY",
     "Artifact Extraction":               "ARTIFACT",
     "Network Hygiene and Segmentation":  "NETHYG",
@@ -2316,6 +2419,15 @@ def ot_significance_for_finding(finding: "Finding") -> str:
             "Unauthorized downloads are among the most serious OT security events because a "
             "compromised PLC program persists through reboots and can cause physical harm."
         )
+    if "av_media" in text:
+        return (
+            "Audio/video systems (IP cameras, DVR/NVR platforms, VoIP phones) on an OT "
+            "segment usually sit outside patch and inventory management.  Camera and DVR "
+            "platforms have a long history of critical vulnerabilities and default "
+            "credentials, making them a common initial foothold, and their continuous "
+            "high-bandwidth streams compete with deterministic control traffic on shared "
+            "switches.  Video paths can also carry sensitive process imagery off-site."
+        )
     return (
         "In OT environments, traffic anomalies that would be low-risk in IT can have direct "
         "consequences for physical processes, equipment, and safety.  This finding warrants "
@@ -2377,6 +2489,13 @@ def auditor_guidance_for_finding(finding: "Finding") -> List[str]:
             "Confirm whether firewall rules explicitly permit or deny the observed flow.",
             "Assess whether the remote host has been included in the site's threat model.",
         ]
+    if "av_media" in text:
+        return [
+            "Ask the site which camera, CCTV, intercom, or VoIP systems are deployed and whether they are intended to share this segment with control equipment.",
+            "Compare the stream source and destination IPs against the approved device inventory — flag any video consumer that is not a known VMS/NVR or operator workstation.",
+            "Confirm A/V equipment is included in firmware/patch management; DVR and camera platforms with known vulnerabilities should be isolated or upgraded.",
+            "If streams are multicast, verify IGMP snooping is enabled on OT switches so video cannot flood control-traffic ports.",
+        ]
     return [
         "Confirm with site personnel whether the observed behavior is expected and authorized.",
         "Cross-reference the source and destination IPs against the site's approved communication matrix.",
@@ -2404,6 +2523,8 @@ def benign_explanation_for_finding(finding: "Finding") -> str:
         return "This finding would be benign if the cross-zone communication is explicitly documented, monitored, and intentionally permitted through a reviewed segmentation policy."
     if any(t in text for t in ("plc stop", "cold restart", "warm restart")):
         return "This finding would be benign if the source is an authorized engineering workstation and the restart was part of a scheduled, documented maintenance window."
+    if "av_media" in text:
+        return "This finding would be benign if the site confirms the endpoints are its own CCTV, intercom, paging, or VoIP equipment and the network placement matches the approved design — in that case treat it as an inventory observation, not an incident."
     return "This finding would be benign if confirmed by site personnel as representing authorized, expected communications during normal or approved maintenance operations."
 
 
@@ -3336,504 +3457,6 @@ class OTPcapAnalyzer:
                 print(f"    - {line}")
         if single_host_capture:
             print(colorize("[!] Capture appears biased toward a single host vantage point. Absence findings may be less reliable.", SEVERITY_MEDIUM))
-        return 0
-
-    def _timestamps_by_pair(self, rows: Sequence[Tuple[Path, Dict[str, str]]]) -> Dict[Tuple[str, str], List[float]]:
-        """Group row timestamps by source/destination pair."""
-        grouped: Dict[Tuple[str, str], List[float]] = defaultdict(list)
-        for _, row in rows:
-            source_ip = row_source_ip(row)
-            destination_ip = row_destination_ip(row)
-            if not source_ip or not destination_ip:
-                continue
-            try:
-                grouped[(source_ip, destination_ip)].append(float(row.get("frame.time_epoch") or "0"))
-            except ValueError:
-                continue
-        return grouped
-
-    def check_modbus(self, pcaps: Sequence[Path]) -> int:
-        """Analyze Modbus traffic."""
-        rows = self._filtered_rows(pcaps, "tcp.port == 502")
-        if not rows:
-            if self._expected_protocol(["modbus"]):
-                self.add_finding(
-                    SEVERITY_MEDIUM,
-                    "Absence of Expected Traffic",
-                    "Expected Modbus TCP not observed",
-                    "Modbus TCP was declared as expected, but no TCP/502 traffic was seen in the analyzed captures.",
-                    ["No tcp.port == 502 packets matched."],
-                    [],
-                    [],
-                    "Modbus TCP",
-                    [pcap.name for pcap in pcaps],
-                    "absence::modbus",
-                )
-            return 0
-        read_masters: set[str] = set()
-        write_sources: Counter[Tuple[str, str]] = Counter()
-        exception_counts: Counter[str] = Counter()
-        address_ranges: Dict[Tuple[str, str], List[int]] = defaultdict(list)
-        timestamps = self._timestamps_by_pair(rows)
-        for pcap, row in rows:
-            source_ip = row_source_ip(row)
-            destination_ip = row_destination_ip(row)
-            info = (row.get("_ws.col.Info") or "").lower()
-            evidence = f"{pcap.name}: {source_ip} -> {destination_ip} | {row.get('_ws.col.Info', '')}"
-            if "read" in info:
-                read_masters.add(source_ip)
-            if "write" in info or re.search(r"\bfc(?:=|:)?\s*(5|6|15|16)\b", info):
-                write_sources[(source_ip, destination_ip)] += 1
-                self.add_finding(
-                    SEVERITY_HIGH,
-                    "Modbus TCP",
-                    "Modbus write operation observed",
-                    f"Modbus write activity was observed from {source_ip} to {destination_ip}. Write-capable function codes should be validated as intentional.",
-                    [evidence],
-                    [source_ip],
-                    [destination_ip],
-                    "Modbus TCP",
-                    [pcap.name],
-                    f"modbus::write::{source_ip}::{destination_ip}",
-                    tags=["write", "modbus"],
-                    first_seen=row.get("frame.time_epoch"),
-                    last_seen=row.get("frame.time_epoch"),
-                )
-            if "exception" in info:
-                exception_counts[destination_ip] += 1
-            if "unit id: 0" in info or "unit identifier: 0" in info:
-                self.add_finding(
-                    SEVERITY_HIGH,
-                    "Modbus TCP",
-                    "Modbus Unit ID 0 observed",
-                    "Modbus traffic referenced Unit ID 0, which can be indicative of broadcast-style behavior or access control bypass attempts.",
-                    [evidence],
-                    [source_ip],
-                    [destination_ip],
-                    "Modbus TCP",
-                    [pcap.name],
-                    f"modbus::unit0::{source_ip}::{destination_ip}",
-                )
-            for match in re.finditer(r"(\d{1,5})", info):
-                address_ranges[(source_ip, destination_ip)].append(int(match.group(1)))
-        for (source_ip, destination_ip), count in write_sources.items():
-            if source_ip not in read_masters:
-                self.add_finding(
-                    SEVERITY_CRITICAL,
-                    "Modbus TCP",
-                    "Unexpected Modbus write source",
-                    f"{source_ip} issued Modbus write traffic toward {destination_ip} without also appearing as a normal polling master in the capture.",
-                    [f"Write count: {count}"],
-                    [source_ip],
-                    [destination_ip],
-                    "Modbus TCP",
-                    [pcap.name for pcap, _ in rows if row_source_ip(_) == source_ip],
-                    f"modbus::unexpected-writer::{source_ip}::{destination_ip}",
-                    tags=["write", "unexpected_writer"],
-                )
-        for (source_ip, destination_ip), values in address_ranges.items():
-            if len(values) >= 20 and max(values) - min(values) > 100:
-                self.add_finding(
-                    SEVERITY_HIGH,
-                    "Modbus TCP",
-                    "Possible Modbus register scanning",
-                    f"{source_ip} queried a wide sequential range of Modbus register values on {destination_ip}, which is consistent with reconnaissance behavior.",
-                    [f"Address span observed: {min(values)}-{max(values)} over {len(values)} values"],
-                    [source_ip],
-                    [destination_ip],
-                    "Modbus TCP",
-                    [pcap.name for pcap, _ in rows if row_source_ip(_) == source_ip],
-                    f"modbus::scan::{source_ip}::{destination_ip}",
-                    tags=["recon", "modbus"],
-                )
-        for destination_ip, count in exception_counts.items():
-            if count >= 5:
-                self.add_finding(
-                    SEVERITY_HIGH,
-                    "Modbus TCP",
-                    "Elevated Modbus exceptions",
-                    f"{destination_ip} returned {count} Modbus exception responses. Elevated exception rates can indicate fuzzing, attack traffic, or misconfiguration.",
-                    [f"Exception responses: {count}"],
-                    [],
-                    [destination_ip],
-                    "Modbus TCP",
-                    [pcap.name for pcap, _ in rows],
-                    f"modbus::exceptions::{destination_ip}",
-                )
-        for pair, points in timestamps.items():
-            if len(points) >= 8:
-                diffs = [later - earlier for earlier, later in zip(points, points[1:]) if later > earlier]
-                if diffs:
-                    baseline = median(diffs)
-                    compressed = [delta for delta in diffs if delta < (baseline / max(self.config.get("polling_anomaly_multiplier", DEFAULT_POLLING_ANOMALY_MULTIPLIER), 1.1))]
-                    if baseline > 0 and len(compressed) >= 5:
-                        self.add_finding(
-                            SEVERITY_HIGH,
-                            "Modbus TCP",
-                            "Modbus polling burst anomaly",
-                            f"Observed packet timing between {pair[0]} and {pair[1]} deviated sharply from the baseline polling interval, which can indicate fuzzing or attack traffic.",
-                            [f"Median interval: {baseline:.3f}s | anomalous intervals: {len(compressed)}"],
-                            [pair[0]],
-                            [pair[1]],
-                            "Modbus TCP",
-                            [pcap.name for pcap, _ in rows],
-                            f"modbus::timing::{pair[0]}::{pair[1]}",
-                            tags=["timing_anomaly", "modbus"],
-                        )
-        server_writers: Dict[str, set[str]] = defaultdict(set)
-        for source_ip, destination_ip in write_sources:
-            server_writers[destination_ip].add(source_ip)
-        for destination_ip, writers in server_writers.items():
-            if len(writers) > 1:
-                self.add_finding(
-                    SEVERITY_HIGH,
-                    "Modbus TCP",
-                    "Multiple Modbus write sources to one server",
-                    f"Multiple source IPs issued Modbus write operations to {destination_ip}. This should be confirmed as intentional from the capture vantage point.",
-                    [f"Writers: {', '.join(sorted(writers))}"],
-                    sorted(writers),
-                    [destination_ip],
-                    "Modbus TCP",
-                    [pcap.name for pcap, _ in rows],
-                    f"modbus::multi-writer::{destination_ip}",
-                    tags=["write", "multi_writer"],
-                )
-        return 0
-
-    def check_bacnet(self, pcaps: Sequence[Path]) -> int:
-        """Analyze BACnet/IP traffic."""
-        rows = self._filtered_rows(pcaps, "udp.port == 47808")
-        if not rows:
-            if self._expected_protocol(["bacnet"]):
-                self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected BACnet traffic not observed", "BACnet/IP was declared as expected, but no UDP/47808 traffic was observed.", ["No udp.port == 47808 packets matched."], [], [], "BACnet/IP", [pcap.name for pcap in pcaps], "absence::bacnet")
-            return 0
-        who_is = 0
-        i_am = 0
-        for pcap, row in rows:
-            source_ip = row_source_ip(row)
-            destination_ip = row_destination_ip(row)
-            info = (row.get("_ws.col.Info") or "").lower()
-            evidence = f"{pcap.name}: {source_ip} -> {destination_ip} | {row.get('_ws.col.Info', '')}"
-            if "who-is" in info:
-                who_is += 1
-            if "i-am" in info:
-                i_am += 1
-            if "writeproperty" in info or "write property" in info:
-                self.add_finding(SEVERITY_HIGH, "BACnet/IP", "BACnet WriteProperty observed", f"BACnet WriteProperty traffic was seen from {source_ip} to {destination_ip}. BACnet writes should be validated as intentional.", [evidence], [source_ip], [destination_ip], "BACnet/IP", [pcap.name], f"bacnet::write::{source_ip}::{destination_ip}", tags=["write", "bacnet"])
-            if "bbmd" in info or "forwarded npdu" in info:
-                self.add_finding(SEVERITY_HIGH, "BACnet/IP", "BACnet routed across subnets", "BACnet traffic appears to have crossed subnets via BBMD/forwarded NPDU behavior. Verify that the routing path is expected.", [evidence], [source_ip], [destination_ip], "BACnet/IP", [pcap.name], f"bacnet::bbmd::{source_ip}::{destination_ip}", tags=["boundary"])
-        if who_is >= 20 and who_is > max(i_am * 3, 10):
-            self.add_finding(SEVERITY_HIGH, "BACnet/IP", "Possible BACnet broadcast storm", "Who-Is broadcast volume greatly exceeded I-Am responses, which can indicate reconnaissance or a misconfigured device.", [f"Who-Is count: {who_is} | I-Am count: {i_am}"], [], [], "BACnet/IP", [pcap.name for pcap, _ in rows], "bacnet::storm", tags=["recon", "bacnet"])
-        return 0
-
-    def check_dnp3(self, pcaps: Sequence[Path]) -> int:
-        """Analyze DNP3 traffic."""
-        rows = self._filtered_rows(pcaps, "tcp.port == 20000 || udp.port == 20000 || dnp3")
-        if not rows:
-            if self._expected_protocol(["dnp3"]):
-                self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected DNP3 traffic not observed", "DNP3 was declared as expected, but no TCP/UDP 20000 traffic was observed.", ["No DNP3 packets matched."], [], [], "DNP3", [pcap.name for pcap in pcaps], "absence::dnp3")
-            return 0
-        secure_auth_seen = False
-        unsolicited_count = 0
-        env_type = self.session.environment_answers.get("environment_type", "").lower() if self.session else ""
-        for pcap, row in rows:
-            source_ip = row_source_ip(row)
-            destination_ip = row_destination_ip(row)
-            info = (row.get("_ws.col.Info") or "").lower()
-            evidence = f"{pcap.name}: {source_ip} -> {destination_ip} | {row.get('_ws.col.Info', '')}"
-            if "secure authentication" in info or "sa" in info:
-                secure_auth_seen = True
-            if "direct operate" in info:
-                self.add_finding(SEVERITY_CRITICAL, "DNP3", "DNP3 Direct Operate observed", f"DNP3 Direct Operate traffic was observed from {source_ip} to {destination_ip}. This is a direct field-device control action.", [evidence], [source_ip], [destination_ip], "DNP3", [pcap.name], f"dnp3::direct-operate::{source_ip}::{destination_ip}", tags=["write", "dnp3"])
-            if "freeze" in info:
-                self.add_finding(SEVERITY_HIGH, "DNP3", "DNP3 Freeze operation observed", f"DNP3 Freeze activity was seen from {source_ip} to {destination_ip}. Freeze operations should be validated with site staff.", [evidence], [source_ip], [destination_ip], "DNP3", [pcap.name], f"dnp3::freeze::{source_ip}::{destination_ip}", tags=["write", "dnp3"])
-            if "unsolicited" in info:
-                unsolicited_count += 1
-            if "broadcast" in info or "ffff" in info:
-                self.add_finding(SEVERITY_HIGH, "DNP3", "DNP3 broadcast observed", "A DNP3 broadcast-style message was observed, indicating one-to-many field device communication.", [evidence], [source_ip], [destination_ip], "DNP3", [pcap.name], f"dnp3::broadcast::{source_ip}::{destination_ip}", tags=["dnp3"])
-        if unsolicited_count >= 10:
-            self.add_finding(SEVERITY_MEDIUM, "DNP3", "Elevated DNP3 unsolicited responses", f"Observed {unsolicited_count} unsolicited DNP3 responses. Confirm whether this volume is expected for the environment.", [f"Unsolicited responses: {unsolicited_count}"], [], [], "DNP3", [pcap.name for pcap, _ in rows], "dnp3::unsolicited")
-        if not secure_auth_seen:
-            severity = SEVERITY_CRITICAL if any(term in env_type for term in ("power", "utility", "electrical")) else SEVERITY_HIGH
-            self.add_finding(severity, "DNP3", "DNP3 traffic without Secure Authentication evidence", "DNP3 traffic was observed but no evidence of Secure Authentication was seen in the capture. This is especially risky in power or utility environments.", ["No DNP3 Secure Authentication indicators observed."], [], [], "DNP3", [pcap.name for pcap, _ in rows], "dnp3::no-sa")
-        return 0
-
-    def check_iec61850(self, pcaps: Sequence[Path]) -> int:
-        """Analyze IEC 61850, GOOSE, and MMS traffic."""
-        rows = self._filtered_rows(pcaps, "mms || goose || sv || tcp.port == 102")
-        if not rows:
-            env_type = self.session.environment_answers.get("environment_type", "").lower() if self.session else ""
-            if any(term in env_type for term in ("power", "electrical", "substation")) or self._expected_protocol(["iec61850", "iec 61850", "goose", "mms"]):
-                self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected IEC 61850 traffic not observed", "IEC 61850 / GOOSE / MMS was expected but no matching traffic was observed.", ["No mms/goose/sv packets matched."], [], [], "IEC 61850", [pcap.name for pcap in pcaps], "absence::iec61850")
-            return 0
-        goose_by_mac: Dict[str, List[int]] = defaultdict(list)
-        for pcap, row in rows:
-            source_ip = row_source_ip(row)
-            destination_ip = row_destination_ip(row)
-            info = row.get("_ws.col.Info", "")
-            info_lower = info.lower()
-            evidence = f"{pcap.name}: {source_ip or row.get('eth.src', '')} -> {destination_ip or row.get('eth.dst', '')} | {info}"
-            if "goose" in protocol_family_from_row(row).lower() or "goose" in (row.get("frame.protocols") or "").lower():
-                source_mac = row.get("eth.src", "")
-                match = re.search(r"stnum[=: ]+(\d+)", info_lower)
-                if match:
-                    goose_by_mac[source_mac].append(int(match.group(1)))
-            if "operate" in info_lower or "cancel" in info_lower or "commandtermination" in info_lower:
-                self.add_finding(SEVERITY_HIGH, "IEC 61850", "IEC 61850 control operation observed", f"IEC 61850 control-oriented traffic was observed from {source_ip or row.get('eth.src', '')} to {destination_ip or row.get('eth.dst', '')}.", [evidence], [source_ip], [destination_ip], "IEC 61850", [pcap.name], f"iec61850::control::{source_ip or row.get('eth.src', '')}::{destination_ip or row.get('eth.dst', '')}", tags=["write", "iec61850"])
-            if row_destination_port(row) == 102 and "tls" not in (row.get("frame.protocols") or "").lower():
-                self.add_finding(SEVERITY_HIGH, "IEC 61850", "IEC 61850 MMS without TLS", "MMS traffic on TCP/102 was observed without TLS indicators. This suggests cleartext substation communications.", [evidence], [source_ip], [destination_ip], "IEC 61850 MMS", [pcap.name], f"iec61850::cleartext::{source_ip}::{destination_ip}")
-        for source_mac, values in goose_by_mac.items():
-            if len(values) >= 3:
-                jumps = [later - earlier for earlier, later in zip(values, values[1:])]
-                if any(jump > 5 for jump in jumps):
-                    self.add_finding(SEVERITY_CRITICAL, "IEC 61850", "GOOSE state-number anomaly", "GOOSE stNum values changed abruptly, which can indicate replay or injection behavior.", [f"Source MAC {source_mac} stNum values: {values[:10]}"], [], [], "IEC 61850 GOOSE", [pcap.name for pcap, _ in rows], f"iec61850::stnum::{source_mac}", tags=["intrusion", "iec61850"])
-        return 0
-
-    def check_iec104(self, pcaps: Sequence[Path]) -> int:
-        """Analyze IEC 60870-5-104 traffic (TCP/2404)."""
-        rows = self._filtered_rows(pcaps, "tcp.port == 2404")
-        if not rows:
-            env_type = self.session.environment_answers.get("environment_type", "").lower() if self.session else ""
-            if any(term in env_type for term in ("power", "electrical", "utility", "substation", "grid")) or self._expected_protocol(["iec104", "iec 104", "iec60870"]):
-                self.add_finding(
-                    SEVERITY_MEDIUM,
-                    "Absence of Expected Traffic",
-                    "Expected IEC 60870-5-104 traffic not observed",
-                    "IEC 60870-5-104 was expected but no traffic was observed on TCP/2404.",
-                    ["No TCP/2404 or IEC 104 packets matched."],
-                    [], [], "IEC 60870-5-104",
-                    [pcap.name for pcap in pcaps],
-                    "absence::iec104",
-                )
-            return 0
-        cleartext_pairs: set[Tuple[str, str]] = set()
-        for pcap, row in rows:
-            source_ip = row_source_ip(row)
-            destination_ip = row_destination_ip(row)
-            info = row.get("_ws.col.Info", "")
-            info_lower = info.lower()
-            evidence = f"{pcap.name}: {source_ip} -> {destination_ip} | {info}"
-            # IEC 104 has no native encryption; flag each unique pair once
-            if row_destination_port(row) == 2404 and (source_ip, destination_ip) not in cleartext_pairs:
-                cleartext_pairs.add((source_ip, destination_ip))
-                self.add_finding(
-                    SEVERITY_HIGH,
-                    "IEC 60870-5-104",
-                    "IEC 60870-5-104 without TLS observed",
-                    "IEC 104 on TCP/2404 carries no native authentication or encryption. "
-                    "Implement IEC 62351-3 TLS wrapping or restrict to approved sources at the firewall.",
-                    [evidence],
-                    [source_ip], [destination_ip],
-                    "IEC 60870-5-104",
-                    [pcap.name],
-                    f"iec104::cleartext::{source_ip}::{destination_ip}",
-                    tags=["cleartext", "iec104"],
-                )
-            # Control ASDU types: C_SC (45), C_DC (46), C_RC (47), C_SE (48-51), C_BO (51)
-            if any(term in info_lower for term in ("c_sc", "c_dc", "c_rc", "c_se", "c_bo", "direct execute", "select-and-execute")):
-                self.add_finding(
-                    SEVERITY_CRITICAL,
-                    "IEC 60870-5-104",
-                    "IEC 104 control ASDU observed",
-                    f"IEC 104 control Application Service Data Unit traffic was observed from {source_ip} to {destination_ip}. "
-                    "This indicates direct field device control activity.",
-                    [evidence],
-                    [source_ip], [destination_ip],
-                    "IEC 60870-5-104",
-                    [pcap.name],
-                    f"iec104::control::{source_ip}::{destination_ip}",
-                    tags=["write", "iec104"],
-                )
-            if "general interrogation" in info_lower or "c_ic" in info_lower or "interrogation" in info_lower:
-                self.add_finding(
-                    SEVERITY_MEDIUM,
-                    "IEC 60870-5-104",
-                    "IEC 104 general interrogation observed",
-                    f"IEC 104 general interrogation (C_IC) was observed from {source_ip}. "
-                    "This requests all current process values from an outstation and is a common pre-attack enumeration step.",
-                    [evidence],
-                    [source_ip], [destination_ip],
-                    "IEC 60870-5-104",
-                    [pcap.name],
-                    f"iec104::interrogation::{source_ip}::{destination_ip}",
-                    tags=["recon", "iec104"],
-                )
-            if destination_ip and (destination_ip.endswith(".255") or destination_ip.startswith("224.")):
-                self.add_finding(
-                    SEVERITY_HIGH,
-                    "IEC 60870-5-104",
-                    "IEC 104 broadcast or multicast destination observed",
-                    "IEC 104 traffic was directed to a broadcast or multicast address. "
-                    "Standard IEC 104 communications are unicast master-to-outstation; broadcast is anomalous.",
-                    [evidence],
-                    [source_ip], [destination_ip],
-                    "IEC 60870-5-104",
-                    [pcap.name],
-                    f"iec104::broadcast::{source_ip}::{destination_ip}",
-                    tags=["iec104"],
-                )
-        return 0
-
-    def check_mqtt(self, pcaps: Sequence[Path]) -> int:
-        """Analyze MQTT traffic."""
-        rows = self._filtered_rows(pcaps, "tcp.port == 1883 || tcp.port == 8883")
-        if not rows:
-            if self._expected_protocol(["mqtt"]):
-                self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected MQTT traffic not observed", "MQTT was declared as expected, but no MQTT traffic was observed on ports 1883 or 8883.", ["No MQTT packets matched."], [], [], "MQTT", [pcap.name for pcap in pcaps], "absence::mqtt")
-            return 0
-        reconnect_tracker: Dict[str, List[float]] = defaultdict(list)
-        for pcap, row in rows:
-            source_ip = row_source_ip(row)
-            destination_ip = row_destination_ip(row)
-            destination_port = row_destination_port(row)
-            info = row.get("_ws.col.Info", "")
-            info_lower = info.lower()
-            evidence = f"{pcap.name}: {source_ip} -> {destination_ip} | {info}"
-            if destination_port == 1883 or row_source_port(row) == 1883:
-                self.add_finding(SEVERITY_HIGH, "MQTT", "Cleartext MQTT observed", "MQTT traffic was observed on port 1883. Cleartext broker communications expose command and telemetry data.", [evidence], [source_ip], [destination_ip], "MQTT", [pcap.name], f"mqtt::cleartext::{source_ip}::{destination_ip}")
-            if "connect" in info_lower and not any(term in info_lower for term in ("user", "username", "password", "auth")):
-                self.add_finding(SEVERITY_CRITICAL, "MQTT", "MQTT connection with no authentication evidence", f"MQTT CONNECT traffic from {source_ip} did not show authentication indicators in the capture summary.", [evidence], [source_ip], [destination_ip], "MQTT", [pcap.name], f"mqtt::anonymous::{source_ip}::{destination_ip}", tags=["anonymous_mqtt"])
-            topic_match = re.search(r"(topic|publish|subscribe)[^A-Za-z0-9/_-]*([A-Za-z0-9/_#.-]+)", info, re.IGNORECASE)
-            if topic_match:
-                topic = topic_match.group(2)
-                if any(keyword in topic.lower() for keyword in CONTROL_KEYWORDS):
-                    self.add_finding(SEVERITY_HIGH, "MQTT", "MQTT control topic observed", f"MQTT topic '{topic}' appears control-oriented and should be validated carefully.", [evidence], [source_ip], [destination_ip], "MQTT", [pcap.name], f"mqtt::control-topic::{topic}", tags=["control_topic", "mqtt"])
-                if any(keyword in topic.lower() for keyword in SECRET_KEYWORDS):
-                    self.add_finding(SEVERITY_CRITICAL, "MQTT", "MQTT topic suggests credential exposure", f"MQTT topic '{topic}' appears to contain credential-related keywords.", [evidence], [source_ip], [destination_ip], "MQTT", [pcap.name], f"mqtt::secret-topic::{topic}", tags=["credential_exposure", "mqtt"])
-            if "subscribe" in info_lower and "#" in info:
-                self.add_finding(SEVERITY_HIGH, "MQTT", "MQTT wildcard subscription observed", "A subscription to wildcard topic '#' was observed, allowing receipt of all broker messages.", [evidence], [source_ip], [destination_ip], "MQTT", [pcap.name], f"mqtt::wildcard::{source_ip}::{destination_ip}", tags=["mqtt"])
-            if "retain" in info_lower and any(keyword in info_lower for keyword in CONTROL_KEYWORDS):
-                self.add_finding(SEVERITY_HIGH, "MQTT", "Retained MQTT control message observed", "A retained control-oriented MQTT message was observed. Persistent commands can survive broker restarts.", [evidence], [source_ip], [destination_ip], "MQTT", [pcap.name], f"mqtt::retained::{source_ip}::{destination_ip}", tags=["control_topic", "mqtt"])
-            if destination_port == 8883 and "tls" not in (row.get("frame.protocols") or "").lower():
-                self.add_finding(SEVERITY_HIGH, "MQTT", "MQTT on 8883 without visible TLS handshake", "Traffic used the typical MQTT-over-TLS port, but TLS was not visible in the capture summary. Verify broker configuration and inspect for stripping or misconfiguration.", [evidence], [source_ip], [destination_ip], "MQTT", [pcap.name], f"mqtt::8883-no-tls::{source_ip}::{destination_ip}")
-            if "disconnect" in info_lower or "connect" in info_lower:
-                try:
-                    reconnect_tracker[source_ip].append(float(row.get("frame.time_epoch") or "0"))
-                except ValueError:
-                    pass
-        for source_ip, points in reconnect_tracker.items():
-            if len(points) >= 3:
-                intervals = [later - earlier for earlier, later in zip(points, points[1:])]
-                if any(interval < 5 for interval in intervals):
-                    self.add_finding(SEVERITY_MEDIUM, "MQTT", "Rapid MQTT reconnect behavior observed", f"{source_ip} disconnected and reconnected rapidly on MQTT, which can indicate broker or session abuse.", [f"Reconnect intervals: {intervals[:10]}"], [source_ip], [], "MQTT", [pcap.name for pcap, _ in rows], f"mqtt::reconnect::{source_ip}", tags=["mqtt"])
-        return 0
-
-    def check_opcua(self, pcaps: Sequence[Path]) -> int:
-        """Analyze OPC-UA traffic."""
-        rows = self._filtered_rows(pcaps, "tcp.port == 4840 || tcp.port == 4843 || opcua")
-        if not rows:
-            if self._expected_protocol(["opc", "opcua", "opc-ua"]):
-                self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected OPC-UA traffic not observed", "OPC-UA was declared as expected, but no TCP/4840 traffic was observed.", ["No OPC-UA packets matched."], [], [], "OPC-UA", [pcap.name for pcap in pcaps], "absence::opcua")
-            return 0
-        browse_counts: Counter[str] = Counter()
-        read_counts: Counter[str] = Counter()
-        for pcap, row in rows:
-            source_ip = row_source_ip(row)
-            destination_ip = row_destination_ip(row)
-            info = row.get("_ws.col.Info", "")
-            info_lower = info.lower()
-            evidence = f"{pcap.name}: {source_ip} -> {destination_ip} | {info}"
-            if "tls" not in (row.get("frame.protocols") or "").lower():
-                self.add_finding(SEVERITY_HIGH, "OPC-UA", "OPC-UA without TLS", "OPC-UA traffic was observed without TLS indicators. This suggests cleartext or weakly protected session transport.", [evidence], [source_ip], [destination_ip], "OPC-UA", [pcap.name], f"opcua::cleartext::{source_ip}::{destination_ip}")
-            if "securitymode" in info_lower and "none" in info_lower:
-                self.add_finding(SEVERITY_CRITICAL, "OPC-UA", "OPC-UA SecurityMode None", "The capture indicates OPC-UA SecurityMode=None, which explicitly disables session protection.", [evidence], [source_ip], [destination_ip], "OPC-UA", [pcap.name], f"opcua::security-none::{source_ip}::{destination_ip}")
-            if "securitymode" in info_lower and "sign" in info_lower and "encrypt" not in info_lower:
-                self.add_finding(SEVERITY_MEDIUM, "OPC-UA", "OPC-UA Sign without Encrypt", "OPC-UA traffic appears to use Sign without Encrypt, which preserves integrity but not confidentiality.", [evidence], [source_ip], [destination_ip], "OPC-UA", [pcap.name], f"opcua::sign-only::{source_ip}::{destination_ip}")
-            if "browse" in info_lower:
-                browse_counts[source_ip] += 1
-            if "read" in info_lower:
-                read_counts[source_ip] += 1
-            if "write" in info_lower:
-                self.add_finding(SEVERITY_HIGH, "OPC-UA", "OPC-UA Write observed", f"OPC-UA Write traffic was observed from {source_ip} to {destination_ip}.", [evidence], [source_ip], [destination_ip], "OPC-UA", [pcap.name], f"opcua::write::{source_ip}::{destination_ip}", tags=["write", "opcua"])
-        for source_ip, count in browse_counts.items():
-            if count >= 25 or read_counts[source_ip] >= 50:
-                self.add_finding(SEVERITY_HIGH, "OPC-UA", "Possible OPC-UA reconnaissance activity", f"{source_ip} generated a high volume of Browse/Read calls against OPC-UA endpoints, which is consistent with enumeration behavior.", [f"Browse calls: {count} | Read calls: {read_counts[source_ip]}"], [source_ip], [], "OPC-UA", [pcap.name for pcap, _ in rows], f"opcua::recon::{source_ip}", tags=["recon", "opcua"])
-        return 0
-
-    def check_ethernet_ip(self, pcaps: Sequence[Path]) -> int:
-        """Analyze EtherNet/IP and CIP traffic."""
-        rows = self._filtered_rows(pcaps, "tcp.port == 44818 || udp.port == 2222")
-        if not rows:
-            if self._expected_protocol(["ethernet/ip", "cip", "enip"]):
-                self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected EtherNet/IP traffic not observed", "EtherNet/IP / CIP was declared as expected, but no TCP/44818 or UDP/2222 traffic was observed.", ["No EtherNet/IP packets matched."], [], [], "EtherNet/IP", [pcap.name for pcap in pcaps], "absence::enip")
-            return 0
-        for pcap, row in rows:
-            source_ip = row_source_ip(row)
-            destination_ip = row_destination_ip(row)
-            info = row.get("_ws.col.Info", "")
-            info_lower = info.lower()
-            evidence = f"{pcap.name}: {source_ip} -> {destination_ip} | {info}"
-            if "list identity" in info_lower:
-                self.add_finding(SEVERITY_HIGH, "EtherNet/IP", "CIP List Identity observed", "CIP List Identity traffic can indicate device enumeration or reconnaissance.", [evidence], [source_ip], [destination_ip], "EtherNet/IP", [pcap.name], f"enip::list-identity::{source_ip}::{destination_ip}", tags=["recon", "enip"])
-            if "forward open" in info_lower:
-                self.add_finding(SEVERITY_MEDIUM, "EtherNet/IP", "CIP Forward Open observed", "A CIP Forward Open request was observed. Validate that the initiating IP is expected for controller communications.", [evidence], [source_ip], [destination_ip], "EtherNet/IP", [pcap.name], f"enip::forward-open::{source_ip}::{destination_ip}")
-            if "write" in info_lower or "service: 0x53" in info_lower or "service: 0x4d" in info_lower:
-                self.add_finding(SEVERITY_HIGH, "EtherNet/IP", "CIP write activity observed", f"CIP write-style traffic was observed from {source_ip} to {destination_ip}.", [evidence], [source_ip], [destination_ip], "EtherNet/IP", [pcap.name], f"enip::write::{source_ip}::{destination_ip}", tags=["write", "enip"])
-            if "reset" in info_lower or "set attribute" in info_lower:
-                self.add_finding(SEVERITY_CRITICAL, "EtherNet/IP", "CIP reset or set-attribute observed", "A CIP Reset or Set Attribute style request was observed. This can have direct control impact on a target device.", [evidence], [source_ip], [destination_ip], "EtherNet/IP", [pcap.name], f"enip::reset::{source_ip}::{destination_ip}", tags=["write", "critical_control", "enip"])
-            if "slot 0" in info_lower:
-                self.add_finding(SEVERITY_HIGH, "EtherNet/IP", "Explicit messaging to slot 0 observed", "Explicit messaging to controller backplane slot 0 was observed. Validate that the initiating station is authorized.", [evidence], [source_ip], [destination_ip], "EtherNet/IP", [pcap.name], f"enip::slot0::{source_ip}::{destination_ip}")
-        return 0
-
-    def check_siemens(self, pcaps: Sequence[Path]) -> int:
-        """Analyze Siemens S7comm and PROFINET traffic."""
-        rows = self._filtered_rows(pcaps, "s7comm || pn_dcp || (udp.port >= 34962 && udp.port <= 34964) || tcp.port == 102")
-        relevant_rows: List[Tuple[Path, Dict[str, str]]] = []
-        for item in rows:
-            row = item[1]
-            text = f"{protocol_family_from_row(row)} {(row.get('_ws.col.Info') or '')}".lower()
-            if any(marker in text for marker in ("s7", "profinet", "dcp")):
-                relevant_rows.append(item)
-        rows = relevant_rows
-        if not rows:
-            if self._expected_protocol(["siemens", "profinet", "s7"]):
-                self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected Siemens traffic not observed", "Siemens / PROFINET was declared as expected, but no relevant traffic was observed.", ["No S7/PROFINET packets matched."], [], [], "Siemens S7 / PROFINET", [pcap.name for pcap in pcaps], "absence::siemens")
-            return 0
-        for pcap, row in rows:
-            source_ip = row_source_ip(row)
-            destination_ip = row_destination_ip(row)
-            info = row.get("_ws.col.Info", "")
-            info_lower = info.lower()
-            evidence = f"{pcap.name}: {source_ip or row.get('eth.src', '')} -> {destination_ip or row.get('eth.dst', '')} | {info}"
-            if "write var" in info_lower or "write variable" in info_lower or "function 0x05" in info_lower:
-                self.add_finding(SEVERITY_CRITICAL, "Siemens S7 / PROFINET", "S7 Write Variable observed", "A Siemens S7 Write Variable operation was observed. This is a direct control action against a PLC.", [evidence], [source_ip], [destination_ip], "S7comm", [pcap.name], f"siemens::write::{source_ip}::{destination_ip}", tags=["write", "siemens"])
-            is_s7_row = "s7comm" in (row.get("frame.protocols") or "").lower() or "s7comm" in protocol_family_from_row(row).lower()
-            if is_s7_row and ("plc stop" in info_lower or "plc start" in info_lower or "function 0x29" in info_lower or "function 0x28" in info_lower or "cpu stop" in info_lower or "cpu start" in info_lower):
-                self.add_finding(SEVERITY_CRITICAL, "Siemens S7 / PROFINET", "S7 PLC stop/start activity observed", "A Siemens PLC stop/start style operation was observed in the capture.", [evidence], [source_ip], [destination_ip], "S7comm", [pcap.name], f"siemens::stopstart::{source_ip}::{destination_ip}", tags=["write", "siemens"])
-            if "read szl" in info_lower:
-                self.add_finding(SEVERITY_HIGH, "Siemens S7 / PROFINET", "S7 Read SZL observed", "S7 Read SZL traffic was observed. This can indicate PLC reconnaissance or system inventory activity.", [evidence], [source_ip], [destination_ip], "S7comm", [pcap.name], f"siemens::szl::{source_ip}::{destination_ip}", tags=["recon", "siemens"])
-            if "dcp set" in info_lower or "set " in info_lower and "dcp" in info_lower:
-                self.add_finding(SEVERITY_HIGH, "Siemens S7 / PROFINET", "PROFINET DCP Set observed", "A PROFINET DCP Set operation was observed. These operations can rename devices or change addressing.", [evidence], [source_ip], [destination_ip], "PROFINET DCP", [pcap.name], f"siemens::dcp-set::{source_ip}::{destination_ip}", tags=["write", "siemens"])
-            if "identify all" in info_lower:
-                self.add_finding(SEVERITY_HIGH, "Siemens S7 / PROFINET", "PROFINET Identify All broadcast observed", "A PROFINET DCP Identify All broadcast was observed, which can indicate active discovery of OT devices.", [evidence], [source_ip], [destination_ip], "PROFINET DCP", [pcap.name], f"siemens::identify-all::{source_ip}::{destination_ip}", tags=["recon", "siemens"])
-            if "s7" in info_lower and row_destination_port(row) not in {0, 102} and row_source_port(row) not in {0, 102}:
-                self.add_finding(SEVERITY_MEDIUM, "Siemens S7 / PROFINET", "S7 traffic observed on a non-standard port", "Siemens S7-style traffic appeared on a port other than TCP/102. Validate whether this is an intentional non-standard deployment.", [evidence], [source_ip], [destination_ip], "S7comm", [pcap.name], f"siemens::non-standard-port::{source_ip}::{destination_ip}")
-        return 0
-
-    def check_physical_security(self, pcaps: Sequence[Path]) -> int:
-        """Analyze physical security protocols."""
-        # Some tshark builds do not expose an `osdp` display filter, so keep the
-        # capture filter to universally-supported port/protocol checks here.
-        rows = self._filtered_rows(pcaps, "rtsp || udp.port == 3702 || tcp.port == 554 || tcp.port == 8554 || tcp.port == 8080")
-        if not rows:
-            env_type = self.session.environment_answers.get("environment_type", "").lower() if self.session else ""
-            if "physical" in env_type or "camera" in env_type or self._expected_protocol(["physical", "rtsp", "osdp", "onvif", "camera"]):
-                self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected physical security traffic not observed", "Physical security protocols (RTSP/ONVIF/OSDP) were expected but no matching traffic was observed.", ["No physical security protocol packets matched."], [], [], "Physical Security", [pcap.name for pcap in pcaps], "absence::physical-security")
-            return 0
-        for pcap, row in rows:
-            source_ip = row_source_ip(row)
-            destination_ip = row_destination_ip(row)
-            info = row.get("_ws.col.Info", "")
-            info_lower = info.lower()
-            evidence = f"{pcap.name}: {source_ip or row.get('eth.src', '')} -> {destination_ip or row.get('eth.dst', '')} | {info}"
-            if ("describe" in info_lower and "www-authenticate" not in info_lower) or ("rtsp" in info_lower and "401" not in info_lower and "unauthorized" not in info_lower):
-                self.add_finding(SEVERITY_HIGH, "Physical Security", "RTSP stream without authentication challenge", "RTSP activity was observed without a visible authentication challenge. Validate whether camera access is intentionally unauthenticated.", [evidence], [source_ip], [destination_ip], "RTSP", [pcap.name], f"rtsp::no-auth::{source_ip}::{destination_ip}")
-            if row_destination_port(row) == 8080 and "rtsp" in info_lower:
-                self.add_finding(SEVERITY_MEDIUM, "Physical Security", "RTSP tunneled over HTTP", "RTSP content was observed over TCP/8080, which may indicate firewall evasion or vendor-specific tunneling.", [evidence], [source_ip], [destination_ip], "RTSP/HTTP", [pcap.name], f"rtsp::http-tunnel::{source_ip}::{destination_ip}")
-            if "ws-discovery" in info_lower or row_destination_port(row) == 3702:
-                self.add_finding(SEVERITY_MEDIUM, "Physical Security", "ONVIF discovery observed", "ONVIF WS-Discovery traffic was observed. Confirm that the initiating station is authorized to inventory cameras.", [evidence], [source_ip], [destination_ip], "ONVIF", [pcap.name], f"onvif::discovery::{source_ip}::{destination_ip}")
-            if "osdp" in info_lower and "secure channel" not in info_lower:
-                self.add_finding(SEVERITY_HIGH, "Physical Security", "Cleartext OSDP observed", "OSDP traffic was observed without Secure Channel indicators.", [evidence], [source_ip], [destination_ip], "OSDP", [pcap.name], f"osdp::cleartext::{source_ip}::{destination_ip}")
         return 0
 
     def check_legacy(self, pcaps: Sequence[Path]) -> int:
@@ -5098,11 +4721,16 @@ class OTPcapAnalyzer:
         "21,23,80,3389,5900,445,139,512,513,"
         # Vendor-specific OT ports: Omron FINS, GE-SRTP, Schneider UMAS,
         # Mitsubishi MELSEC, OSIsoft PI, Ignition Gateway, Node-RED
-        "9600,18245,1024,5007,9001,4592,1880} || "
+        "9600,18245,1024,5007,9001,4592,1880,"
+        # A/V streaming ports: SIP (5060/5061), RTMP (1935),
+        # Hikvision DVR/NVR (8000), Dahua DVR/NVR (37777)
+        "5060,5061,1935,8000,37777} || "
         "udp.port in {47808,20000,2222,3702,69,161,123,34962,34963,34964,"
         "5353,5355,137,138,1900,67,68,"
         # Omron FINS also runs over UDP/9600
-        "9600} || "
+        "9600,"
+        # SIP over UDP, GigE Vision control (GVCP)
+        "5060,3956} || "
         "dnp3 || mms || goose || sv || opcua || s7comm || pn_dcp || rtsp || "
         "tftp || "
         "arp || dns || icmp || tls || ssl || "
@@ -5114,6 +4742,16 @@ class OTPcapAnalyzer:
         "wpan || zbee_nwk || zbee_aps || "
         # CoAP (IP-based constrained-device protocol)
         "coap || udp.port in {5683,5684} || "
+        # Audio/Video streaming dissectors.  NOTE: 'rtp' here only matches
+        # RTP that tshark could classify from signaling (SIP/RTSP SDP) —
+        # global RTP heuristics stay OFF so they cannot hijack OT UDP
+        # dissection (same failure class as the Z-Wave/wpan conflict).
+        "sip || rtp || rtcp || mp2t || rtmpt || gvcp || "
+        # Unsignaled media candidates: multicast UDP, and ephemeral-to-
+        # ephemeral UDP with media-sized frames (raw RTP heuristic —
+        # classification happens Python-side in the AV dispatch block).
+        "(udp && ip.dst == 224.0.0.0/4) || "
+        "(udp.srcport >= 16384 && udp.dstport >= 16384 && frame.len >= 200) || "
         "tcp.flags.reset==1 || (tcp.flags.syn==1 && tcp.flags.ack==0)"
     )
 
@@ -5288,6 +4926,23 @@ class OTPcapAnalyzer:
             "unencrypted_samples": [],   # traffic on port 5683 (not 5684/DTLS)
         }
         zwave:    Dict[str, Any] = {"rows_seen": False, "pcap_names": set(), "samples": []}
+        # Audio/Video streaming accumulator.  Flow keys are (src, dst, dport);
+        # each flow tracks packets/bytes/first/last plus the RTP payload types
+        # seen so post-loop code can classify audio vs video.
+        av: Dict[str, Any] = {
+            "pcap_names": set(),
+            "rtp_flows": defaultdict(lambda: {"pkts": 0, "bytes": 0, "first": None, "last": None, "ptypes": Counter(), "pcaps": set()}),
+            "raw_flows": defaultdict(lambda: {"pkts": 0, "bytes": 0, "first": None, "last": None, "pcaps": set()}),
+            "mcast_flows": defaultdict(lambda: {"pkts": 0, "bytes": 0, "first": None, "last": None, "pcaps": set()}),
+            "mp2t_pairs": defaultdict(lambda: {"pkts": 0, "bytes": 0, "pcaps": set(), "sample": "", "mcast": False}),
+            "sip_calls": [],          # [(pcap, src, dst, info, ts)] INVITE/200-with-SDP
+            "sip_sources": set(),
+            "rtsp_play": [],          # [(pcap, src, dst, info, ts)] PLAY/SETUP requests
+            "rtsp_sources": set(),
+            "rtmp_pairs": defaultdict(lambda: {"pkts": 0, "pcaps": set(), "sample": ""}),
+            "gige_pairs": defaultdict(lambda: {"pkts": 0, "pcaps": set(), "sample": ""}),
+            "vendor_dvr_pairs": defaultdict(lambda: {"pkts": 0, "bytes": 0, "pcaps": set(), "sample": "", "port": 0}),
+        }
 
         # Per-pair (src, dst) ARP request timestamps — used to decide if a reply
         # was preceded by a request.  We use a short sliding window per pair.
@@ -6044,6 +5699,135 @@ class OTPcapAnalyzer:
                                 f"osdp::cleartext::{src}::{dst}",
                             )
 
+                    # ---- AUDIO/VIDEO STREAMING ---------------------------
+                    # Signaled RTP (tshark classified it from SIP/RTSP SDP).
+                    _ptype_raw = row.get("rtp.p_type") or ""
+                    try:
+                        _tsf = float(_ts_e) if _ts_e else None
+                    except ValueError:
+                        _tsf = None
+                    _flen = 0
+                    try:
+                        _flen = int(row.get("frame.len") or "0")
+                    except ValueError:
+                        pass
+                    _is_mcast_dst = False
+                    if dst and "." in dst:
+                        try:
+                            _is_mcast_dst = 224 <= int(dst.split(".", 1)[0]) <= 239
+                        except ValueError:
+                            pass
+                    if _ptype_raw and src and dst:
+                        av["pcap_names"].add(pn)
+                        if len(av["rtp_flows"]) < 2000 or (src, dst, dport) in av["rtp_flows"]:
+                            fl = av["rtp_flows"][(src, dst, dport)]
+                            fl["pkts"] += 1
+                            fl["bytes"] += _flen
+                            fl["pcaps"].add(pn)
+                            for pt_val in _ptype_raw.split(","):
+                                pt_val = pt_val.strip()
+                                if pt_val.isdigit():
+                                    fl["ptypes"][int(pt_val)] += 1
+                            if _tsf is not None:
+                                if fl["first"] is None or _tsf < fl["first"]:
+                                    fl["first"] = _tsf
+                                if fl["last"] is None or _tsf > fl["last"]:
+                                    fl["last"] = _tsf
+                    # SIP signaling (VoIP call setup, intercom / paging systems)
+                    if "sip" in fp.split(":") or dport in (5060, 5061) or sport in (5060, 5061):
+                        if "invite" in il or ("200 ok" in il and "sdp" in fp):
+                            av["pcap_names"].add(pn)
+                            if src:
+                                av["sip_sources"].add(src)
+                            if len(av["sip_calls"]) < 50:
+                                av["sip_calls"].append((pn, src, dst, info[:160], _ts_e))
+                    # RTSP active streaming (PLAY/SETUP = a stream was requested;
+                    # presence/auth findings for RTSP live in Physical Security)
+                    if is_phys and re.search(r"\b(play|setup)\b", il) and "rtsp" in fp:
+                        av["pcap_names"].add(pn)
+                        if src:
+                            av["rtsp_sources"].add(src)
+                        if len(av["rtsp_play"]) < 50:
+                            av["rtsp_play"].append((pn, src, dst, info[:160], _ts_e))
+                    # MPEG Transport Stream (IPTV / raw video distribution)
+                    if "mp2t" in fp.split(":") and src and dst:
+                        av["pcap_names"].add(pn)
+                        if len(av["mp2t_pairs"]) < 500 or (src, dst) in av["mp2t_pairs"]:
+                            pr = av["mp2t_pairs"][(src, dst)]
+                            pr["pkts"] += 1
+                            pr["bytes"] += _flen
+                            pr["pcaps"].add(pn)
+                            pr["mcast"] = pr["mcast"] or _is_mcast_dst
+                            if not pr["sample"]:
+                                pr["sample"] = ev
+                    # RTMP (Flash-era video push, still common on DVR/NVR gear)
+                    elif ("rtmpt" in fp or dport == 1935 or sport == 1935) and src and dst:
+                        av["pcap_names"].add(pn)
+                        pr = av["rtmp_pairs"][(src, dst)]
+                        pr["pkts"] += 1
+                        pr["pcaps"].add(pn)
+                        if not pr["sample"]:
+                            pr["sample"] = ev
+                    # GigE Vision machine-vision cameras (GVCP control channel)
+                    if ("gvcp" in fp.split(":") or dport == 3956 or sport == 3956) and src and dst:
+                        av["pcap_names"].add(pn)
+                        pr = av["gige_pairs"][(src, dst)]
+                        pr["pkts"] += 1
+                        pr["pcaps"].add(pn)
+                        if not pr["sample"]:
+                            pr["sample"] = ev
+                    # CCTV vendor DVR/NVR ports: Hikvision 8000, Dahua 37777.
+                    # Hedged — port 8000 is also a common HTTP-alt port, so
+                    # skip rows tshark already dissected as HTTP and require a
+                    # sustained flow before the post-loop code emits anything.
+                    _dvr_port = 8000 if (dport == 8000 or sport == 8000) else (37777 if (dport == 37777 or sport == 37777) else 0)
+                    if _dvr_port and src and dst and "http" not in fp.split(":"):
+                        av["pcap_names"].add(pn)
+                        pr = av["vendor_dvr_pairs"][(src, dst, _dvr_port)]
+                        pr["pkts"] += 1
+                        pr["bytes"] += _flen
+                        pr["pcaps"].add(pn)
+                        pr["port"] = _dvr_port
+                        if not pr["sample"]:
+                            pr["sample"] = ev
+                    # Unsignaled media candidates — only rows no dissector claimed.
+                    if not _ptype_raw and "udp" in fp.split(":") and src and dst:
+                        if _is_mcast_dst:
+                            # Generic multicast UDP: possible video/audio
+                            # distribution.  Skip well-known service groups
+                            # (mDNS/LLMNR/SSDP/WS-Discovery/PTP/CoAP) — they
+                            # have their own checks.
+                            if (not dst.startswith("224.0.0.")
+                                    and dst != "239.255.255.250"
+                                    and dst != "224.0.1.129"
+                                    and dport not in (5353, 5355, 1900, 3702, 319, 320, 5683, 5684)
+                                    and "mp2t" not in fp.split(":")):
+                                av["pcap_names"].add(pn)
+                                if len(av["mcast_flows"]) < 2000 or (src, dst, dport) in av["mcast_flows"]:
+                                    fl = av["mcast_flows"][(src, dst, dport)]
+                                    fl["pkts"] += 1
+                                    fl["bytes"] += _flen
+                                    fl["pcaps"].add(pn)
+                                    if _tsf is not None:
+                                        if fl["first"] is None or _tsf < fl["first"]:
+                                            fl["first"] = _tsf
+                                        if fl["last"] is None or _tsf > fl["last"]:
+                                            fl["last"] = _tsf
+                        elif sport >= 16384 and dport >= 16384 and _flen >= 200:
+                            # Ephemeral-to-ephemeral UDP with media-sized frames:
+                            # raw RTP-like heuristic.  Classified post-loop only
+                            # if the flow is sustained (>=200 packets).
+                            if len(av["raw_flows"]) < 2000 or (src, dst, dport) in av["raw_flows"]:
+                                fl = av["raw_flows"][(src, dst, dport)]
+                                fl["pkts"] += 1
+                                fl["bytes"] += _flen
+                                fl["pcaps"].add(pn)
+                                if _tsf is not None:
+                                    if fl["first"] is None or _tsf < fl["first"]:
+                                        fl["first"] = _tsf
+                                    if fl["last"] is None or _tsf > fl["last"]:
+                                        fl["last"] = _tsf
+
                     # ---- BEACONING / C2 PERIODICITY ----------------------
                     # Track timestamps per (src, dst, dport).  Bound samples to
                     # the first 500 per pair so memory stays bounded on chatty
@@ -6778,6 +6562,186 @@ class OTPcapAnalyzer:
                 "Node-RED (TCP 1880) was declared as expected, but no traffic was observed on that port.",
                 ["No TCP 1880 packets matched."], [], [], "Node-RED", pcap_name_list, "absence::nodered")
         print(colorize(f"[✓] Node-RED complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
+
+        # Audio/Video streaming
+        before = len(self.session.findings)
+
+        def _av_flow_line(flow_key: Tuple[str, str, int], fl: Dict[str, Any]) -> str:
+            f_src, f_dst, f_dport = flow_key
+            dur = ""
+            if fl["first"] is not None and fl["last"] is not None and fl["last"] > fl["first"]:
+                dur = f" | duration {fl['last'] - fl['first']:.0f}s"
+            ts_tag = f" @{fl['first']}" if fl["first"] is not None else ""
+            return f"{f_src} -> {f_dst}:{f_dport} | {fl['pkts']:,} pkts | {human_size(fl['bytes'])}{dur}{ts_tag}"
+
+        def _emit_av_flow_group(flows: Dict[Tuple[str, str, int], Dict[str, Any]],
+                                severity: str, title: str, desc: str,
+                                dedup: str, tags: List[str]) -> None:
+            if not flows:
+                return
+            f_srcs = sorted({k[0] for k in flows})
+            f_dsts = sorted({k[1] for k in flows})
+            f_pcaps: set = set()
+            for fl in flows.values():
+                f_pcaps.update(fl["pcaps"])
+            evidence = [_av_flow_line(k, fl) for k, fl in
+                        sorted(flows.items(), key=lambda item: -item[1]["bytes"])[:10]]
+            if len(flows) > 10:
+                evidence.append(f"... and {len(flows) - 10} more stream(s); see JSON export for the full list.")
+            self.add_finding(severity, "Audio/Video Streaming", title, desc, evidence,
+                             f_srcs[:20], f_dsts[:20], "RTP/UDP", sorted(f_pcaps), dedup,
+                             tags=["av_media"] + tags)
+
+        # Classify signaled RTP flows by payload type; dynamic PTs (>=96,
+        # H.264/H.265/Opus/...) are split by observed bitrate instead.
+        rtp_video: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
+        rtp_audio: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
+        rtp_media: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
+        for flow_key, fl in av["rtp_flows"].items():
+            if fl["pkts"] < 20:
+                continue  # ignore sub-second fragments
+            ptypes = fl["ptypes"]
+            if any(24 <= pt <= 34 for pt in ptypes):
+                rtp_video[flow_key] = fl
+            elif any(pt <= 23 for pt in ptypes):
+                rtp_audio[flow_key] = fl
+            else:
+                duration = (fl["last"] - fl["first"]) if (fl["first"] is not None and fl["last"] is not None) else 0
+                rate = (fl["bytes"] / duration) if duration >= 2 else None
+                if rate is not None and rate > 100_000:
+                    rtp_video[flow_key] = fl
+                elif rate is not None and rate < 30_000:
+                    rtp_audio[flow_key] = fl
+                else:
+                    rtp_media[flow_key] = fl
+        _emit_av_flow_group(
+            rtp_video, SEVERITY_MEDIUM, "Video streaming (RTP) observed on the network",
+            "RTP video streams were observed. Video traffic on an OT network usually means IP cameras, "
+            "video walls, or operator screen-sharing. Each stream is an unmanaged high-bandwidth flow that "
+            "can congest switches shared with control traffic, and camera platforms are a common foothold "
+            "for attackers because they are rarely patched.",
+            "avmedia::rtp-video", ["video"])
+        _emit_av_flow_group(
+            rtp_audio, SEVERITY_LOW, "Audio/voice streaming (RTP) observed on the network",
+            "RTP audio streams were observed (VoIP telephony, intercom, or paging audio). Voice traffic on "
+            "an OT network indicates converged IT/OT infrastructure — the phone system shares switching "
+            "with control traffic, which widens the attack surface and can violate segmentation policy.",
+            "avmedia::rtp-audio", ["audio"])
+        _emit_av_flow_group(
+            rtp_media, SEVERITY_LOW, "Media streaming (RTP, unclassified codec) observed",
+            "RTP streams with dynamic payload types were observed but could not be classified as audio or "
+            "video from bitrate alone. Review the endpoints to determine what is streaming.",
+            "avmedia::rtp-media", ["media"])
+        if av["sip_calls"]:
+            sip_ev = [f"{c_pn}: {c_src} -> {c_dst} | {c_info}" + (f" @{c_ts}" if c_ts else "")
+                      for c_pn, c_src, c_dst, c_info, c_ts in av["sip_calls"][:10]]
+            self.add_finding(
+                SEVERITY_LOW, "Audio/Video Streaming", "VoIP call signaling (SIP) observed",
+                "SIP call-setup signaling (INVITE / 200 OK with SDP) was observed. A VoIP telephone or "
+                "intercom system is active on this network segment. Confirm the phone system is intended "
+                "to share this segment with OT traffic.",
+                sip_ev, sorted(av["sip_sources"])[:20], [], "SIP",
+                sorted(av["pcap_names"]), "avmedia::sip-call", tags=["av_media", "voip"])
+        if av["rtsp_play"]:
+            rtsp_ev = [f"{c_pn}: {c_src} -> {c_dst} | {c_info}" + (f" @{c_ts}" if c_ts else "")
+                       for c_pn, c_src, c_dst, c_info, c_ts in av["rtsp_play"][:10]]
+            self.add_finding(
+                SEVERITY_MEDIUM, "Audio/Video Streaming", "Active video stream requested via RTSP",
+                "RTSP SETUP/PLAY requests were observed — a client actively started a camera or media "
+                "stream during the capture (not just discovery traffic). Verify the requesting host is an "
+                "authorized video client (VMS/NVR), not a workstation or unknown device pulling video.",
+                rtsp_ev, sorted(av["rtsp_sources"])[:20], [], "RTSP",
+                sorted(av["pcap_names"]), "avmedia::rtsp-play", tags=["av_media", "video"])
+        if av["mp2t_pairs"]:
+            mp2t_ev = []
+            any_mcast = False
+            mp2t_pcaps: set = set()
+            for (p_src, p_dst), pr in sorted(av["mp2t_pairs"].items(), key=lambda item: -item[1]["bytes"])[:10]:
+                mp2t_ev.append(f"{p_src} -> {p_dst} | {pr['pkts']:,} pkts | {human_size(pr['bytes'])}"
+                               + (" | multicast" if pr["mcast"] else ""))
+                any_mcast = any_mcast or pr["mcast"]
+            for pr in av["mp2t_pairs"].values():
+                mp2t_pcaps.update(pr["pcaps"])
+            self.add_finding(
+                SEVERITY_MEDIUM, "Audio/Video Streaming", "MPEG Transport Stream video distribution observed",
+                "MPEG-TS packets were observed — broadcast-style video distribution (IPTV, digital signage, "
+                "or camera multicast). " + ("At least one stream is multicast, which floods every switch port "
+                "in the VLAN unless IGMP snooping is configured — a real bandwidth risk on OT segments." if any_mcast
+                else "Confirm the source and consumers of this video feed are intended."),
+                mp2t_ev,
+                sorted({k[0] for k in av["mp2t_pairs"]})[:20],
+                sorted({k[1] for k in av["mp2t_pairs"]})[:20],
+                "MPEG-TS", sorted(mp2t_pcaps), "avmedia::mp2t", tags=["av_media", "video"])
+        rtmp_active = {k: v for k, v in av["rtmp_pairs"].items() if v["pkts"] >= 20}
+        if rtmp_active:
+            rtmp_pcaps: set = set()
+            for pr in rtmp_active.values():
+                rtmp_pcaps.update(pr["pcaps"])
+            self.add_finding(
+                SEVERITY_MEDIUM, "Audio/Video Streaming", "RTMP video streaming observed",
+                "RTMP (TCP 1935) streaming traffic was observed. RTMP is used by some DVR/NVR platforms and "
+                "media servers to push live video. Identify the publisher and confirm video is not being "
+                "pushed to an unexpected destination.",
+                [pr["sample"] for pr in list(rtmp_active.values())[:10]],
+                sorted({k[0] for k in rtmp_active})[:20],
+                sorted({k[1] for k in rtmp_active})[:20],
+                "RTMP", sorted(rtmp_pcaps), "avmedia::rtmp", tags=["av_media", "video"])
+        mcast_sustained = {k: v for k, v in av["mcast_flows"].items() if v["pkts"] >= 200}
+        if mcast_sustained:
+            _emit_av_flow_group(
+                mcast_sustained, SEVERITY_MEDIUM,
+                "Sustained multicast UDP stream (possible video/audio distribution)",
+                "A sustained multicast UDP stream was observed that does not match any known service "
+                "protocol. On OT networks this pattern is most often video distribution or an audio paging "
+                "feed. Multicast floods every port in the VLAN unless IGMP snooping is configured; identify "
+                "the source device and confirm the stream is intended.",
+                "avmedia::multicast", ["multicast"])
+        raw_sustained = {k: v for k, v in av["raw_flows"].items() if v["pkts"] >= 200}
+        if raw_sustained:
+            _emit_av_flow_group(
+                raw_sustained, SEVERITY_LOW,
+                "Unclassified sustained UDP stream with media-like characteristics",
+                "A sustained high-port UDP flow with steady media-sized packets was observed. tshark could "
+                "not confirm the codec (no signaling was captured), but the traffic shape matches real-time "
+                "audio/video (unsignaled RTP, proprietary camera streams). Review the endpoints — this can "
+                "also indicate tunneled or covert-channel traffic.",
+                "avmedia::raw-udp-media", ["media", "unclassified"])
+        gige_active = {k: v for k, v in av["gige_pairs"].items() if v["pkts"] >= 5}
+        if gige_active:
+            gige_pcaps: set = set()
+            for pr in gige_active.values():
+                gige_pcaps.update(pr["pcaps"])
+            self.add_finding(
+                SEVERITY_INFO, "Audio/Video Streaming", "GigE Vision machine-vision camera traffic observed",
+                "GigE Vision control traffic (GVCP, UDP 3956) was observed. Machine-vision cameras are "
+                "normal in automated inspection lines; this is recorded for inventory purposes. The video "
+                "stream itself (GVSP) runs on dynamic UDP ports and may appear as an unclassified stream.",
+                [pr["sample"] for pr in list(gige_active.values())[:10]],
+                sorted({k[0] for k in gige_active})[:20],
+                sorted({k[1] for k in gige_active})[:20],
+                "GigE Vision", sorted(gige_pcaps), "avmedia::gige-vision", tags=["av_media", "machine_vision"])
+        dvr_active = {k: v for k, v in av["vendor_dvr_pairs"].items() if v["pkts"] >= 100}
+        if dvr_active:
+            dvr_pcaps: set = set()
+            for pr in dvr_active.values():
+                dvr_pcaps.update(pr["pcaps"])
+            dvr_ports = sorted({pr["port"] for pr in dvr_active.values()})
+            self.add_finding(
+                SEVERITY_MEDIUM, "Audio/Video Streaming", "CCTV DVR/NVR vendor-port traffic observed",
+                f"Sustained traffic was observed on CCTV vendor port(s) {', '.join(str(p) for p in dvr_ports)} "
+                "(TCP 8000 = Hikvision private protocol, TCP 37777 = Dahua private protocol). This indicates "
+                "a camera recorder platform on the segment. These platforms have a long history of critical "
+                "vulnerabilities and default credentials — confirm firmware currency and network placement.",
+                [f"{pr['sample']} | {pr['pkts']:,} pkts | {human_size(pr['bytes'])}" for pr in list(dvr_active.values())[:10]],
+                sorted({k[0] for k in dvr_active})[:20],
+                sorted({k[1] for k in dvr_active})[:20],
+                "CCTV DVR", sorted(dvr_pcaps), "avmedia::vendor-dvr", tags=["av_media", "video", "cctv"])
+        if not av["pcap_names"] and self._expected_protocol(["voip", "video", "audio", "camera", "cctv", "sip", "rtsp"]):
+            self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected audio/video traffic not observed",
+                "Audio/video streaming was declared as expected, but no SIP, RTP, RTSP, MPEG-TS, RTMP, or "
+                "media-like UDP streams were observed in the capture.",
+                ["No A/V signaling or streaming rows matched."], [], [], "A/V Streaming", pcap_name_list, "absence::av_media")
+        print(colorize(f"[✓] Audio/Video streaming complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
 
         # Zigbee
         before = len(self.session.findings)
@@ -9356,15 +9320,10 @@ def run_application(args: argparse.Namespace) -> None:
     analyzer = OTPcapAnalyzer(config)
     CURRENT_ANALYZER = analyzer
     signal.signal(signal.SIGINT, signal_handler)
-    # Ensure the standard workspace folders exist next to the script.
-    # These are no-ops if the folders already exist or if the user runs
-    # from a read-only location (e.g. a locked USB drive) — errors are
-    # silently ignored so the tool still starts.
-    try:
-        _PCAPS_ROOT.mkdir(parents=True, exist_ok=True)
-        _OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
+    # First-run workspace bootstrap: folders + requirements.txt +
+    # README_FIRST.txt materialize next to the script so a bare otscope.py
+    # dropped into an empty directory is fully self-provisioning.
+    _bootstrap_workspace()
     # If the pcaps folder exists but holds no capture files, guide the user
     # before they hit the file-selection prompt mid-session.
     if _PCAPS_ROOT.is_dir() and not any(
