@@ -70,16 +70,19 @@ brew install wireshark                         # macOS
 
 ### 2.1 Field Deployment (Standalone)
 
-OTscope is fully self-provisioning: drop `otscope.py` — just the one file — into any empty folder and run it. On first run it creates everything else it needs next to itself:
+OTscope is fully self-provisioning: drop `otscope.py` — and optionally your capture files — into any folder (e.g. `Building 1\`) and run it. On first run it creates everything else it needs next to itself:
 
 ```
-OTscope\
+Building 1\
     otscope.py          ← the only file you need to copy
+    site_capture.pcap   ← optional: loose captures are moved into pcaps\ automatically
     requirements.txt    ← auto-generated (pip dependency list)
     README_FIRST.txt    ← auto-generated plain-text quick-start
-    pcaps\              ← auto-created; drop capture files here
+    pcaps\              ← auto-created; capture files live here
     output\             ← auto-created; reports appear here
 ```
+
+Any `.pcap` / `.pcapng` files sitting loose next to `otscope.py` are moved into `pcaps\` at startup (with a `[i] Moved capture into workspace: …` notice; name collisions get a `_v2` suffix rather than overwriting). The same run then finds them in the default location — so "one folder with the script and the captures" is a complete deployment.
 
 If `pcaps\` is empty, the startup message will prompt you to drop capture files there before proceeding. If Python packages are missing, the startup dependency check prints the exact `pip install -r requirements.txt` command pointing at the generated file.
 
@@ -528,7 +531,7 @@ Net result: a 1.4M-device flood capture renders as a ~50-page Word report with t
 | `<session_folder>/OTscope_Purdue_Summary_<site>_<YYYYMMDD>.svg` | Visual Purdue diagram (always). |
 | `<session_folder>/OTscope_Purdue_Detail_<site>_<YYYYMMDD>.svg` | Visual per-device diagram (≤50 devices only). |
 
-> **Field deployment note:** When running from the standard field layout, `pcaps\` is the default pcap drop folder and `output\` is the default session folder — both are siblings of `otscope.py` and are auto-created on first run, along with `requirements.txt` and `README_FIRST.txt` (see §2.1). Existing files are never overwritten.
+> **Field deployment note:** When running from the standard field layout, `pcaps\` is the default pcap drop folder and `output\` is the default session folder — both are siblings of `otscope.py` and are auto-created on first run, along with `requirements.txt` and `README_FIRST.txt` (see §2.1). Loose capture files next to `otscope.py` are moved into `pcaps\` at startup. Existing files are never overwritten.
 
 ---
 
@@ -567,7 +570,7 @@ Running log of capabilities added in each release. Newest at the top.
 ### Version 2.7.0 · July 2026
 
 - **Audio/Video streaming detection** — new `Audio/Video Streaming` category (`AVMEDIA-###` finding IDs) answering "is there video or audio running on this network?": signaled RTP flows classified audio vs. video from payload type and bitrate; SIP/VoIP call signaling (INVITE / 200 OK with SDP); active RTSP `SETUP`/`PLAY` stream requests; MPEG Transport Stream distribution (IPTV/CCTV multicast); RTMP; sustained multicast UDP streams; unsignaled media-like UDP heuristic; GigE Vision machine-vision camera control (GVCP, UDP 3956); CCTV DVR/NVR vendor-port traffic (Hikvision TCP 8000, Dahua TCP 37777). Absence detection via `voip` / `video` / `audio` / `cctv` keywords in the expected-protocols question. Global RTP heuristics are deliberately left OFF in tshark so media decoding can never hijack OT UDP dissection.
-- **Drop-in self-provisioning** — a bare `otscope.py` in an empty folder now creates its full workspace on first run: `pcaps\`, `output\`, `requirements.txt`, and `README_FIRST.txt`. Nothing to pre-create, nothing overwritten if already present; read-only media never blocks startup.
+- **Drop-in self-provisioning** — a bare `otscope.py` in an empty folder now creates its full workspace on first run: `pcaps\`, `output\`, `requirements.txt`, and `README_FIRST.txt`. Capture files dropped loose next to the script are moved into `pcaps\` automatically at startup (collision-safe `_v2` suffixing), so "one folder with the script and the pcaps" is a complete deployment. Nothing to pre-create, nothing overwritten if already present; read-only media never blocks startup.
 - **UTF-8 console output** — stdout/stderr are reconfigured to UTF-8 with replacement at startup, fixing a crash (`UnicodeEncodeError: 'charmap' codec…`) when output was piped or redirected on Windows (legacy cp1252 code page).
 - **Dead code removal** — the ten legacy per-protocol `check_*` methods superseded by the streaming combined pass (Modbus, BACnet, DNP3, IEC 61850, IEC 104, MQTT, OPC-UA, EtherNet/IP, Siemens, Physical Security) were removed (~500 lines); all detection logic lives in the streaming pass only, eliminating drift risk between two implementations.
 - **Slimmed `requirements.txt`** — trimmed from a 17-package pip-freeze to the two real dependencies (`python-docx`, `scapy`); release packages and the first-run bootstrap now agree.

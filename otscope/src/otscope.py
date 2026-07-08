@@ -1229,6 +1229,7 @@ def _workspace_readme_text() -> str:
         "This workspace was set up automatically on first run:\n"
         "\n"
         "  pcaps/    drop your .pcap / .pcapng capture files here\n"
+        "            (captures left next to otscope.py are moved here automatically)\n"
         "  output/   reports, session files, and diagrams are written here\n"
         "\n"
         "Quick start\n"
@@ -1253,8 +1254,10 @@ def _bootstrap_workspace() -> None:
 
     Lets a bare otscope.py dropped into an empty folder create everything
     it needs: pcaps/ and output/ folders, a minimal requirements.txt, and
-    a README_FIRST.txt quick-start.  Every step is best-effort — a
-    read-only location (e.g. a locked USB drive) must never stop the tool.
+    a README_FIRST.txt quick-start.  Capture files dropped loose next to
+    the script are adopted into pcaps/ so the "one folder" workflow just
+    works.  Every step is best-effort — a read-only location (e.g. a
+    locked USB drive) must never stop the tool.
     """
     try:
         _PCAPS_ROOT.mkdir(parents=True, exist_ok=True)
@@ -1271,6 +1274,21 @@ def _bootstrap_workspace() -> None:
                 target.write_text(content, encoding="utf-8")
         except OSError:
             pass
+    if _PCAPS_ROOT.is_dir():
+        try:
+            loose = sorted(
+                item for item in _SCRIPT_DIR.iterdir()
+                if item.is_file() and item.suffix.lower() in {".pcap", ".pcapng"}
+            )
+        except OSError:
+            loose = []
+        for item in loose:
+            dest = _versioned_path(_PCAPS_ROOT, item.stem, item.suffix.lstrip("."))
+            try:
+                shutil.move(str(item), str(dest))
+                print(f"[i] Moved capture into workspace: {item.name} -> pcaps{os.sep}{dest.name}")
+            except OSError:
+                pass
 
 
 def ensure_runtime_dependencies() -> None:

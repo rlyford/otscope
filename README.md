@@ -28,7 +28,7 @@ It is designed for the case where you receive a pile of pcap files from a site y
 
 ## Quick Start
 
-> **Field deployment:** `otscope.py` is fully self-provisioning — drop the single file into any empty folder and run it. It creates `pcaps\`, `output\`, `requirements.txt`, and a `README_FIRST.txt` quick-start on first run.
+> **Field deployment:** `otscope.py` is fully self-provisioning — drop the single file (plus your capture files) into any folder and run it. It creates `pcaps\`, `output\`, `requirements.txt`, and a `README_FIRST.txt` quick-start on first run, and moves any loose `.pcap` / `.pcapng` files sitting next to the script into `pcaps\` automatically.
 
 ```bash
 # Install Python dependencies (all platforms)
