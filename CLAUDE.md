@@ -34,7 +34,7 @@ Supporting docs:
 
 ## Versioning
 
-- Single version constant at line ~74: `VERSION = "x.y.z"`
+- Single version constant at line ~75: `VERSION = "x.y.z"`
 - Keep `VERSION` in `otscope.py` in sync with the version declared in `otscope/docs/OTscope_User_Guide.md`.
 - Update the version history section in the User Guide when bumping the version.
 

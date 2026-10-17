@@ -372,6 +372,72 @@ def modbus_value_jump() -> Net:
     return n
 
 
+def attack_mitm_intercept() -> Net:
+    """Modeled on a real one-way ARP MITM capture taken at the PLC's switch port.
+
+    An HMI polls a PLC with transaction ID 0 and once packs 11 requests into
+    one segment.  An attacker VM (own address .80) sends unsolicited ARP
+    replies telling the PLC that the HMI's IP is at its MAC; for 20 s the
+    HMI's traffic reaches the PLC through the attacker, then the attacker
+    re-announces the real MAC.  A second client writes a register every 3 s
+    with requests sent one byte per TCP segment and closes each connection
+    with FIN, after which the PLC sends two RSTs.  The HMI also broadcasts
+    NetBIOS and multicast mDNS.
+    """
+    n = Net(seed=22)
+    hmi, plc, writer, attacker_ip = "10.61.0.70", "10.61.0.250", "10.61.0.251", "10.61.0.80"
+    hmi_mac, attacker_mac = "00:0c:29:9d:9e:9e", "00:0c:29:e6:14:0d"
+    n.set_mac(hmi, hmi_mac)
+    n.set_mac(attacker_ip, attacker_mac)
+    plc_mac = n.mac(plc)
+    t0 = n.t0
+    poll = n.session(hmi, 49499, plc, 502).open(t0)
+    attack_start, attack_end = t0 + 30, t0 + 50
+    t = t0 + 1
+    burst_done = False
+    while t < t0 + 80:
+        if attack_start <= t < attack_end:
+            n.set_mac(hmi, attacker_mac)
+        else:
+            n.set_mac(hmi, hmi_mac)
+        if not burst_done and t > t0 + 60:
+            poll.c2s(b"".join(modbus_request(0, 3, 0, 10) for _ in range(11)), t)
+            for i in range(11):
+                poll.s2c(modbus_read_response(0, 3, [1, 0, 0, 30, 0, 0, 0, 0, 0, 0]), t + 0.01 + i * 0.0004)
+            burst_done = True
+        else:
+            poll.c2s(modbus_request(0, 3, 0, 10), t)
+            poll.s2c(modbus_read_response(0, 3, [1, 0, 0, 30, 0, 0, 0, 0, 0, 0]), t + 0.01)
+        poll.ack_c(t + 0.2)
+        t += 0.3
+    n.set_mac(hmi, hmi_mac)
+    for i in range(10):
+        n.arp(t0 + 2 + i * 8, 1, hmi_mac, hmi, plc, eth_dst=plc_mac)
+        n.arp(t0 + 2.001 + i * 8, 2, plc_mac, plc, hmi, target_mac=hmi_mac, eth_dst=hmi_mac)
+    n.arp(attack_start - 1.0, 1, attacker_mac, attacker_ip, hmi)
+    n.arp(attack_start - 0.999, 2, hmi_mac, hmi, attacker_ip, target_mac=attacker_mac, eth_dst=attacker_mac)
+    n.arp(attack_start - 0.99, 1, attacker_mac, attacker_ip, plc)
+    n.arp(attack_start - 0.989, 2, plc_mac, plc, attacker_ip, target_mac=attacker_mac, eth_dst=attacker_mac)
+    for i in range(6):
+        n.arp(attack_start - 0.5 + i * 4, 2, attacker_mac, hmi, plc, target_mac=plc_mac, eth_dst=plc_mac)
+    for i in range(3):
+        n.arp(attack_end + 0.5 + i, 2, hmi_mac, hmi, plc, target_mac=plc_mac, eth_src=attacker_mac, eth_dst=plc_mac)
+    for k in range(25):
+        start = t0 + 1.5 + k * 3
+        w = n.session(writer, 50100 + k, plc, 502).open(start)
+        for i, byte in enumerate(modbus_write_single(1, 40, 100 + k)):
+            w.c2s(bytes([byte]), start + 0.01 + i * 0.0002)
+        w.s2c(modbus_write_single(1, 40, 100 + k), start + 0.02)
+        w.ack_c(start + 0.2)
+        w.close(start + 1.0)
+        n.tcp(start + 1.001, plc, 502, writer, 50100 + k, w.sseq, w.cseq, "RA")
+        n.tcp(start + 1.002, plc, 502, writer, 50100 + k, w.sseq, 0, "R")
+    for i in range(8):
+        n.udp(t0 + 3 + i * 9, hmi, 138, "10.61.0.255", 138, b"\x11\x0a" + b"\x00" * 60, dst_mac="ff:ff:ff:ff:ff:ff")
+        n.udp(t0 + 4 + i * 9, hmi, 5353, "224.0.0.251", 5353, b"\x00" * 12)
+    return n
+
+
 SCENARIOS = {
     "benign_modbus_hmi": benign_modbus_hmi,
     "benign_scada_master": benign_scada_master,
@@ -384,4 +450,5 @@ SCENARIOS = {
     "s7_engineering": s7_engineering,
     "arp_same_ms": arp_same_ms,
     "modbus_value_jump": modbus_value_jump,
+    "attack_mitm_intercept": attack_mitm_intercept,
 }

@@ -40,7 +40,9 @@ from scenarios import SCENARIOS  # noqa: E402
 
 REPO = HERE.parent
 DEFAULT_OTSCOPE = REPO / "otscope" / "src" / "otscope.py"
-DNP3_SAMPLE = REPO / "otscope" / "pcaps" / "dnp3_challenge.pcap"
+DNP3_SAMPLE = next((path for path in (REPO / "otscope" / "src" / "pcaps" / "dnp3_challenge.pcap",
+                                      REPO / "otscope" / "pcaps" / "dnp3_challenge.pcap") if path.exists()),
+                   REPO / "otscope" / "src" / "pcaps" / "dnp3_challenge.pcap")
 BENIGN_FORBIDDEN_SEVERITIES = {"INTRUSION", "CORRELATION"}
 BAND_ORDER = ["MINIMAL", "LOW", "MODERATE", "HIGH", "SEVERE"]
 
@@ -230,8 +232,11 @@ def check_attack_modbus_recon_injection(r: Result, out: RunOutput) -> None:
 
 
 def check_attack_arp_mitm(r: Result, out: RunOutput) -> None:
-    require(r, out, "ARP-based Adversary-in-the-Middle attack pattern detected", severity="INTRUSION")
-    require(r, out, "IP address claimed by multiple MACs in ARP")
+    require(r, out, "ARP-based Adversary-in-the-Middle attack pattern detected", dst="10.80.0.20", severity="INTRUSION")
+    mitm = out.matching("ARP-based Adversary-in-the-Middle attack pattern detected")
+    r.check(bool(mitm) and any("00:0c:29:aa:bb:cc" in line for line in mitm[0]["evidence"]),
+            "spoofed MAC 00:0c:29:aa:bb:cc missing from the MITM evidence")
+    forbid(r, out, "IP address claimed by multiple MACs in ARP")
 
 
 def check_av_camera_voip(r: Result, out: RunOutput) -> None:
@@ -258,6 +263,35 @@ def check_arp_same_ms(r: Result, out: RunOutput) -> None:
 def check_modbus_value_jump(r: Result, out: RunOutput) -> None:
     require(r, out, "Modbus register value anomaly detected", src="10.11.0.20", dst="10.11.0.10")
     forbid(r, out, "Modbus write operation observed")
+
+
+def check_attack_mitm_intercept(r: Result, out: RunOutput) -> None:
+    mitm = out.matching("ARP-based Adversary-in-the-Middle attack pattern detected — traffic intercepted",
+                        src="10.61.0.80", severity="INTRUSION")
+    r.check(bool(mitm), "intercepted MITM not reported as INTRUSION from the impostor's own address 10.61.0.80")
+    if mitm:
+        finding = mitm[0]
+        r.check({"10.61.0.70", "10.61.0.250"} <= set(finding["destination_ips"]),
+                "MITM finding does not name the impersonated HMI and the poisoned PLC")
+        r.check(finding["category"] == "Intrusion Indicators", f"MITM filed under {finding['category']}")
+        r.check(any("00:0c:29:e6:14:0d" in line and "Impostor MAC" in line for line in finding["evidence"]),
+                "impostor MAC missing from the evidence")
+        try:
+            span = float(finding["last_seen"]) - float(finding["first_seen"])
+        except (TypeError, ValueError):
+            span = -1
+        r.check(15 <= span <= 30, f"attack window is {span:.1f} s, expected about 20 s")
+    for title in ("Duplicate or unsolicited Modbus responses", "TCP reset storm observed",
+                  "IP address claimed by multiple MACs", "Multiple MAC addresses observed for one IP",
+                  "ARP sender MAC differs", "ARP replies without matching requests"):
+        forbid(r, out, title)
+    require(r, out, "Modbus write operation observed", src="10.61.0.251", dst="10.61.0.250")
+    devices = out.report.get("devices", {})
+    r.check("10.61.0.80" in devices, "impostor's own address 10.61.0.80 missing from the device inventory")
+    for group in ("10.61.0.255", "224.0.0.251"):
+        r.check(group not in devices, f"group address {group} listed as a device")
+    r.check(out.band() in ("HIGH", "SEVERE"), f"risk band {out.band()} for a confirmed intrusion")
+    require_heading(r, out, "Intrusion Indicators")
 
 
 def check_truncated(r: Result, out: RunOutput) -> None:
@@ -288,6 +322,7 @@ CHECKS: Dict[str, Callable[[Result, RunOutput], None]] = {
     "s7_engineering": check_s7_engineering,
     "arp_same_ms": check_arp_same_ms,
     "modbus_value_jump": check_modbus_value_jump,
+    "attack_mitm_intercept": check_attack_mitm_intercept,
     "truncated_capture": check_truncated,
     "dnp3_sample": check_dnp3_sample,
 }

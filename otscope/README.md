@@ -99,12 +99,13 @@ OT/ICS protocols, attack patterns, and hygiene anomalies are detected in a singl
 
 ### Attack and Anomaly Patterns
 
-- **Adversary-in-the-Middle (ARP MITM)** — multi-MAC-per-IP, eth/ARP MAC mismatch, gratuitous-ARP burst. Combined-signal MITM correlation escalates to INTRUSION when subsequent OT writes appear in the same subnet.
+- **Adversary-in-the-Middle (ARP MITM)** — for every IP claimed by more than one MAC, decides which MAC is the owner and which is the impostor, then reports the impostor's MAC and own IP, the impersonated host, the poisoned hosts, the attack window, and how much of the victim's traffic passed through it. INTRUSION when interception is confirmed.
 - **Beaconing / C2** — low-jitter periodic client → server exchanges (OT polling, DNS, NTP, SNMP, syslog, and discovery traffic excluded).
 - **DNS abuse** — DGA-like NXDOMAIN bursts, long and high-entropy names, large TXT, multi-resolver.
 - **TLS weakness** — the version and cipher suite each server actually selected (SSLv2/3, TLS 1.0/1.1; NULL/anon/EXPORT/RC4/DES/3DES/MD5 suites), certificates rejected by the peer, expired certificates, JA3 fingerprints of known offensive tools.
 - **SNMP** — walks (≥50 GetNext/GetBulk), SET ops, SNMPv1/v2c community strings.
 - **Reconnaissance** — broad-and-shallow OT port scans, ICMP sweeps, port-scan unreachable bursts, register-map sweeps, SNMP walks, suspicious tool User-Agents (Mimikatz, Cobalt Strike, sqlmap, masscan, nmap), recon-then-write correlation. Routine engineering discovery (IEC 104 interrogation, CIP List Identity, S7 Read SZL) is reported but not treated as reconnaissance.
+- **Denial of service** — correlation of unanswered SYNs, aborted connections, and hammer-rate requests between one client and one server.
 - **Suppression attacks** — DNP3 disable-spontaneous, cold/warm restart, alarm silencing.
 - **Brute-force** — authentication-failure bursts read from server replies (FTP 530, HTTP 401, Telnet login failures).
 - **Boundary violations** — IT/OT crossings, dual-zone bridging, public-IP exposure of OT devices.
@@ -127,7 +128,7 @@ Each session writes up to six artifacts to `output\` next to `otscope.py` (or th
 |---|---|---|
 | Word report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.docx` | Human-readable deliverable. Executive Summary, Priority Findings by category, Suggested Controls, Network Interpretation, MITRE coverage, Device Inventory and Flow Allowlist summaries, Wireshark guides (Appendix A); timeline and full evidence with `--technical-appendix` (Appendix B). |
 | JSON report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.json` | SIEM / ticketing / scripting input. |
-| Device Inventory CSV | `OT_Device_Inventory_<site>_<YYYYMMDD>.csv` | Full device list (the Word report shows the top 15 by traffic). |
+| Device Inventory CSV | `OT_Device_Inventory_<site>_<YYYYMMDD>.csv` | Full host list with MACs, roles, services used and answered, folded IPv6 addresses, and observations such as "impersonated by MAC …" (the Word report shows the top 15 by traffic). |
 | Flow Allowlist CSV | `OT_Flow_Allowlist_<site>_<YYYYMMDD>.csv` | Observed (client, server, service port, protocol) tuples for asset-owner segmentation review. |
 | Purdue Summary SVG | `OTscope_Purdue_Summary_<site>_<YYYYMMDD>.svg` | Visual layered architecture diagram (always written; readable at any network size). |
 | Purdue Detail SVG | `OTscope_Purdue_Detail_<site>_<YYYYMMDD>.svg` | Per-device visual diagram with a top-connections panel (only for ≤50 devices). |
