@@ -74,11 +74,27 @@ class RunOutput:
         self.svgs = sorted(out.glob("*.svg"))
         docs = sorted(out.glob("*.docx"))
         self.docx_headings: Optional[List[str]] = None
+        self.docx_text = ""
+        self.unreadable_header_cells = 0
         if docs:
             try:
                 import docx  # type: ignore
+                from docx.oxml.ns import qn  # type: ignore
                 document = docx.Document(str(docs[-1]))
                 self.docx_headings = [p.text for p in document.paragraphs if p.style.name.startswith("Heading")]
+                parts = [p.text for p in document.paragraphs]
+                for table in document.tables:
+                    for row in table.rows:
+                        parts.extend(cell.text for cell in row.cells)
+                    # Header cells get the dark blue fill; their text must be white.
+                    for cell in table.rows[0].cells if len(table.rows) else []:
+                        shading = cell._tc.find(f"{qn('w:tcPr')}/{qn('w:shd')}")
+                        if shading is None or shading.get(qn("w:fill")) != "2E5F8A":
+                            continue
+                        runs = [run for para in cell.paragraphs for run in para.runs]
+                        if any(str(run.font.color.rgb) != "FFFFFF" for run in runs):
+                            self.unreadable_header_cells += 1
+                self.docx_text = "\n".join(parts)
             except ImportError:
                 self.docx_headings = None
 
@@ -112,12 +128,13 @@ class RunOutput:
         return self.report.get("devices", {}).get(ip, {})
 
 
-def run_otscope(otscope: Path, workspace: Path, capture: Path, loose: bool, site: Optional[str],
+def run_otscope(otscope: Path, workspace: Path, captures: List[Path], loose: bool, site: Optional[str],
                 home: Path) -> RunOutput:
     (workspace / "pcaps").mkdir(parents=True, exist_ok=True)
     shutil.copy2(otscope, workspace / "otscope.py")
-    target = workspace / capture.name if loose else workspace / "pcaps" / capture.name
-    shutil.copy2(capture, target)
+    for capture in captures:
+        target = workspace / capture.name if loose else workspace / "pcaps" / capture.name
+        shutil.copy2(capture, target)
     cmd = [sys.executable, "otscope.py", "--scan", "pcaps", "--offline"]
     if site is not None:
         cmd += ["--site", site]
@@ -138,6 +155,9 @@ def expect_common(r: Result, out: RunOutput) -> None:
         except Exception as exc:  # noqa: BLE001
             r.failures.append(f"{svg.name} is not valid XML ({exc})")
     r.check("Traceback" not in out.log, "Python traceback in run log")
+    r.check("Word report generation failed" not in out.log, "Word report fell back to plain text")
+    r.check(out.unreadable_header_cells == 0,
+            f"{out.unreadable_header_cells} table header cell(s) have dark text on the dark header fill")
 
 
 def expect_benign(r: Result, out: RunOutput, max_band: str, forbidden_titles: List[str]) -> None:
@@ -167,6 +187,12 @@ def require_heading(r: Result, out: RunOutput, text: str) -> None:
     if out.docx_headings is None:
         return
     r.check(any(text.lower() in h.lower() for h in out.docx_headings), f"Word report has no heading containing '{text}'")
+
+
+def require_text(r: Result, out: RunOutput, text: str) -> None:
+    if out.docx_headings is None:
+        return
+    r.check(text in out.docx_text, f"Word report does not contain '{text}'")
 
 
 NOISE = ["Unknown OT-adjacent traffic", "Legacy service observed"]
@@ -292,6 +318,17 @@ def check_attack_mitm_intercept(r: Result, out: RunOutput) -> None:
         r.check(group not in devices, f"group address {group} listed as a device")
     r.check(out.band() in ("HIGH", "SEVERE"), f"risk band {out.band()} for a confirmed intrusion")
     require_heading(r, out, "Intrusion Indicators")
+    # Readable layout: remediation plan, summary box, numbered steps.
+    require_heading(r, out, "Remediation Plan")
+    for text in ("What happened", "What to do now", "1. Contain now:", "3. Verify:", "OT safety note:",
+                 "Isolate the impostor device and turn on ARP protection", "whose own address is 10.61.0.80,"):
+        require_text(r, out, text)
+    plan = out.report.get("remediation_plan", [])
+    r.check(bool(plan) and plan[0]["priority"] == 1 and "impostor" in plan[0]["action"],
+            "remediation plan does not open with isolating the impostor")
+    r.check(all(f.get("report_id") for f in out.findings
+                if f["category"] not in ("Protection Guidance", "Assessor Notes")),
+            "JSON findings are missing their report IDs")
 
 
 def check_truncated(r: Result, out: RunOutput) -> None:
@@ -308,6 +345,26 @@ def check_dnp3_sample(r: Result, out: RunOutput) -> None:
     for title in NOISE:
         forbid(r, out, title)
     r.check(len(out.allowlist) == 3, f"flow allowlist has {len(out.allowlist)} rows, expected 3 real flows")
+    # Two masters sent the same command: each pair is listed on its own.
+    require_text(r, out, "Occurrences (2):")
+    for pair in ("10.0.0.8 → 10.0.0.3", "10.0.0.9 → 10.0.0.3"):
+        require_text(r, out, pair)
+    restart_rows = [row for row in out.report.get("remediation_plan", [])
+                    if row["action"].startswith("Confirm who stopped")]
+    r.check(len(restart_rows) == 1 and len(restart_rows[0]["findings"]) == 3 and restart_rows[0]["priority"] == 1,
+            "restart and silencing findings are not combined into one priority-1 plan row")
+
+
+def check_multi_capture_out_of_order(r: Result, out: RunOutput) -> None:
+    r.check(len(out.report.get("pcaps", {})) == 2, "both capture files should be analyzed")
+    forbid(r, out, "Repetitive single-register polling pattern", src="10.12.0.10")
+    hammer = out.matching("Repetitive single-register polling pattern", src="10.12.0.66")
+    r.check(bool(hammer) and "about 50 requests per second" in hammer[0]["description"],
+            "hammering client not reported at about 50 requests per second")
+    forbid(r, out, "No NTP traffic observed in capture")
+    gaps = out.matching("Capture discontinuity")
+    r.check(any("plant_a.pcap" in g["description"] and "3 days" in g["description"] for g in gaps),
+            "three-day pause in plant_a.pcap not reported in days")
 
 
 CHECKS: Dict[str, Callable[[Result, RunOutput], None]] = {
@@ -325,6 +382,7 @@ CHECKS: Dict[str, Callable[[Result, RunOutput], None]] = {
     "attack_mitm_intercept": check_attack_mitm_intercept,
     "truncated_capture": check_truncated,
     "dnp3_sample": check_dnp3_sample,
+    "multi_capture_out_of_order": check_multi_capture_out_of_order,
 }
 SITES = {"benign_modbus_hmi": None, "s7_engineering": "R&D Plant <North>"}
 LOOSE = {"benign_modbus_hmi"}
@@ -349,22 +407,26 @@ def main() -> int:
     try:
         for name in names:
             result = Result(name)
-            captures = root / "captures"
-            captures.mkdir(exist_ok=True)
+            capture_dir = root / "captures" / name
+            capture_dir.mkdir(parents=True, exist_ok=True)
             if name == "dnp3_sample":
                 if not DNP3_SAMPLE.exists():
                     result.summary = "skipped (sample pcap not present)"
                     results.append(result)
                     continue
-                capture = DNP3_SAMPLE
+                captures = [DNP3_SAMPLE]
             elif name == "truncated_capture":
-                capture = captures / "truncated_capture.pcap"
-                SCENARIOS["benign_scada_master"]().write(str(capture), truncate_tail=20)
+                captures = [capture_dir / "truncated_capture.pcap"]
+                SCENARIOS["benign_scada_master"]().write(str(captures[0]), truncate_tail=20)
             else:
-                capture = captures / f"{name}.pcap"
-                SCENARIOS[name]().write(str(capture))
+                built = SCENARIOS[name]()
+                nets = built if isinstance(built, dict) else {f"{name}.pcap": built}
+                captures = []
+                for filename, net in nets.items():
+                    captures.append(capture_dir / filename)
+                    net.write(str(captures[-1]))
             site = SITES.get(name, name)
-            out = run_otscope(args.otscope, root / name, capture, name in LOOSE, site, home)
+            out = run_otscope(args.otscope, root / name, captures, name in LOOSE, site, home)
             expect_common(result, out)
             if out.report:
                 CHECKS[name](result, out)

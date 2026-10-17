@@ -126,8 +126,8 @@ Each session writes up to six artifacts to `output\` next to `otscope.py` (or th
 
 | Artifact | Filename Pattern | Purpose |
 |---|---|---|
-| Word report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.docx` | Human-readable deliverable. Executive Summary, Priority Findings by category, Suggested Controls, Network Interpretation, MITRE coverage, Device Inventory and Flow Allowlist summaries, Wireshark guides (Appendix A); timeline and full evidence with `--technical-appendix` (Appendix B). |
-| JSON report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.json` | SIEM / ticketing / scripting input. |
+| Word report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.docx` | Human-readable deliverable. Executive Summary, Remediation Plan (what to fix first, devices, likely owner), Priority Findings by category — each opening with what happened, why it matters, and numbered contain / fix / verify steps — Suggested Controls, Network Interpretation, MITRE coverage, Device Inventory and Flow Allowlist summaries, Wireshark guides (Appendix A); timeline and full evidence with `--technical-appendix` (Appendix B). |
+| JSON report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.json` | SIEM / ticketing / scripting input, including the remediation plan and each finding's report ID. |
 | Device Inventory CSV | `OT_Device_Inventory_<site>_<YYYYMMDD>.csv` | Full host list with MACs, roles, services used and answered, folded IPv6 addresses, and observations such as "impersonated by MAC …" (the Word report shows the top 15 by traffic). |
 | Flow Allowlist CSV | `OT_Flow_Allowlist_<site>_<YYYYMMDD>.csv` | Observed (client, server, service port, protocol) tuples for asset-owner segmentation review. |
 | Purdue Summary SVG | `OTscope_Purdue_Summary_<site>_<YYYYMMDD>.svg` | Visual layered architecture diagram (always written; readable at any network size). |

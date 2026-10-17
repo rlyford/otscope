@@ -1,6 +1,7 @@
 """Synthetic capture scenarios for the OTscope regression suite.
 
-Each builder returns a pcapgen.Net.  "benign_*" scenarios model ordinary
+Each builder returns a pcapgen.Net, or a {file name: Net} dict for scenarios
+that span several capture files.  "benign_*" scenarios model ordinary
 plant / office traffic and must not produce intrusion-class findings;
 "attack_*" scenarios contain the behavior a detector is meant to catch.
 """
@@ -8,6 +9,7 @@ plant / office traffic and must not produce intrusion-class findings;
 from __future__ import annotations
 
 import struct
+from typing import Dict
 
 from pcapgen import (
     WSD_HELLO,
@@ -438,6 +440,37 @@ def attack_mitm_intercept() -> Net:
     return n
 
 
+def multi_capture_out_of_order() -> Dict[str, Net]:
+    """Two captures of one HMI polling a PLC once a second, named so the later
+    capture is analyzed first.  The later file also holds a second recording
+    three days after the first (a paused capture), and neither file has NTP.
+    In the earlier file a test client reads one register 1,500 times in 30 s —
+    a genuine hammer pattern.  Returns {file name: capture}."""
+    hmi, plc, tester = "10.12.0.10", "10.12.0.20", "10.12.0.66"
+    base = 1760000000.0
+
+    def poll(session, start: float, count: int) -> None:
+        for i in range(count):
+            t = start + i
+            session.c2s(modbus_request(i + 1, 3, 0, 4), t)
+            session.s2c(modbus_read_response(i + 1, 3, [100, 200, 300, 400]), t + 0.01)
+            session.ack_c(t + 0.2)
+
+    later = Net(seed=31, start=base + 5 * 86400)
+    poll(later.session(hmi, 50200, plc, 502).open(later.t0), later.t0 + 1, 600)
+    resumed = later.t0 + 3 * 86400
+    poll(later.session(hmi, 50201, plc, 502).open(resumed), resumed + 1, 100)
+
+    earlier = Net(seed=32, start=base)
+    poll(earlier.session(hmi, 50300, plc, 502).open(earlier.t0), earlier.t0 + 1, 600)
+    hammer = earlier.session(tester, 50400, plc, 502).open(earlier.t0 + 100)
+    for i in range(1500):
+        t = earlier.t0 + 101 + i * 0.02
+        hammer.c2s(modbus_request(i + 1, 3, 7, 1), t)
+        hammer.s2c(modbus_read_response(i + 1, 3, [55]), t + 0.005)
+    return {"plant_a.pcap": later, "plant_b.pcap": earlier}
+
+
 SCENARIOS = {
     "benign_modbus_hmi": benign_modbus_hmi,
     "benign_scada_master": benign_scada_master,
@@ -451,4 +484,5 @@ SCENARIOS = {
     "arp_same_ms": arp_same_ms,
     "modbus_value_jump": modbus_value_jump,
     "attack_mitm_intercept": attack_mitm_intercept,
+    "multi_capture_out_of_order": multi_capture_out_of_order,
 }

@@ -72,7 +72,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 
 TOOL_NAME = "OTscope"
-VERSION = "2.8.1"
+VERSION = "2.8.2"
 __author__ = "Ryan Lyford"
 __copyright__ = "© 2026 Ryan Lyford. All rights reserved."
 
@@ -1074,6 +1074,25 @@ def format_epoch(value: Any) -> str:
         return ""
 
 
+def human_duration(seconds: float) -> str:
+    """Render a duration for report text: seconds, minutes, hours, days, or years."""
+    seconds = max(0.0, float(seconds))
+    if seconds < 1:
+        return "under a second"
+    if seconds < 90:
+        return f"{seconds:.0f} seconds"
+    minutes = seconds / 60
+    if minutes < 90:
+        return f"{minutes:.0f} minutes"
+    hours = minutes / 60
+    if hours < 48:
+        return f"{hours:.1f} hours"
+    days = hours / 24
+    if days < 730:
+        return f"{days:.0f} days"
+    return f"{days / 365.25:.1f} years"
+
+
 RISK_BANDS = ["MINIMAL", "LOW", "MODERATE", "HIGH", "SEVERE"]
 
 
@@ -1503,14 +1522,14 @@ _WHY_THIS_MATTERS: Dict[str, str] = {
     "value_anomaly": "This finding matters because sudden jumps in reported values can mean the values were spoofed rather than measured.",
     "dos": "This finding matters because a controller flooded with requests or connections stops answering its HMIs, which blinds operators and can halt the process.",
     "file_transfer": "This finding matters because controller programs and firmware moving over the network can be copied for offline attack planning or swapped for modified versions.",
-    "write": "This finding matters because it indicates traffic that can change controller state, process values, or device configuration rather than just observe data.",
+    "write": "This finding matters because this traffic can change controller state, process values, or device configuration rather than just observe data.",
     "polling": "This finding matters because abnormal polling patterns can starve a controller of resources, or reveal a script or second client acting on the process.",
-    "recon": "This finding matters because it is consistent with discovery or enumeration activity, which is often a precursor to targeted manipulation or exploitation.",
-    "c2": "This finding matters because it is consistent with a compromised host keeping contact with an operator outside the network.",
+    "recon": "This finding matters because discovery and enumeration activity is often a precursor to targeted manipulation or exploitation.",
+    "c2": "This finding matters because the traffic is consistent with a compromised host keeping contact with an attacker outside the network.",
     "credentials": "This finding matters because exposed or guessed credentials give an attacker legitimate-looking access that monitoring rarely questions.",
     "engineering": "This finding matters because engineering protocols can upload, download, and modify controller programs; whoever can speak them can change the process logic.",
     "cleartext": "This finding matters because the protocol or session protection is weak enough that credentials, commands, or process data may be exposed or modified by anyone with network visibility.",
-    "boundary": "This finding matters because it weakens OT segmentation and increases the chance that IT-side compromise or internet exposure can directly reach control systems.",
+    "boundary": "This finding matters because traffic that crosses zones weakens OT segmentation and increases the chance that IT-side compromise or internet exposure can directly reach control systems.",
     "it_noise": "This finding matters because name-resolution and discovery broadcasts can be answered by any host on the segment, which lets an attacker collect credentials or redirect connections.",
     "dhcp": "This finding matters because a rogue DHCP server can hand every new client a malicious gateway or DNS server.",
     "tcp_anomaly": "This finding matters because connections that are repeatedly refused, aborted, or unanswered point to scanning, a misconfigured client, or a failing service.",
@@ -1525,33 +1544,255 @@ _WHY_THIS_MATTERS: Dict[str, str] = {
     "unknown": "This finding matters because traffic that cannot be identified cannot be assessed, and undocumented services are a common hiding place for unauthorized access.",
 }
 
-_RECOMMENDED_FIX: Dict[str, str] = {
-    "mitm": "Find the switch port the impostor MAC is connected to (switch MAC address table) and isolate it; clear the ARP caches of the affected hosts; check controller logic, setpoints, and recent writes against a known-good backup; then enable Dynamic ARP Inspection or port security on OT switch ports and consider static ARP entries for critical controller/HMI pairs.",
-    "replay": "Identify the source of the extra responses (compare the Ethernet source MAC and TTL with the genuine server), check the path for ARP spoofing, and verify the values the HMI displayed against the controller itself.",
-    "restart": "Confirm the command came from an approved engineering host during a documented maintenance window; if not, block that host's access to the controller and review what changed around the event.",
-    "value_anomaly": "Compare the reported values with the controller's own readings and the process instrumentation, and check the path for spoofed or injected responses.",
-    "dos": "Identify and block the flooding host at the switch or firewall, rate-limit connections to the controller where the network supports it, and confirm with operations whether HMIs lost communication during the window.",
-    "file_transfer": "Limit file-transfer paths between corporate, engineering, and control assets; disable unnecessary FTP, TFTP, SMB, or web download functions on PLC-facing systems; and require authenticated engineering workstations for any program transfer.",
-    "unknown": "Identify the application behind the port with the device owner, document it in the communication matrix, and block it if it is not required.",
-    "write": "Restrict write-capable functions to approved engineering or HMI hosts only, block all other sources at the firewall or switch ACL layer, and disable unused write services where the vendor allows it.",
-    "polling": "Identify the client generating the pattern, confirm its configuration matches the approved scan list and rate, and rate-limit or block unexpected clients.",
-    "recon": "Identify the scanning source, confirm whether it is an approved management station, and if not, block its access to OT ports, disable unnecessary discovery services, and alert operations that device enumeration occurred.",
-    "c2": "Identify the process on the source host that generates the traffic, block the destination at the boundary, and examine the host for compromise before returning it to service.",
-    "credentials": "Rotate the exposed credentials, remove any default or shared administrative passwords, enforce unique role-based accounts, and disable any management interface that exposes authentication material in cleartext.",
-    "engineering": "Allow engineering protocols only from the designated engineering workstation, protect controller projects with passwords, and use the controller's memory-protect or run-mode key where available so programs cannot change outside an approved session.",
-    "cleartext": "Enable the strongest supported authentication and encryption for the protocol, disable insecure legacy access methods, rotate any exposed credentials, and limit access to a dedicated management subnet.",
-    "boundary": "Remove direct routing where possible, place a firewall or industrial DMZ between the zones, permit only explicitly required ports, and force administration through an approved jump host.",
-    "it_noise": "Disable LLMNR, NetBIOS over TCP/IP, mDNS, SSDP, and WS-Discovery on OT Windows hosts (Group Policy), or filter them at the OT switch.",
-    "dhcp": "Identify and remove the unauthorized DHCP server, then enable DHCP snooping on OT switches so only the approved server port can answer.",
-    "tcp_anomaly": "Identify the client and the service involved: block it if it is a scanner, or fix the client or service configuration so control sessions stop failing.",
-    "ipv6": "If IPv6 is not used, disable it on OT hosts or block it at the switch; if it is, add it to firewall rules and monitoring.",
-    "icmp": "Restrict ICMP to approved monitoring hosts at the OT boundary, and confirm controllers only answer the systems that need to reach them.",
-    "time": "Use a local internal time source for OT assets and block direct queries to public time servers from the control network.",
-    "capture": "Retake the capture with a longer window or from a better vantage point, and confirm the capture appliance was not dropping packets.",
-    "av": "Inventory the audio/video endpoints, move cameras, DVR/NVR platforms, and VoIP systems onto a dedicated VLAN separated from control traffic, enable IGMP snooping where multicast video is used, and bring camera and DVR firmware under patch management.",
-    "wireless": "Enable the protocol's link-layer security, restrict device enrollment, and confirm every wireless controller and node is in the asset inventory.",
-    "dns": "Point OT assets only to approved internal DNS services if name resolution is required, or remove DNS access entirely from controllers that should operate by IP only.",
-    "absence": "Retake the capture from a better vantage point, confirm the device was online during collection, and compare expected protocol flows against firewall rules and switch topology.",
+# Remediation per narrative family: (plan action, contain now, fix, verify).
+# The action is the one-line entry in the Remediation Plan; the three steps
+# are the numbered "What to Do" list in each finding.
+_REMEDIATION_STEPS: Dict[str, Tuple[str, str, str, str]] = {
+    "mitm": (
+        "Isolate the impostor device and turn on ARP protection",
+        "Find the switch port the impostor MAC is connected to (switch MAC address table) and isolate it, then clear the ARP caches of the affected hosts.",
+        "Enable Dynamic ARP Inspection or port security on the OT switch ports, and add static ARP entries for critical controller/HMI pairs.",
+        "Check controller logic, setpoints, and recent writes against a known-good backup, then recapture and confirm each affected IP is claimed by only one MAC.",
+    ),
+    "replay": (
+        "Find the host injecting the extra responses",
+        "Compare the Ethernet source MAC and TTL of the extra responses with the genuine server's to find the sender, and isolate it unless it is a known protocol gateway.",
+        "Close the injection path: look for ARP spoofing on the segment and enable Dynamic ARP Inspection or port security on the OT switch ports.",
+        "Compare the values the HMI displayed with the controller's own readings, then recapture and confirm each request gets exactly one response.",
+    ),
+    "restart": (
+        "Confirm who stopped, restarted, or silenced the controller",
+        "Ask operations whether the command came from an approved engineering host during a documented maintenance window; if not, block that host's access to the controller.",
+        "Allow restart, stop, and reporting-control commands only from the designated engineering workstation (firewall or switch ACL), and turn on the controller's own access protection where it has one.",
+        "Check the controller's mode, configuration, and event log for changes around the event, and confirm unsolicited reporting is enabled again if it was turned off.",
+    ),
+    "value_anomaly": (
+        "Check the reported values against the real process",
+        "Compare the reported values with the controller's own display and the field instruments to decide whether the process or the network data is wrong.",
+        "If the network values were spoofed, find and isolate the injecting host (check the segment for ARP spoofing); if the process really changed, hand over to operations.",
+        "Recapture during normal operation and confirm the register values track the process again.",
+    ),
+    "dos": (
+        "Stop the flood and protect the controller",
+        "Identify the flooding host and block it at its switch port or the firewall.",
+        "Limit which hosts can reach the controller's service ports, and rate-limit new connections to it where the network equipment supports it.",
+        "Ask operations whether HMIs lost communication during the window, then recapture and confirm the controller answers its HMIs normally.",
+    ),
+    "file_transfer": (
+        "Control program and firmware transfers",
+        "Confirm the transfer was an approved change; if not, isolate the source host and compare the controller's program or firmware with a known-good backup.",
+        "Allow program and firmware transfers only from authenticated engineering workstations, and disable unneeded FTP, TFTP, SMB, or web download functions on PLC-facing systems.",
+        "Recapture and confirm transfers come only from the approved engineering workstation.",
+    ),
+    "write": (
+        "Restrict who can write to the controllers",
+        "Ask operations whether each writing host is an approved HMI or engineering workstation, and block any that is not at its switch port or the firewall.",
+        "Allow write functions only from the approved HMI and engineering hosts (firewall or switch ACL), and disable unused write services where the vendor allows it.",
+        "Check the affected setpoints and outputs against their expected values, then recapture and confirm writes come only from the approved hosts.",
+    ),
+    "polling": (
+        "Bring the polling client back to its approved scan rate",
+        "Identify the client creating the pattern and ask operations whether it is an approved HMI, historian, or engineering tool.",
+        "Correct its scan list and polling rate to the approved configuration, and rate-limit or block clients that are not on the approved list.",
+        "Recapture and confirm the polling rate and register list match the approved configuration.",
+    ),
+    "recon": (
+        "Find and stop the scanning host",
+        "Identify the scanning host and confirm whether it is an approved management station; if not, block its access to OT ports.",
+        "Allow device discovery only from approved management stations, and disable discovery services the devices do not need.",
+        "Tell operations that device enumeration occurred, then recapture and confirm the scanning has stopped.",
+    ),
+    "c2": (
+        "Investigate the host for compromise",
+        "Block the external destination at the OT boundary, and isolate the source host if operations can run without it.",
+        "Find the process creating the traffic, examine the host for compromise, and rebuild it from a known-good image if it is compromised.",
+        "Recapture and confirm the host no longer contacts the destination before returning it to service.",
+    ),
+    "credentials": (
+        "Change the exposed credentials",
+        "Change the exposed or guessed credentials now, starting with administrative accounts.",
+        "Remove default and shared passwords, give each person a unique role-based account, and turn off management interfaces that send credentials in cleartext.",
+        "Confirm the old credentials no longer work and that logins now use an encrypted protocol.",
+    ),
+    "engineering": (
+        "Limit engineering access to the designated workstation",
+        "Confirm the engineering session was approved; if not, block the source host's access to the controller and compare the controller program with a known-good backup.",
+        "Allow engineering protocols only from the designated engineering workstation, password-protect controller projects, and use the controller's memory-protect setting or run-mode key where available.",
+        "Recapture and confirm engineering traffic comes only from the designated workstation during approved sessions.",
+    ),
+    "cleartext": (
+        "Secure or restrict the unencrypted service",
+        "Limit access to the service to the hosts that need it or a dedicated management subnet, and change any credentials seen in the capture.",
+        "Enable the strongest authentication and encryption the device supports (for example HTTPS, SSH, SNMPv3, or TLS) and disable the insecure legacy access methods.",
+        "Recapture and confirm the service now uses encryption or is no longer reachable from other hosts.",
+    ),
+    "boundary": (
+        "Close the unapproved path between zones",
+        "Confirm whether the cross-zone traffic is documented and required; if not, block it at the zone firewall.",
+        "Put a firewall or industrial DMZ between the zones, permit only explicitly required ports, and force remote administration through an approved jump host.",
+        "Recapture and confirm only the documented flows cross the boundary.",
+    ),
+    "it_noise": (
+        "Turn off broadcast name resolution on OT hosts",
+        "Identify the hosts sending these broadcasts (usually Windows HMIs or engineering workstations).",
+        "Disable LLMNR, NetBIOS over TCP/IP, mDNS, SSDP, and WS-Discovery on those hosts with Group Policy, or filter them at the OT switch.",
+        "Recapture and confirm the broadcasts have stopped.",
+    ),
+    "dhcp": (
+        "Remove the unauthorized DHCP server",
+        "Find the switch port of the unauthorized DHCP server and disconnect it.",
+        "Enable DHCP snooping on the OT switches so only the approved server's port can hand out addresses.",
+        "Check that clients which took an address from it have the correct gateway and DNS settings, and recapture to confirm only the approved server answers.",
+    ),
+    "tcp_anomaly": (
+        "Find out why the connections fail",
+        "Identify the client and the service involved, and block the client if it is an unapproved scanner.",
+        "Fix the client or service configuration so control sessions stop failing.",
+        "Recapture and confirm the resets or unanswered connection attempts have stopped.",
+    ),
+    "ipv6": (
+        "Disable or manage IPv6 on OT hosts",
+        "Identify the hosts sending IPv6 and confirm whether the site uses IPv6 at all.",
+        "If IPv6 is not used, disable it on the OT hosts or block it at the switch; if it is used, add it to the firewall rules and monitoring.",
+        "Recapture and confirm IPv6 traffic is gone or matches the documented design.",
+    ),
+    "icmp": (
+        "Limit ICMP to approved monitoring hosts",
+        "Identify the hosts sending ICMP to the controllers and confirm whether they are approved monitoring systems.",
+        "Allow ICMP only from approved monitoring hosts, at the OT boundary and in switch ACLs.",
+        "Recapture and confirm the controllers answer only the systems that need to reach them.",
+    ),
+    "time": (
+        "Synchronize OT clocks to an internal time source",
+        "Check the clock and time-source settings on the affected devices.",
+        "Point OT devices to a local internal time source and block direct queries to public time servers from the control network.",
+        "Confirm device clocks agree with the reference within the site's tolerance, and recapture to confirm time queries go only to the internal source.",
+    ),
+    "capture": (
+        "Retake the capture",
+        "Treat findings for the affected capture as incomplete coverage.",
+        "Retake the capture with a longer window or from a better vantage point.",
+        "Confirm the capture appliance or SPAN port reported no dropped packets during the new capture.",
+    ),
+    "av": (
+        "Separate audio/video systems from control traffic",
+        "Ask the site which camera, DVR/NVR, intercom, or VoIP systems these are and who manages them.",
+        "Move them onto a dedicated VLAN separated from control traffic, enable IGMP snooping where multicast video is used, and bring camera and DVR firmware under patch management.",
+        "Recapture and confirm the audio/video traffic no longer shares the control network.",
+    ),
+    "wireless": (
+        "Secure the wireless control network",
+        "Confirm every wireless controller and node is in the asset inventory, and remove unknown devices.",
+        "Enable the protocol's link-layer security and restrict device enrollment.",
+        "Recapture and confirm only enrolled devices communicate, using encrypted frames.",
+    ),
+    "dns": (
+        "Restrict name resolution from OT devices",
+        "Identify which OT devices resolve names and which servers they query.",
+        "Point OT devices only to approved internal DNS servers, or remove DNS access from controllers that should work by IP address only.",
+        "Recapture and confirm DNS queries go only to the approved internal servers.",
+    ),
+    "absence": (
+        "Confirm what the capture could see",
+        "Ask site staff whether the expected devices were online during the capture.",
+        "Retake the capture from a better vantage point, and compare the expected protocol flows with the firewall rules and switch layout.",
+        "Confirm the expected traffic appears in the new capture.",
+    ),
+    "unknown": (
+        "Identify the unknown service",
+        "Ask the device owner which application uses the port.",
+        "Document the service in the communication matrix if it is needed, and block it if it is not.",
+        "Recapture and confirm only documented services remain.",
+    ),
+}
+
+_NODE_RED_STEPS = (
+    "Lock down the Node-RED editor",
+    "Limit TCP/1880 to the engineering hosts that need the editor (host firewall or switch ACL).",
+    "Configure adminAuth for the Node-RED editor and serve it over TLS.",
+    "Confirm the editor now asks for credentials and cannot be reached from other hosts.",
+)
+_RTSP_STEPS = (
+    "Require credentials for camera streams",
+    "Limit which hosts can reach the camera's RTSP port (TCP/554) to the recording server and approved viewers.",
+    "Disable anonymous RTSP access on the camera and set unique credentials.",
+    "Confirm an unauthenticated stream request is now refused.",
+)
+# Findings outside every family: urgent ones get an investigate-and-block plan.
+_DEFAULT_URGENT_STEPS = (
+    "Investigate the activity and block it if unauthorized",
+    "Identify the initiating host and the target devices, and ask operations whether the activity was authorized.",
+    "If it was not, block or disable the path so the action cannot be repeated from an unauthorized source, and preserve the capture for investigation.",
+    "Check the target devices against change records, then recapture and confirm the activity has stopped.",
+)
+_DEFAULT_STEPS = (
+    "Confirm the traffic is needed; remove it if not",
+    "Confirm with the site that the protocol, source, destination, and timing match the intended design.",
+    "If the traffic is not needed, remove the exposure at the device, service, or firewall.",
+    "Recapture and confirm only the intended traffic remains.",
+)
+
+_REMEDIATION_OWNER: Dict[str, str] = {
+    "mitm": "OT network engineer, incident response",
+    "replay": "OT network engineer, incident response",
+    "restart": "Controls engineer, operations",
+    "value_anomaly": "Controls engineer, operations",
+    "dos": "OT network engineer, incident response",
+    "file_transfer": "Controls engineer",
+    "write": "Controls engineer",
+    "polling": "Controls engineer",
+    "recon": "OT network engineer, security",
+    "c2": "Incident response",
+    "credentials": "System owner",
+    "engineering": "Controls engineer",
+    "cleartext": "System owner, OT network engineer",
+    "boundary": "OT network engineer",
+    "it_noise": "OT systems administrator",
+    "dhcp": "OT network engineer",
+    "tcp_anomaly": "OT network engineer",
+    "ipv6": "OT network engineer",
+    "icmp": "OT network engineer",
+    "time": "OT systems administrator",
+    "capture": "Assessor",
+    "av": "Facilities, OT network engineer",
+    "wireless": "Controls engineer",
+    "dns": "OT network engineer",
+    "absence": "Assessor",
+    "unknown": "System owner",
+}
+
+_DEFAULT_SAFETY_NOTE = (
+    "Agree every block or configuration change with operations first, make it in a maintenance window, and keep a "
+    "way to roll it back — a blocked HMI or controller path can stop the process."
+)
+_SAFETY_CONTROL_PATH = (
+    "Do not block an HMI or engineering workstation that operators rely on until another control path is "
+    "confirmed — agree the change with operations first."
+)
+_SAFETY_SUSPECT_VALUES = (
+    "Do not change setpoints or act on alarms based on the suspect values until they are confirmed against the "
+    "controller and the field instruments."
+)
+_SAFETY_PROTOCOL_CHANGE = (
+    "Turning on encryption or changing credentials can break HMI, historian, or vendor connections — test the "
+    "change in a maintenance window and keep a rollback plan."
+)
+_OT_SAFETY_NOTE: Dict[str, str] = {
+    "mitm": "Isolating the impostor's port is normally safe, but first confirm it is not a legitimate failover partner (VRRP/HSRP, NIC teaming); expect a short communication drop while ARP caches refresh.",
+    "replay": _SAFETY_SUSPECT_VALUES,
+    "value_anomaly": _SAFETY_SUSPECT_VALUES,
+    "restart": _SAFETY_CONTROL_PATH,
+    "write": _SAFETY_CONTROL_PATH,
+    "engineering": _SAFETY_CONTROL_PATH,
+    "file_transfer": _SAFETY_CONTROL_PATH,
+    "polling": "Changing a scan rate or blocking a client can interrupt HMI or historian data — agree the change with operations first.",
+    "dos": "Set any rate limit above the normal HMI polling rate; a limit that is too tight drops legitimate control traffic.",
+    "c2": "Isolating a host that runs part of the process can stop it — confirm with operations what the host does before disconnecting it.",
+    "cleartext": _SAFETY_PROTOCOL_CHANGE,
+    "credentials": _SAFETY_PROTOCOL_CHANGE,
+    # Assessor actions change nothing on the plant network.
+    "capture": "",
+    "absence": "",
 }
 
 _OT_SIGNIFICANCE: Dict[str, str] = {
@@ -1755,7 +1996,7 @@ _BENIGN_EXPLANATION: Dict[str, str] = {
     "dos": "This finding would be benign only if an approved load or penetration test was running against the device at that time.",
     "mitm": "This finding would be benign only if the second MAC belongs to a legitimate failover partner (VRRP/HSRP, NIC teaming) or a replacement device that took over the IP — none of which sends unsolicited ARP replies to other hosts or relays the original host's traffic.",
     "replay": "This finding would be benign if a protocol gateway or redundant server pair legitimately answers for the device, or if the capture merged two mirror sources that duplicated frames (TCP retransmissions are already excluded).",
-    "restart": "This finding would be benign if the source is an authorized engineering workstation and the restart was part of a scheduled, documented maintenance window.",
+    "restart": "This finding would be benign if the source is an authorized engineering workstation and the command was part of a scheduled, documented maintenance window.",
     "write": "This finding would be benign if the source is an authorized HMI or engineering workstation performing approved maintenance or commissioning during a documented change window.",
     "polling": "This finding would be benign if the increased polling rate was a deliberate configuration change or occurred during a scheduled data-collection or commissioning activity.",
     "recon": "This finding would be benign if the source is a licensed engineering workstation or approved scanner performing routine commissioning, maintenance, or diagnostics with site approval.",
@@ -1775,23 +2016,51 @@ def why_this_matters_for_finding(finding: "Finding") -> str:
     if family in _WHY_THIS_MATTERS:
         return _WHY_THIS_MATTERS[family]
     if finding.severity == SEVERITY_INTRUSION:
-        return "This finding matters because it combines multiple suspicious behaviors into a pattern that is more concerning than any single packet or protocol event on its own."
-    return "This finding matters because it reflects behavior that is inconsistent with a minimal, well-segmented, and tightly controlled OT network."
+        return "This finding matters because several suspicious behaviors together form a pattern that is more concerning than any single packet or protocol event on its own."
+    return "This finding matters because the behavior is inconsistent with a minimal, well-segmented, and tightly controlled OT network."
+
+
+def why_it_matters_plain(finding: "Finding") -> str:
+    """The why-this-matters text as a standalone sentence, for summary boxes."""
+    text = why_this_matters_for_finding(finding)
+    prefix = "This finding matters because "
+    if text.startswith(prefix):
+        text = text[len(prefix):]
+        text = text[:1].upper() + text[1:]
+    return text
+
+
+def remediation_for_finding(finding: "Finding") -> Dict[str, str]:
+    """Return the plan action, contain/fix/verify steps, OT safety note, and likely owner for a finding."""
+    family = narrative_family(finding)
+    title = finding.title.lower()
+    if family == "default" and any(word in finding.category.lower() for word in ("cleartext", "legacy")):
+        family = "cleartext"
+    if family in ("cleartext", "unknown") and "node-red" in title:
+        steps = _NODE_RED_STEPS
+    elif family == "cleartext" and "rtsp" in title:
+        steps = _RTSP_STEPS
+    elif family in _REMEDIATION_STEPS:
+        steps = _REMEDIATION_STEPS[family]
+    elif finding.severity in {SEVERITY_CRITICAL, SEVERITY_INTRUSION}:
+        steps = _DEFAULT_URGENT_STEPS
+    else:
+        steps = _DEFAULT_STEPS
+    action, contain, fix, verify = steps
+    return {
+        "action": action,
+        "contain": contain,
+        "fix": fix,
+        "verify": verify,
+        "safety": _OT_SAFETY_NOTE.get(family, _DEFAULT_SAFETY_NOTE),
+        "owner": _REMEDIATION_OWNER.get(family, "OT security lead"),
+    }
 
 
 def recommended_fix_for_finding(finding: "Finding") -> str:
-    """Provide concrete remediation guidance tailored to a finding."""
-    family = narrative_family(finding)
-    title = finding.title.lower()
-    if family in ("cleartext", "unknown") and "node-red" in title:
-        return "Configure adminAuth for the Node-RED editor, put it behind TLS, and restrict TCP/1880 to the engineering hosts that need it."
-    if family == "cleartext" and "rtsp" in title:
-        return "Disable anonymous RTSP access on the camera, set unique credentials, and restrict which hosts can request streams."
-    if family in _RECOMMENDED_FIX:
-        return _RECOMMENDED_FIX[family]
-    if finding.severity in {SEVERITY_CRITICAL, SEVERITY_INTRUSION}:
-        return "Start with the initiating host and target devices, verify the behavior against change records, then block, disable, or reconfigure the exposed path so the same action cannot be repeated from an unauthorized source."
-    return finding.next_steps
+    """One-line remediation: the containment step followed by the lasting fix."""
+    steps = remediation_for_finding(finding)
+    return f"{steps['contain']} {steps['fix']}"
 
 
 # ----------------------------------------------------------------------
@@ -2179,6 +2448,12 @@ def lead_sentences(text: str, count: int = 2) -> str:
     return " ".join(sentences[:count])
 
 
+def sentences_after(text: str, count: int = 1) -> str:
+    """Return a description without its first `count` sentences."""
+    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z])", text.strip())
+    return " ".join(sentences[count:])
+
+
 def correlation_summary_lines(session: "SessionState") -> List[str]:
     """Build a compact summary of related/high-order findings.
 
@@ -2256,6 +2531,96 @@ def aggregated_report_issues(session: "SessionState", categories: Optional[Seque
     issues = list(grouped.values())
     issues.sort(key=lambda item: (SEVERITY_ORDER.get(item["severity"], 0), item["category"], item["title"]), reverse=True)
     return issues
+
+
+def report_issue_ids(report_issues: Sequence[Dict[str, Any]]) -> Dict[Tuple[str, str], str]:
+    """Number report issues per category prefix (e.g. NET-001), in report order."""
+    issue_ids: Dict[Tuple[str, str], str] = {}
+    id_counters: Dict[str, int] = defaultdict(int)
+    for issue in report_issues:
+        prefix = _finding_id_prefix(issue["category"])
+        id_counters[prefix] += 1
+        issue_ids[(issue["category"], issue["title"])] = f"{prefix}-{id_counters[prefix]:03d}"
+    return issue_ids
+
+
+# Remediation priority by severity: (priority, label, severities).
+_PLAN_PRIORITIES: List[Tuple[int, str, Tuple[str, ...]]] = [
+    (1, "Act now", (SEVERITY_INTRUSION, SEVERITY_CRITICAL)),
+    (2, "This week", (SEVERITY_CORRELATION, SEVERITY_HIGH)),
+    (3, "Next maintenance window", (SEVERITY_MEDIUM,)),
+    (4, "Backlog", (SEVERITY_LOW, SEVERITY_INFO)),
+]
+
+
+def plan_priority(severity: str) -> Tuple[int, str]:
+    """Map a severity to its remediation priority number and label."""
+    for priority, label, severities in _PLAN_PRIORITIES:
+        if severity in severities:
+            return priority, label
+    return _PLAN_PRIORITIES[-1][0], _PLAN_PRIORITIES[-1][1]
+
+
+def _ip_sort_key(text: str) -> Tuple[int, int, str]:
+    try:
+        address = ipaddress.ip_address(text.split("%")[0])
+        return address.version, int(address), text
+    except ValueError:
+        return 9, 0, text
+
+
+def build_remediation_plan(report_issues: Sequence[Dict[str, Any]],
+                           issue_ids: Dict[Tuple[str, str], str]) -> List[Dict[str, Any]]:
+    """Combine report issues that share the same fix into prioritized plan rows.
+
+    A row takes the most urgent priority among the findings it covers.  Rows
+    are ordered by priority, then by the most severe finding they cover, then
+    by how many findings they cover.  Device lists are capped at 50
+    (`device_count` keeps the full number).
+    """
+    rows: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+    for issue in report_issues:
+        steps = remediation_for_finding(issue["findings"][0])
+        priority, label = plan_priority(issue["severity"])
+        key = (steps["action"], steps["contain"], steps["fix"], steps["verify"])
+        row = rows.get(key)
+        if row is None:
+            row = rows[key] = {
+                "priority": priority,
+                "priority_label": label,
+                "action": steps["action"],
+                "steps": {"contain": steps["contain"], "fix": steps["fix"], "verify": steps["verify"]},
+                "ot_safety_note": steps["safety"],
+                "owner": steps["owner"],
+                "top_severity": issue["severity"],
+                "devices": set(),
+                "findings": [],
+            }
+        if priority < row["priority"]:
+            row["priority"], row["priority_label"] = priority, label
+        if SEVERITY_ORDER.get(issue["severity"], 0) > SEVERITY_ORDER.get(row["top_severity"], 0):
+            row["top_severity"] = issue["severity"]
+        row["devices"].update(issue["source_ips"])
+        row["devices"].update(issue["destination_ips"])
+        row["findings"].append({"id": issue_ids.get((issue["category"], issue["title"]), ""),
+                                "title": issue["title"], "severity": issue["severity"]})
+    plan = sorted(rows.values(), key=lambda row: (row["priority"], -SEVERITY_ORDER.get(row["top_severity"], 0),
+                                                  -len(row["findings"]), row["action"]))
+    for row in plan:
+        devices = sorted(row["devices"], key=_ip_sort_key)
+        row["device_count"] = len(devices)
+        row["devices"] = devices[:50]
+    return plan
+
+
+def occurrence_label(finding: "Finding") -> str:
+    """Name what one finding involves: "source → destination", one host, or the capture file."""
+    def _ips(ips: Sequence[str]) -> str:
+        return ", ".join(ips[:3]) + (f" (+{len(ips) - 3} more)" if len(ips) > 3 else "")
+    source, destination = _ips(finding.source_ips), _ips(finding.destination_ips)
+    if source and destination:
+        return f"{source} → {destination}"
+    return source or destination or ", ".join(finding.source_pcaps[:2]) or finding.protocol or finding.title
 
 
 class TSharkError(RuntimeError):
@@ -4672,8 +5037,7 @@ class OTPcapAnalyzer:
             return (min(values), max(values)) if values else (0.0, 0.0)
 
         def _window_text(start: float, end: float) -> str:
-            seconds = max(0.0, end - start)
-            duration = f"{seconds:.0f} s" if seconds < 120 else f"{seconds / 60:.1f} min"
+            duration = human_duration(end - start)
             return (f"{format_epoch(start)} – {format_epoch(end)} ({duration}) — Wireshark: "
                     f"frame.time_epoch >= {start:.6f} && frame.time_epoch <= {end:.6f}")
 
@@ -4700,8 +5064,10 @@ class OTPcapAnalyzer:
                 for target, count in claim["targets"].items():
                     targets[target] += count
             identity = f"Impostor MAC: {mac_label(impostor)}"
+            own_text = (f"its own address is {own_ips[0]}" if len(own_ips) == 1
+                        else f"its own addresses are {', '.join(own_ips[:-1])} and {own_ips[-1]}" if own_ips else "")
             if own_ips:
-                identity += f" — its own address is {', '.join(own_ips)}"
+                identity += f" — {own_text}"
             if frame_senders:
                 identity += f" — its ARP frames were sent from {', '.join(mac_label(s) for s in frame_senders)}"
             evidence.append(identity)
@@ -4769,7 +5135,7 @@ class OTPcapAnalyzer:
             victim_text = " and ".join(victims)
             target_text = ", ".join(target_ips) if target_ips else "other hosts"
             real_text = "; ".join(f"the real {v['ip']} is {v['owner']}" for v in impersonations)
-            narrative = (f"MAC {mac_label(impostor)}{', whose own address is ' + ', '.join(own_ips) + ',' if own_ips else ''} "
+            narrative = (f"MAC {mac_label(impostor)}{', whose ' + own_text.replace('its ', '', 1) + ',' if own_ips else ''} "
                          f"sent {replies} spoofed ARP repl{'y' if replies == 1 else 'ies'} to {target_text} claiming to be "
                          f"{victim_text} ({real_text}).")
             if intercepted:
@@ -5662,7 +6028,9 @@ class OTPcapAnalyzer:
         }
         # NTP / capture-integrity accumulator
         ntp_state: Dict[str, Any] = {
-            "per_file_times":   defaultdict(list),  # pcap_name -> [epoch floats]
+            # pcap_name -> first/last epoch, largest gap and where, frames, and
+            # active seconds (time between consecutive rows less than 60 s apart).
+            "per_file":         {},
             "ntp_queries":      Counter(),          # src -> count
             "ntp_servers":      defaultdict(set),   # src -> {server_ip}
             "pcap_names":       set(),
@@ -5840,8 +6208,11 @@ class OTPcapAnalyzer:
                                     mb["read_masters"].add(client)
                                     if ref >= 0:
                                         mb["read_starts"][pair_mb][ref] += 1
-                                        span = mb["read_span"].setdefault((pair_mb, ref), [ts_mb, ts_mb])
-                                        span[1] = ts_mb
+                                        # Per capture file: files may be read out of date order.
+                                        span = mb["read_span"].setdefault((pair_mb, ref), {}).setdefault(pn, [0, ts_mb, ts_mb])
+                                        span[0] += 1
+                                        span[1] = min(span[1], ts_mb)
+                                        span[2] = max(span[2], ts_mb)
                                 if func in MODBUS_WRITE_FUNCTIONS:
                                     mb["write_sources"][pair_mb] += pdus
                                     self.add_finding(
@@ -6807,13 +7178,23 @@ class OTPcapAnalyzer:
                     # never sync time.
                     try:
                         ts_ntp = float(row.get("frame.time_epoch") or "0")
-                        if ts_ntp:
-                            bucket = ntp_state["per_file_times"][pn]
-                            if len(bucket) < 20000:
-                                bucket.append(ts_ntp)
-                            ntp_state["pcap_names"].add(pn)
                     except ValueError:
-                        pass
+                        ts_ntp = 0.0
+                    if ts_ntp:
+                        ntp_state["pcap_names"].add(pn)
+                        clock = ntp_state["per_file"].get(pn)
+                        if clock is None:
+                            clock = ntp_state["per_file"][pn] = {
+                                "first": ts_ntp, "last": ts_ntp, "frames": 0, "active": 0.0,
+                                "max_gap": 0.0, "gap_at": (ts_ntp, ts_ntp)}
+                        step = ts_ntp - clock["last"]
+                        if step > clock["max_gap"]:
+                            clock["max_gap"], clock["gap_at"] = step, (clock["last"], ts_ntp)
+                        if 0 < step < 60:
+                            clock["active"] += step
+                        clock["frames"] += 1
+                        clock["first"] = min(clock["first"], ts_ntp)
+                        clock["last"] = max(clock["last"], ts_ntp)
                     if _l7 and (dport == 123 or sport == 123 or "ntp" in fp):
                         if src:
                             ntp_state["ntp_queries"][src] += 1
@@ -7033,20 +7414,34 @@ class OTPcapAnalyzer:
                 top_reg, top_count = starts.most_common(1)[0]
                 if top_count < 1000:
                     continue
-                first_read, last_read = mb["read_span"].get(((src, dst), top_reg), (0.0, 0.0))
-                rate = top_count / (last_read - first_read) if last_read > first_read else float(top_count)
-                if rate < 20:
+                # Rates come from each capture file's own time span, never from
+                # one file's first read to another's last (files can be read out
+                # of date order).  The busiest single file is compared with the
+                # pooled rate over all files, which covers a flood split across
+                # rotated capture files.
+                spans = mb["read_span"].get(((src, dst), top_reg), {})
+                candidates = [(count / max(last_read - first_read, 1.0), count, max(last_read - first_read, 1.0), pcap_key)
+                              for pcap_key, (count, first_read, last_read) in spans.items() if count >= 1000]
+                if len(spans) > 1:
+                    pooled_count = sum(span[0] for span in spans.values())
+                    pooled_seconds = sum(max(span[2] - span[1], 1.0) for span in spans.values())
+                    candidates.append((pooled_count / pooled_seconds, pooled_count, pooled_seconds,
+                                       f"{len(spans)} capture files"))
+                hammer = max(candidates, default=None)
+                if hammer is None or hammer[0] < 20:
                     continue
+                rate, count, seconds, pcap_key = hammer
                 distinct = len(starts)
                 severity = SEVERITY_HIGH if distinct <= 3 else SEVERITY_MEDIUM
                 self.add_finding(
                     severity, "Modbus TCP",
                     "Repetitive single-register polling pattern",
-                    f"{src} read address {top_reg} on {dst} {top_count:,} times at about {rate:.0f} requests per second "
-                    f"({distinct} distinct start address(es) overall). HMI scan groups rarely exceed a few reads per "
-                    "second per block; a sustained high rate on one address suggests a hammer-style test, a "
-                    "denial-of-service probe, or a misconfigured client.",
-                    [f"Top address: {top_reg} ({top_count:,} reads, ~{rate:.0f}/s)",
+                    f"{src} read address {top_reg} on {dst} {count:,} times in {human_duration(seconds)} — about "
+                    f"{rate:.0f} requests per second ({distinct} distinct start address(es) overall). HMI scan groups "
+                    "rarely exceed a few reads per second per block; a sustained high rate on one address suggests a "
+                    "hammer-style test, a denial-of-service probe, or a misconfigured client.",
+                    [f"Address {top_reg}: {count:,} reads in {human_duration(seconds)} (about {rate:.0f} per second) "
+                     f"in {pcap_key}",
                      f"Distinct start addresses: {distinct}",
                      "Top 5 addresses: " + ", ".join(f"{r}({c})" for r, c in starts.most_common(5))],
                     [src], [dst], "Modbus TCP", sorted(mb["pcap_names"]),
@@ -8058,42 +8453,35 @@ class OTPcapAnalyzer:
 
         # ---- NTP / Capture integrity finalization -------------------
         before = len(self.session.findings)
-        for pcap_name, stamps in ntp_state["per_file_times"].items():
-            if len(stamps) < 2:
+        for pcap_name, clock in ntp_state["per_file"].items():
+            if clock["frames"] < 2:
                 continue
-            stamps.sort()
-            gaps = [(stamps[i] - stamps[i - 1]) for i in range(1, len(stamps))]
-            if not gaps:
-                continue
-            max_gap = max(gaps)
+            max_gap = clock["max_gap"]
             # A >60s gap in captures with multi-kpps normal traffic is
             # evidence of a paused recorder, rotated file mid-stream, or
             # a TAP/SPAN drop.  Report only when notable.
             if max_gap >= 60.0:
-                idx_max = gaps.index(max_gap)
-                t_before = datetime.fromtimestamp(stamps[idx_max], timezone.utc).replace(tzinfo=None).isoformat() + "Z"
-                t_after  = datetime.fromtimestamp(stamps[idx_max + 1], timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+                gap_from, gap_to = clock["gap_at"]
                 self.add_finding(
                     SEVERITY_MEDIUM, "Network Hygiene and Segmentation",
                     "Capture discontinuity (large inter-packet gap)",
-                    f"A gap of {max_gap:.1f} seconds was observed in {pcap_name} between "
-                    f"{t_before} and {t_after}. Large gaps may indicate a paused capture, "
-                    "rotated file, TAP/SPAN overload, or selective recording — investigate whether "
-                    "analysis coverage is complete.",
-                    [f"{pcap_name}: gap {max_gap:.1f}s between {t_before} and {t_after}"],
+                    f"{pcap_name} has a gap of {human_duration(max_gap)} with no traffic, from {format_epoch(gap_from)} "
+                    f"to {format_epoch(gap_to)}. Large gaps may indicate a paused capture, rotated file, TAP/SPAN "
+                    "overload, or selective recording — investigate whether analysis coverage is complete.",
+                    [f"{pcap_name}: no traffic for {human_duration(max_gap)}, {format_epoch(gap_from)} – "
+                     f"{format_epoch(gap_to)} (@{gap_from:.6f} – @{gap_to:.6f})"],
                     [], [], "", [pcap_name],
                     f"capture::gap::{pcap_name}",
                     tags=["capture-integrity"],
                 )
-            # Total capture span for reference.
-            total_span = stamps[-1] - stamps[0]
-            if total_span > 0 and total_span < 60 and len(stamps) > 500:
+            total_span = clock["last"] - clock["first"]
+            if 0 < total_span < 60 and clock["frames"] > 500:
                 self.add_finding(
                     SEVERITY_LOW, "Network Hygiene and Segmentation",
                     "Very short capture window",
-                    f"{pcap_name} spans only {total_span:.1f}s with {len(stamps)} frames — "
-                    "analysis results may be limited by the short observation window.",
-                    [f"{pcap_name}: {len(stamps)} frames over {total_span:.1f}s"],
+                    f"{pcap_name} covers only {human_duration(total_span)} ({clock['frames']:,} frames) — analysis "
+                    "results may be limited by the short observation window.",
+                    [f"{pcap_name}: {clock['frames']:,} frames over {human_duration(total_span)}"],
                     [], [], "", [pcap_name],
                     f"capture::short::{pcap_name}",
                     tags=["capture-integrity"],
@@ -8101,13 +8489,13 @@ class OTPcapAnalyzer:
 
         # Devices talking TCP/UDP but no NTP seen at all → time-sync gap.
         all_ntp_srcs = set(ntp_state["ntp_queries"].keys())
-        capture_span = max((max(stamps) - min(stamps) for stamps in ntp_state["per_file_times"].values() if stamps),
-                           default=0.0)
+        # Continuous observed time (gaps excluded) of the longest capture file.
+        capture_span = max((clock["active"] for clock in ntp_state["per_file"].values()), default=0.0)
         if not all_ntp_srcs and capture_span >= 1800:
             self.add_finding(
                 SEVERITY_MEDIUM, "Network Hygiene and Segmentation",
                 "No NTP traffic observed in capture",
-                f"No NTP (UDP/123) traffic was seen in {capture_span / 60:.0f} minutes of capture. OT environments "
+                f"No NTP (UDP/123) traffic was seen in {human_duration(capture_span)} of continuous capture. OT environments "
                 "without synchronized time make forensic correlation, SIEM alerting, and certificate validity "
                 "checks unreliable. Some clients (Windows domain members) poll only every few hours, so confirm "
                 "the time source on the devices themselves.",
@@ -8849,10 +9237,12 @@ class OTPcapAnalyzer:
         assessor_notes = [finding for finding in self.session.findings if finding.category == "Assessor Notes"]
         report_issues = [issue for issue in aggregated_report_issues(self.session)
                          if issue["category"] not in NON_SCORING_CATEGORIES]
+        issue_ids = report_issue_ids(report_issues)
+        remediation_plan = build_remediation_plan(report_issues, issue_ids)
         try:
             from docx import Document
             from docx.enum.text import WD_ALIGN_PARAGRAPH
-            from docx.shared import Pt, RGBColor
+            from docx.shared import Emu, Inches, Pt, RGBColor
             from docx.oxml.ns import qn
             from docx.oxml import OxmlElement
 
@@ -8868,6 +9258,8 @@ class OTPcapAnalyzer:
                 SEVERITY_LOW:         RGBColor(0x55, 0x55, 0x55),
                 SEVERITY_INFO:        RGBColor(0x88, 0x88, 0x88),
             }
+            _BOX_FILL = "EAF1FB"
+            _PRIORITY_FILL = {1: "F4CCCC", 2: "FCE5CD", 3: "FFF2CC", 4: "EEEEEE"}
 
             def _shade_cell(cell, fill_hex: str) -> None:
                 tc = cell._tc
@@ -8912,6 +9304,17 @@ class OTPcapAnalyzer:
                 hl.append(wr)
                 para._p.append(hl)
 
+            def _set_col_widths(tbl, fractions) -> None:
+                """Size table columns as fractions of the usable page width."""
+                section = document.sections[-1]
+                usable = section.page_width - section.left_margin - section.right_margin
+                tbl.autofit = False
+                for idx, fraction in enumerate(fractions):
+                    width = Emu(int(usable * fraction))
+                    tbl.columns[idx].width = width
+                    for cell in tbl.columns[idx].cells:
+                        cell.width = width
+
             def _add_kv_table(rows_data):
                 """Add a 2-col key/value table with no header row."""
                 if not rows_data:
@@ -8924,6 +9327,35 @@ class OTPcapAnalyzer:
                     for run in cells[0].paragraphs[0].runs:
                         run.bold = True
                     cells[1].text = v or "—"
+                _set_col_widths(tbl, (0.3, 0.7))
+
+            def _add_summary_box(rows_data) -> None:
+                """Shaded label/text box that opens each detailed finding."""
+                tbl = document.add_table(rows=len(rows_data), cols=2)
+                tbl.style = "Table Grid"
+                for i, (label, text) in enumerate(rows_data):
+                    cells = tbl.rows[i].cells
+                    cells[0].text = label
+                    for run in cells[0].paragraphs[0].runs:
+                        run.bold = True
+                    cells[1].text = text
+                    for cell in cells:
+                        _shade_cell(cell, _BOX_FILL)
+                _set_col_widths(tbl, (0.22, 0.78))
+
+            def _color_header_text() -> None:
+                """Header cells are shaded before their text is written; make that text white and bold."""
+                for tbl in document.tables:
+                    if not len(tbl.rows):
+                        continue
+                    for cell in tbl.rows[0].cells:
+                        shd = cell._tc.find(f"{qn('w:tcPr')}/{qn('w:shd')}")
+                        if shd is None or shd.get(qn("w:fill")) != _HDR_COLOR:
+                            continue
+                        for para in cell.paragraphs:
+                            for run in para.runs:
+                                run.bold = True
+                                run.font.color.rgb = _HDR_TXT
 
             document = Document()
             try:
@@ -8951,17 +9383,13 @@ class OTPcapAnalyzer:
                 "Audit Workpaper  ·  DRAFT — Validate all findings with site personnel before reporting"
             )
             sub_run.italic = True
-            meta_table = document.add_table(rows=5, cols=2)
-            _style_table(meta_table)
-            for i, (label, value) in enumerate([
+            _add_kv_table([
                 ("Site",        self.session.site or "—"),
                 ("Assessor",    self.session.assessor or "—"),
                 ("Session",     self.session.name or "—"),
                 ("Generated",   utc_now_iso()),
                 ("Risk Score",  f"{risk['score']} ({risk['band']})"),
-            ]):
-                meta_table.rows[i].cells[0].text = label
-                meta_table.rows[i].cells[1].text = value
+            ])
             tool_credit_p = document.add_paragraph()
             tool_credit_run = tool_credit_p.add_run(
                 f"Analysis Tool: {TOOL_NAME} v{VERSION} — authored by {__author__}.  {__copyright__}"
@@ -9034,26 +9462,18 @@ class OTPcapAnalyzer:
                 document.add_paragraph("Attack Chain Indicators:")
                 for ln in narrative_lines[:3]:
                     document.add_paragraph(ln, style="List Bullet")
-            actionable = [
-                f for f in self.session.findings
-                if f.severity in {SEVERITY_INTRUSION, SEVERITY_CRITICAL,
-                                   SEVERITY_HIGH, SEVERITY_CORRELATION}
-            ]
-            actionable.sort(key=lambda f: SEVERITY_ORDER.get(f.severity, 0), reverse=True)
-            if actionable:
+            urgent_rows = [row for row in remediation_plan if row["priority"] <= 2][:3]
+            if urgent_rows:
                 document.add_paragraph("Immediate Next Steps:")
-                seen_actions: Dict[str, List[str]] = {}
-                for f in actionable:
-                    action = recommended_fix_for_finding(f)
-                    if action in seen_actions:
-                        if f.title not in seen_actions[action]:
-                            seen_actions[action].append(f.title)
-                        continue
-                    if len(seen_actions) >= 3:
-                        continue
-                    seen_actions[action] = [f.title]
-                for action, titles in seen_actions.items():
-                    document.add_paragraph(f"{'; '.join(titles)} — {action}", style="List Bullet")
+                for row in urgent_rows:
+                    ids = ", ".join(item["id"] for item in row["findings"][:4] if item["id"])
+                    step_p = document.add_paragraph(style="List Bullet")
+                    step_p.add_run(f"{row['action']}: ").bold = True
+                    step_p.add_run(row["steps"]["contain"] + (f" ({ids})" if ids else ""))
+                document.add_paragraph(
+                    "The Remediation Plan that follows lists every action by priority, with the devices "
+                    "involved and the likely owner."
+                )
             document.add_paragraph(
                 "Companion artifacts generated alongside this report: "
                 "JSON addendum (complete machine-readable findings), "
@@ -9065,6 +9485,36 @@ class OTPcapAnalyzer:
                    "Appendix B with detailed packet-level evidence.")
             )
             document.add_page_break()
+
+            # ================================================================
+            # 2b. REMEDIATION PLAN
+            # ================================================================
+            if remediation_plan:
+                document.add_heading("Remediation Plan", level=1)
+                document.add_paragraph(
+                    "What to fix, in priority order.  Findings that share the same fix are combined into one "
+                    "row.  Each finding's “What to Do” section gives the step-by-step actions and an OT "
+                    "safety note.  Agree every change with operations before acting: blocking OT traffic "
+                    "can stop the process."
+                )
+                plan_table = document.add_table(rows=1, cols=5)
+                _style_table(plan_table)
+                for ci, h in enumerate(("Priority", "What to do", "Devices", "Findings", "Likely owner")):
+                    plan_table.rows[0].cells[ci].text = h
+                for row in remediation_plan:
+                    pc = plan_table.add_row().cells
+                    pc[0].text = f"{row['priority']} — {row['priority_label']}"
+                    _shade_cell(pc[0], _PRIORITY_FILL.get(row["priority"], "FFFFFF"))
+                    pc[1].text = row["action"]
+                    shown_devices = row["devices"][:6]
+                    pc[2].text = (", ".join(shown_devices) or "—") + (
+                        f" (+{row['device_count'] - len(shown_devices)} more)"
+                        if row["device_count"] > len(shown_devices) else "")
+                    ids = [item["id"] for item in row["findings"] if item["id"]]
+                    pc[3].text = ", ".join(ids[:8]) + (f" (+{len(ids) - 8} more)" if len(ids) > 8 else "")
+                    pc[4].text = row["owner"]
+                _set_col_widths(plan_table, (0.17, 0.33, 0.2, 0.15, 0.15))
+                document.add_page_break()
 
             # ================================================================
             # 3. ENVIRONMENT DISCOVERY / CONTEXT
@@ -9093,21 +9543,14 @@ class OTPcapAnalyzer:
             document.add_heading("Priority Findings", level=1)
             document.add_paragraph(
                 "Findings are grouped by category and ordered by severity.  "
-                "CRITICAL and HIGH findings receive full detail below.  "
+                "CRITICAL and HIGH findings receive full detail: a summary box (what happened, why it "
+                "matters, what to do now), numbered steps to contain, fix, and verify, then the evidence "
+                "and reference details.  "
                 "Lower-severity findings within the same category are summarized.  "
+                "When the same issue occurs between several device pairs, each pair is listed separately.  "
                 "Complete structured findings are in the JSON addendum.  "
                 "Wireshark investigation steps are in Appendix A."
             )
-
-            # Assign sequential human-readable IDs
-            issue_ids: Dict[Tuple[str, str], str] = {}
-            id_counters: Dict[str, int] = defaultdict(int)
-            for issue in report_issues:
-                prefix = _finding_id_prefix(issue["category"])
-                id_counters[prefix] += 1
-                issue_ids[(issue["category"], issue["title"])] = (
-                    f"{prefix}-{id_counters[prefix]:03d}"
-                )
 
             # Re-bucket by category
             issues_by_category: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -9171,43 +9614,89 @@ class OTPcapAnalyzer:
                     parts.append(f"{tid} – {name}" if name else tid)
                 return "; ".join(parts)
 
+            OCCURRENCE_CAP_FULL = 8
+            OCCURRENCE_CAP_ABBREV = 5
+            EVIDENCE_OCCURRENCES = 4
+            EVIDENCE_PER_OCCURRENCE = 2
+
+            def _occurrence_bullets(issue: Dict[str, Any], cap: int, fid: str) -> None:
+                """One bullet per finding merged into this issue: the devices involved, then what happened."""
+                occurrences = issue["findings"]
+                document.add_paragraph(f"Occurrences ({len(occurrences)}):")
+                for finding in occurrences[:cap]:
+                    bullet = document.add_paragraph(style="List Bullet")
+                    bullet.add_run(occurrence_label(finding)).bold = True
+                    repeats = f" (seen {finding.occurrences:,} times)" if finding.occurrences > 1 else ""
+                    bullet.add_run(f"{repeats}: {lead_sentences(finding.description, 1)}")
+                if len(occurrences) > cap:
+                    document.add_paragraph(
+                        f"(+{len(occurrences) - cap} more occurrences in JSON finding {fid})",
+                        style="List Bullet",
+                    )
+                explanation = sentences_after(occurrences[0].description, 1)
+                if explanation:
+                    document.add_paragraph(explanation)
+
             def _render_full_finding(issue: Dict[str, Any], fid: str) -> None:
                 representative = issue["findings"][0]
+                others = len(issue["findings"]) - 1
+                steps = remediation_for_finding(representative)
                 sev = issue["severity"]
                 color = _SEV_COLOR.get(sev, RGBColor(0x44, 0x44, 0x44))
                 ws_ref = _note_guide(issue["category"], representative)
 
                 h3 = document.add_heading(level=3)
-                h3_run = h3.add_run(f"[{sev}]  {issue['title']}")
+                h3_run = h3.add_run(f"[{sev}]  {issue['title']}  ({fid})")
                 h3_run.font.color.rgb = color
 
-                meta_rows = [
-                    ("Finding ID",              fid),
-                    ("Affected Assets",         _ep_str(issue["source_ips"], issue["destination_ips"])),
-                    ("Inferred OT Roles",       _roles_str(issue["source_ips"], issue["destination_ips"])),
-                    ("Category",                issue["category"]),
-                    ("MITRE ATT&CK for ICS",    _mitre_str(representative)),
-                    ("Advisory References",     "; ".join(representative.advisory_refs[:3])
-                                                if representative.advisory_refs else "—"),
-                    ("Detection Confidence",    detection_confidence_for_finding(representative)),
-                    ("Maliciousness Confidence",maliciousness_confidence_for_finding(representative)),
-                    ("Operational Context",     "Yes — validate with site personnel"),
-                ]
-                _add_kv_table([(k, v) for k, v in meta_rows if v and v != "—"])
+                happened = lead_sentences(issue["description"], 1)
+                if others:
+                    happened += f"  ({others} other occurrence{'s' if others > 1 else ''} listed under What Was Observed.)"
+                _add_summary_box([
+                    ("What happened", happened),
+                    ("Why it matters", why_it_matters_plain(representative)),
+                    ("What to do now", steps["contain"]),
+                ])
+
+                document.add_heading("What to Do", level=4)
+                for number, (label, text) in enumerate(
+                        (("Contain now", steps["contain"]), ("Fix", steps["fix"]), ("Verify", steps["verify"])),
+                        start=1):
+                    step_p = document.add_paragraph()
+                    step_p.paragraph_format.left_indent = Inches(0.25)
+                    step_p.add_run(f"{number}. {label}: ").bold = True
+                    step_p.add_run(text)
+                if steps["safety"]:
+                    safety_p = document.add_paragraph()
+                    safety_p.paragraph_format.left_indent = Inches(0.25)
+                    safety_p.add_run("OT safety note: ").bold = True
+                    safety_p.add_run(steps["safety"]).italic = True
 
                 document.add_heading("What Was Observed", level=4)
-                document.add_paragraph(issue["description"])
+                if others:
+                    _occurrence_bullets(issue, OCCURRENCE_CAP_FULL, fid)
+                else:
+                    document.add_paragraph(issue["description"])
 
                 document.add_heading("OT Significance", level=4)
                 document.add_paragraph(ot_significance_for_finding(representative))
 
                 document.add_heading("Key Evidence", level=4)
-                for line in issue["evidence"][:EVIDENCE_CAP_FULL]:
-                    document.add_paragraph(line, style="List Bullet")
-                if len(issue["evidence"]) > EVIDENCE_CAP_FULL:
+                if others:
+                    shown: set = set()
+                    for finding in issue["findings"][:EVIDENCE_OCCURRENCES]:
+                        document.add_paragraph(occurrence_label(finding), style="List Bullet")
+                        for line in finding.evidence[:EVIDENCE_PER_OCCURRENCE]:
+                            document.add_paragraph(line, style="List Bullet 2")
+                            shown.add(line)
+                    remaining = len(set(issue["evidence"]) - shown)
+                else:
+                    for line in issue["evidence"][:EVIDENCE_CAP_FULL]:
+                        document.add_paragraph(line, style="List Bullet")
+                    remaining = len(issue["evidence"]) - EVIDENCE_CAP_FULL
+                if remaining > 0:
                     document.add_paragraph(
-                        f"(+{len(issue['evidence']) - EVIDENCE_CAP_FULL} additional "
-                        f"evidence lines in JSON finding {fid})",
+                        f"(+{remaining} additional evidence lines in JSON finding {fid})",
                         style="List Bullet",
                     )
 
@@ -9219,9 +9708,21 @@ class OTPcapAnalyzer:
                 benign_p.add_run("What Would Make This Benign: ").bold = True
                 benign_p.add_run(benign_explanation_for_finding(representative))
 
-                fix_p = document.add_paragraph()
-                fix_p.add_run("Recommended Action: ").bold = True
-                fix_p.add_run(recommended_fix_for_finding(representative))
+                document.add_heading("Reference", level=4)
+                meta_rows = [
+                    ("Finding ID",              fid),
+                    ("Affected Assets",         _ep_str(issue["source_ips"], issue["destination_ips"])),
+                    ("Inferred OT Roles",       _roles_str(issue["source_ips"], issue["destination_ips"])),
+                    ("Category",                issue["category"]),
+                    ("Likely Owner",            steps["owner"]),
+                    ("MITRE ATT&CK for ICS",    _mitre_str(representative)),
+                    ("Advisory References",     "; ".join(representative.advisory_refs[:3])
+                                                if representative.advisory_refs else "—"),
+                    ("Detection Confidence",    detection_confidence_for_finding(representative)),
+                    ("Maliciousness Confidence",maliciousness_confidence_for_finding(representative)),
+                    ("Operational Context",     "Yes — validate with site personnel"),
+                ]
+                _add_kv_table([(k, v) for k, v in meta_rows if v and v != "—"])
 
                 detail_parts = [f"JSON finding {fid}", ws_ref]
                 if technical_appendix:
@@ -9250,11 +9751,14 @@ class OTPcapAnalyzer:
                 if mp.runs:
                     mp.runs[0].font.size = Pt(9)
 
-                document.add_paragraph(issue["description"])
-                for line in issue["evidence"][:EVIDENCE_CAP_ABBREV]:
-                    document.add_paragraph(line, style="List Bullet")
+                if len(issue["findings"]) > 1:
+                    _occurrence_bullets(issue, OCCURRENCE_CAP_ABBREV, fid)
+                else:
+                    document.add_paragraph(issue["description"])
+                    for line in issue["evidence"][:EVIDENCE_CAP_ABBREV]:
+                        document.add_paragraph(line, style="List Bullet")
                 fix_p = document.add_paragraph()
-                fix_p.add_run("Action: ").bold = True
+                fix_p.add_run("What to do: ").bold = True
                 fix_p.add_run(recommended_fix_for_finding(representative))
 
             for category_name in ordered_categories:
@@ -9604,6 +10108,7 @@ class OTPcapAnalyzer:
                         pc_text += f" (+{len(pc_list) - 3} more)"
                     dr[7].text = pc_text
 
+            _color_header_text()
             document.save(report_path)
             print(colorize(f"[✓] Word report generated: {report_path}", "SUCCESS"))
             # Always generate companion artifacts alongside the Word report.
@@ -9628,8 +10133,19 @@ class OTPcapAnalyzer:
                 f"Overall Risk Score: {risk['score']} ({risk['band']})"
                 + (f" — {risk['band_reason']}" if risk.get("band_reason") else ""),
                 "",
-                "Correlation Summary:",
+                "Remediation Plan:",
             ]
+            for row in remediation_plan:
+                ids = ", ".join(item["id"] for item in row["findings"] if item["id"])
+                devices = ", ".join(row["devices"][:6]) + (
+                    f" (+{row['device_count'] - 6} more)" if row["device_count"] > 6 else "")
+                fallback_text.append(
+                    f"  - Priority {row['priority']} ({row['priority_label']}): {row['action']} — findings {ids}; "
+                    f"devices {devices or '—'}; likely owner: {row['owner']}"
+                )
+            if not remediation_plan:
+                fallback_text.append("  - No findings require action.")
+            fallback_text.extend(["", "Correlation Summary:"])
             if correlation_lines:
                 fallback_text.extend([f"  - {line}" for line in correlation_lines])
             else:
@@ -9649,11 +10165,24 @@ class OTPcapAnalyzer:
             for issue in report_issues:
                 representative = issue["findings"][0]
                 why_text = why_this_matters_for_finding(representative)
-                fix_text = recommended_fix_for_finding(representative)
+                steps = remediation_for_finding(representative)
                 related = related_findings_for_finding(self.session, representative)
-                fallback_text.append(f"[{issue['severity']}] {issue['title']}")
+                fid = issue_ids.get((issue["category"], issue["title"]), "")
+                fallback_text.append(f"[{issue['severity']}] {fid}  {issue['title']}")
                 fallback_text.append(f"  {issue['description']}")
+                if len(issue["findings"]) > 1:
+                    fallback_text.append(f"  Occurrences ({len(issue['findings'])}):")
+                    for finding in issue["findings"][:20]:
+                        fallback_text.append(f"    - {occurrence_label(finding)}: {lead_sentences(finding.description, 1)}")
+                    if len(issue["findings"]) > 20:
+                        fallback_text.append(f"    - (+{len(issue['findings']) - 20} more)")
                 fallback_text.append(f"  Why This Matters: {why_text}")
+                fallback_text.append("  What to Do:")
+                fallback_text.append(f"    1. Contain now: {steps['contain']}")
+                fallback_text.append(f"    2. Fix: {steps['fix']}")
+                fallback_text.append(f"    3. Verify: {steps['verify']}")
+                if steps["safety"]:
+                    fallback_text.append(f"    OT safety note: {steps['safety']}")
                 if issue["source_ips"] or issue["destination_ips"]:
                     endpoints = list(dict.fromkeys(sorted(issue["source_ips"]) + sorted(issue["destination_ips"])))
                     if len(endpoints) > 30:
@@ -9677,7 +10206,6 @@ class OTPcapAnalyzer:
                 fallback_text.append("  Evidence:")
                 for line in issue["evidence"][:30]:
                     fallback_text.append(f"    - {line}")
-                fallback_text.append(f"  Recommended Fix: {fix_text}")
                 ws_filter, ws_steps = wireshark_steps_for_finding(representative)
                 fallback_text.append("  Wireshark Investigation:")
                 if ws_filter:
@@ -9736,6 +10264,9 @@ class OTPcapAnalyzer:
         base_name = f"OT_PCAP_Analysis_{safe_slug(self.session.site)}_{report_date}"
         report_path = _versioned_path(folder, base_name, "json")
         risk = self.compute_risk_summary()
+        report_issues = [issue for issue in aggregated_report_issues(self.session)
+                         if issue["category"] not in NON_SCORING_CATEGORIES]
+        issue_ids = report_issue_ids(report_issues)
         report_data: Dict[str, Any] = {
             "tool": TOOL_NAME,
             "version": VERSION,
@@ -9750,13 +10281,14 @@ class OTPcapAnalyzer:
             "pcaps": {k: asdict(v) for k, v in self.session.processed_pcaps.items()},
             "devices": {k: asdict(v) for k, v in self.session.devices.items()},
             "findings": [
-                asdict(f)
+                {"report_id": issue_ids.get((f.category, f.title), ""), **asdict(f)}
                 for f in sorted(
                     self.session.findings,
                     key=lambda f: SEVERITY_ORDER.get(f.severity, 0),
                     reverse=True,
                 )
             ],
+            "remediation_plan": build_remediation_plan(report_issues, issue_ids),
             "connections_count": len(self.session.connections),
             "correlation_summary": correlation_summary_lines(self.session),
         }
