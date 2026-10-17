@@ -54,7 +54,7 @@ Violating these rules could constitute license infringement. When in doubt, leav
 
 ## Versioning
 
-- Single version constant near line 74: `VERSION = "x.y.z"`
+- Single version constant near line 75: `VERSION = "x.y.z"`
 - **Keep `VERSION` in `otscope.py` in sync with the version header in `otscope/docs/OTscope_User_Guide.md`.**
 - When bumping the version, also add an entry to the Version History section of the User Guide (newest at top).
 

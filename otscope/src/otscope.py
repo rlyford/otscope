@@ -36,6 +36,7 @@ import base64
 import csv
 import hashlib
 import io
+import ipaddress
 import json
 import math
 import os
@@ -71,7 +72,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 
 TOOL_NAME = "OTscope"
-VERSION = "2.8.0"
+VERSION = "2.8.1"
 __author__ = "Ryan Lyford"
 __copyright__ = "© 2026 Ryan Lyford. All rights reserved."
 
@@ -199,8 +200,8 @@ IT_INDICATOR_PORTS = {88, 135, 139, 389, 445, 636, 3389, 5985, 5986}
 # Well-known service ports used to decide which end of a flow is the server
 # when the capture missed the TCP handshake.
 _SERVICE_PORT_HINTS = set(KNOWN_OT_PORTS) | IT_PORTS | IT_INDICATOR_PORTS | {
-    22, 25, 110, 123, 143, 161, 162, 465, 514, 587, 993, 995, 1433, 1521, 1900,
-    3306, 3702, 5353, 5355, 5432, 5683, 5684, 8443,
+    22, 25, 67, 110, 123, 143, 161, 162, 465, 514, 547, 587, 993, 995, 1433, 1521, 1900,
+    1947, 3306, 3702, 5353, 5355, 5432, 5683, 5684, 8443,
 }
 
 # Periodic-by-design traffic that must never be scored as C2 beaconing.
@@ -665,6 +666,7 @@ MITRE_ICS_MAP: List[Tuple[Tuple[str, ...], List[str]]] = [
     (("modbus register value anomaly",),       ["T0856", "T0832"]),        # Spoof Reporting Message / Manipulation of View
     (("ws-discovery",),                        ["T0840"]),
     (("read device id",),                      ["T0888"]),                 # Remote System Information Discovery
+    (("possible denial-of-service",),          ["T0814", "T0826"]),        # Denial of Service / Loss of Availability
     (("write/control commands sent to many devices",),
                                                ["T0855"]),                 # Unauthorized Command Message
     (("beaconing pattern",),                   ["T0869"]),                 # Standard Application Layer Protocol
@@ -1008,16 +1010,71 @@ def _dns_label_entropy(qname: str) -> Tuple[float, str]:
 
 
 def subnet_from_ip(ip_text: str) -> str:
-    """Return a /24 subnet string for IPv4 or a broader placeholder otherwise."""
+    """Return the /24 (IPv4) or /64 (IPv6) network containing an address."""
     if not ip_text:
         return "unknown"
     if ":" in ip_text:
-        chunks = ip_text.split(":")
-        return ":".join(chunks[:4]) + "::/64"
+        try:
+            return str(ipaddress.ip_network(f"{ip_text.split('%')[0]}/64", strict=False))
+        except ValueError:
+            return "unknown"
     parts = ip_text.split(".")
     if len(parts) != 4:
         return "unknown"
     return ".".join(parts[:3]) + ".0/24"
+
+
+def is_group_mac(mac_text: str) -> bool:
+    """True for broadcast and multicast MAC addresses (the I/G bit is set)."""
+    try:
+        return bool(int(mac_text.split(":")[0], 16) & 1)
+    except ValueError:
+        return False
+
+
+def is_group_address(ip_text: str, mac_text: str = "") -> bool:
+    """True for broadcast / multicast destinations, which are not hosts.
+
+    A subnet-directed broadcast (e.g. 10.1.2.255) is only recognizable by
+    its Ethernet destination, so the frame's MAC is checked as well.
+    """
+    if mac_text and is_group_mac(mac_text):
+        return True
+    if not ip_text:
+        return False
+    if ip_text == "255.255.255.255":
+        return True
+    try:
+        return ipaddress.ip_address(ip_text.split("%")[0]).is_multicast
+    except ValueError:
+        return False
+
+
+def is_unspecified_address(ip_text: str) -> bool:
+    """True for 0.0.0.0 / :: (hosts that do not have an address yet)."""
+    try:
+        return ipaddress.ip_address(ip_text.split("%")[0]).is_unspecified
+    except ValueError:
+        return False
+
+
+def is_link_local_ipv6(ip_text: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip_text.split("%")[0])
+    except ValueError:
+        return False
+    return addr.version == 6 and addr.is_link_local
+
+
+def format_epoch(value: Any) -> str:
+    """Render an epoch timestamp as 'YYYY-MM-DD HH:MM:SS UTC' ('' when invalid)."""
+    try:
+        return datetime.fromtimestamp(float(value), timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return ""
+
+
+RISK_BANDS = ["MINIMAL", "LOW", "MODERATE", "HIGH", "SEVERE"]
 
 
 def risk_band(score: int) -> str:
@@ -1083,6 +1140,7 @@ class DeviceRecord:
     os_fingerprint: str = ""
     user_agents: List[str] = field(default_factory=list)
     server_banners: List[str] = field(default_factory=list)
+    ipv6_addresses: List[str] = field(default_factory=list)  # link-local addresses of this same host (by MAC)
 
 
 @dataclass
@@ -1360,11 +1418,6 @@ def next_steps_for(severity: str, category: str) -> str:
             "Verify capture point visibility with site staff. Consider recapturing from a different network tap point. "
             "This may indicate a segmentation issue or a system that was offline during capture."
         )
-    if "boundary" in category.lower() or "segmentation" in category.lower():
-        return (
-            "Validate whether this communication path is intended. If not, remove the route, tighten firewall or ACL rules, "
-            "and ensure OT devices can only talk to approved peers through a controlled boundary device."
-        )
     if "cleartext" in category.lower() or "legacy" in category.lower():
         return (
             "Replace the legacy service with a secure alternative where possible, such as HTTPS, SSH, SNMPv3, or TLS. "
@@ -1386,32 +1439,341 @@ def next_steps_for(severity: str, category: str) -> str:
     )
 
 
+# Each finding is placed in one narrative family, checked in order, from its
+# title and tags only.  Category names are deliberately not matched: a broad
+# category such as "Network Hygiene and Segmentation" would otherwise pull
+# every finding in it toward the same text.
+_NARRATIVE_RULES: List[Tuple[str, Tuple[str, ...], Tuple[str, ...]]] = [
+    # (family, title substrings, tags)
+    ("mitm", ("adversary-in-the-middle", "arp ", "arp-", "multiple mac", "gratuitous arp", "claims multiple ips"),
+     ("mitm", "arp_spoof", "mac_conflict")),
+    ("replay", ("duplicate or unsolicited", "replay"), ("replay",)),
+    ("restart", ("cold restart", "warm restart", "plc stop", "disable spontaneous", "stop/start"), ("restart", "suppression")),
+    ("value_anomaly", ("register value anomaly",), ("value_anomaly",)),
+    ("dos", ("denial-of-service",), ("dos",)),
+    ("file_transfer", ("project file", "firmware", "ladder", "engineering file"), ("firmware_transfer",)),
+    ("write", ("write", "operate", "control asdu", "control operation", "flow deployment", "set operation",
+               "forward open", "logic transfer", "download"),
+     ("write", "write_volume", "unexpected_writer", "multi_writer", "logic_download")),
+    ("polling", ("polling burst", "polling pattern", "polling anomaly"), ("timing_anomaly", "polling_pattern")),
+    ("recon", ("scan", "sweep", "walk", "enumeration", "reconnaissance", "identify all", "read szl", "list identity",
+               "read device id", "who-is", "browse", "interrogation"),
+     ("recon", "discovery")),
+    ("c2", ("beacon", "user-agent", "ja3", "tls fingerprint", "dns query name", "txt response", "nxdomain"),
+     ("beacon", "c2", "dga", "dns_tunneling", "offensive_tool")),
+    ("credentials", ("credential", "community string", "authentication failure", "without credentials"),
+     ("credential_exposure", "anonymous_mqtt")),
+    ("engineering", ("umas", "engineering traffic", "program upload"), ("engineering", "program_upload")),
+    ("cleartext", ("without tls", "cleartext", "telnet", "ftp", "tftp", "http", "snmpv1", "smb", "rdp", "vnc",
+                   "tls", "ssl", "securitypolicy", "without authentication", "signed but not encrypted",
+                   "without secure authentication", "legacy", "web-server banner"),
+     ("cleartext", "legacy", "weak_crypto", "noauth")),
+    ("boundary", ("public ip", "dual-zone", "vlan", "ot-to-it", "dns resolvers"), ("boundary", "public", "vlan")),
+    ("it_noise", ("mdns", "llmnr", "netbios", "ssdp", "ws-discovery"), ("it-on-ot",)),
+    ("dhcp", ("dhcp",), ("dhcp-rogue",)),
+    ("tcp_anomaly", ("reset storm", "unanswered syn"), ("tcp_anomaly",)),
+    ("ipv6", ("ipv6",), ("ipv6",)),
+    ("icmp", ("icmp",), ("icmp",)),
+    ("time", ("ntp",), ("time-sync",)),
+    ("capture", ("capture",), ("capture-integrity",)),
+    ("av", (), ("av_media",)),
+    ("wireless", ("zigbee", "z-wave", "coap"), ("wireless",)),
+    ("dns", ("dns",), ("dns",)),
+]
+
+
+def narrative_family(finding: "Finding") -> str:
+    """Return the narrative family used for a finding's explanatory text."""
+    if finding.category == "Absence of Expected Traffic":
+        return "absence"
+    if finding.category == "Unknown and Unclassified Traffic":
+        return "unknown"
+    title = finding.title.lower()
+    tags = {tag.lower() for tag in finding.tags}
+    for family, title_keys, tag_keys in _NARRATIVE_RULES:
+        if tags.intersection(tag_keys) or any(key in title for key in title_keys):
+            return family
+    return "default"
+
+
+_WHY_THIS_MATTERS: Dict[str, str] = {
+    "mitm": "This finding matters because a host that can rewrite ARP mappings sits invisibly between OT devices and can read, alter, or drop any command or process value that passes through it.",
+    "replay": "This finding matters because injected or replayed responses let an attacker show operators false process values while the real process changes.",
+    "restart": "This finding matters because stopping, restarting, or silencing a controller has immediate operational impact and can hide follow-on manipulation.",
+    "value_anomaly": "This finding matters because sudden jumps in reported values can mean the values were spoofed rather than measured.",
+    "dos": "This finding matters because a controller flooded with requests or connections stops answering its HMIs, which blinds operators and can halt the process.",
+    "file_transfer": "This finding matters because controller programs and firmware moving over the network can be copied for offline attack planning or swapped for modified versions.",
+    "write": "This finding matters because it indicates traffic that can change controller state, process values, or device configuration rather than just observe data.",
+    "polling": "This finding matters because abnormal polling patterns can starve a controller of resources, or reveal a script or second client acting on the process.",
+    "recon": "This finding matters because it is consistent with discovery or enumeration activity, which is often a precursor to targeted manipulation or exploitation.",
+    "c2": "This finding matters because it is consistent with a compromised host keeping contact with an operator outside the network.",
+    "credentials": "This finding matters because exposed or guessed credentials give an attacker legitimate-looking access that monitoring rarely questions.",
+    "engineering": "This finding matters because engineering protocols can upload, download, and modify controller programs; whoever can speak them can change the process logic.",
+    "cleartext": "This finding matters because the protocol or session protection is weak enough that credentials, commands, or process data may be exposed or modified by anyone with network visibility.",
+    "boundary": "This finding matters because it weakens OT segmentation and increases the chance that IT-side compromise or internet exposure can directly reach control systems.",
+    "it_noise": "This finding matters because name-resolution and discovery broadcasts can be answered by any host on the segment, which lets an attacker collect credentials or redirect connections.",
+    "dhcp": "This finding matters because a rogue DHCP server can hand every new client a malicious gateway or DNS server.",
+    "tcp_anomaly": "This finding matters because connections that are repeatedly refused, aborted, or unanswered point to scanning, a misconfigured client, or a failing service.",
+    "ipv6": "This finding matters because unmanaged IPv6 is a parallel network path that IPv4-only firewalls and monitoring do not see.",
+    "icmp": "This finding matters because ICMP reachability lets any host on the segment map which controllers are alive.",
+    "time": "This finding matters because unsynchronized clocks undermine forensic timelines, alarm correlation, and certificate validation.",
+    "capture": "This finding matters because gaps or short windows in the capture limit what the analysis can see.",
+    "av": "This finding matters because audio/video systems on a control network are usually unmanaged, rarely patched endpoints whose continuous high-bandwidth streams share switching capacity with control traffic — and camera/DVR platforms are a frequent initial foothold for attackers.",
+    "wireless": "This finding matters because wireless control networks can be observed or injected into by anyone within radio range.",
+    "dns": "This finding matters because OT devices that resolve names can be redirected by whoever controls name resolution.",
+    "absence": "This finding matters because missing expected traffic can mean the capture point had limited visibility, a device was offline, or segmentation is preventing expected communications.",
+    "unknown": "This finding matters because traffic that cannot be identified cannot be assessed, and undocumented services are a common hiding place for unauthorized access.",
+}
+
+_RECOMMENDED_FIX: Dict[str, str] = {
+    "mitm": "Find the switch port the impostor MAC is connected to (switch MAC address table) and isolate it; clear the ARP caches of the affected hosts; check controller logic, setpoints, and recent writes against a known-good backup; then enable Dynamic ARP Inspection or port security on OT switch ports and consider static ARP entries for critical controller/HMI pairs.",
+    "replay": "Identify the source of the extra responses (compare the Ethernet source MAC and TTL with the genuine server), check the path for ARP spoofing, and verify the values the HMI displayed against the controller itself.",
+    "restart": "Confirm the command came from an approved engineering host during a documented maintenance window; if not, block that host's access to the controller and review what changed around the event.",
+    "value_anomaly": "Compare the reported values with the controller's own readings and the process instrumentation, and check the path for spoofed or injected responses.",
+    "dos": "Identify and block the flooding host at the switch or firewall, rate-limit connections to the controller where the network supports it, and confirm with operations whether HMIs lost communication during the window.",
+    "file_transfer": "Limit file-transfer paths between corporate, engineering, and control assets; disable unnecessary FTP, TFTP, SMB, or web download functions on PLC-facing systems; and require authenticated engineering workstations for any program transfer.",
+    "unknown": "Identify the application behind the port with the device owner, document it in the communication matrix, and block it if it is not required.",
+    "write": "Restrict write-capable functions to approved engineering or HMI hosts only, block all other sources at the firewall or switch ACL layer, and disable unused write services where the vendor allows it.",
+    "polling": "Identify the client generating the pattern, confirm its configuration matches the approved scan list and rate, and rate-limit or block unexpected clients.",
+    "recon": "Identify the scanning source, confirm whether it is an approved management station, and if not, block its access to OT ports, disable unnecessary discovery services, and alert operations that device enumeration occurred.",
+    "c2": "Identify the process on the source host that generates the traffic, block the destination at the boundary, and examine the host for compromise before returning it to service.",
+    "credentials": "Rotate the exposed credentials, remove any default or shared administrative passwords, enforce unique role-based accounts, and disable any management interface that exposes authentication material in cleartext.",
+    "engineering": "Allow engineering protocols only from the designated engineering workstation, protect controller projects with passwords, and use the controller's memory-protect or run-mode key where available so programs cannot change outside an approved session.",
+    "cleartext": "Enable the strongest supported authentication and encryption for the protocol, disable insecure legacy access methods, rotate any exposed credentials, and limit access to a dedicated management subnet.",
+    "boundary": "Remove direct routing where possible, place a firewall or industrial DMZ between the zones, permit only explicitly required ports, and force administration through an approved jump host.",
+    "it_noise": "Disable LLMNR, NetBIOS over TCP/IP, mDNS, SSDP, and WS-Discovery on OT Windows hosts (Group Policy), or filter them at the OT switch.",
+    "dhcp": "Identify and remove the unauthorized DHCP server, then enable DHCP snooping on OT switches so only the approved server port can answer.",
+    "tcp_anomaly": "Identify the client and the service involved: block it if it is a scanner, or fix the client or service configuration so control sessions stop failing.",
+    "ipv6": "If IPv6 is not used, disable it on OT hosts or block it at the switch; if it is, add it to firewall rules and monitoring.",
+    "icmp": "Restrict ICMP to approved monitoring hosts at the OT boundary, and confirm controllers only answer the systems that need to reach them.",
+    "time": "Use a local internal time source for OT assets and block direct queries to public time servers from the control network.",
+    "capture": "Retake the capture with a longer window or from a better vantage point, and confirm the capture appliance was not dropping packets.",
+    "av": "Inventory the audio/video endpoints, move cameras, DVR/NVR platforms, and VoIP systems onto a dedicated VLAN separated from control traffic, enable IGMP snooping where multicast video is used, and bring camera and DVR firmware under patch management.",
+    "wireless": "Enable the protocol's link-layer security, restrict device enrollment, and confirm every wireless controller and node is in the asset inventory.",
+    "dns": "Point OT assets only to approved internal DNS services if name resolution is required, or remove DNS access entirely from controllers that should operate by IP only.",
+    "absence": "Retake the capture from a better vantage point, confirm the device was online during collection, and compare expected protocol flows against firewall rules and switch topology.",
+}
+
+_OT_SIGNIFICANCE: Dict[str, str] = {
+    "mitm": (
+        "In an OT network, an Adversary-in-the-Middle position between an HMI and a PLC "
+        "allows real-time observation, modification, or replay of any command or process "
+        "value.  This bypasses application-layer authentication and is one of the most "
+        "serious network-layer threats to OT data integrity and process safety."
+    ),
+    "replay": (
+        "A Modbus server answers each request exactly once.  A second answer to the same "
+        "transaction, or an answer to a request that was never sent, is how injected or "
+        "replayed responses appear on the wire — the technique an attacker uses to show "
+        "operators false process values while the real process changes.  This is "
+        "particularly serious in safety-critical processes where operators rely on "
+        "controller feedback."
+    ),
+    "restart": (
+        "Commands that stop, restart, or suppress reporting from a PLC or RTU have "
+        "immediate operational impact — halting production, disabling safety monitoring, "
+        "or disrupting the operator's view of the process.  In MITRE ATT&CK for ICS "
+        "these are classified as impact-stage techniques."
+    ),
+    "value_anomaly": (
+        "Sudden large jumps in register values can indicate spoofed or injected Modbus "
+        "responses rather than real sensor readings.  In safety-critical processes, "
+        "acting on spoofed data can cause equipment damage, process upsets, or safety "
+        "system failures."
+    ),
+    "dos": (
+        "OT controllers have small connection tables and limited CPU.  A flood that a server "
+        "would absorb can stop a PLC from answering its HMI, or fault its communication "
+        "module — a loss-of-view or loss-of-control event for operators."
+    ),
+    "file_transfer": (
+        "Firmware and logic downloads modify the program driving physical processes.  "
+        "Unauthorized downloads are among the most serious OT security events because a "
+        "compromised PLC program persists through reboots and can cause physical harm."
+    ),
+    "write": (
+        "In OT environments, write-capable commands have direct physical consequences: "
+        "they can change setpoints, open or close valves, start or stop motors, and modify "
+        "controller configuration.  Unapproved writes are among the highest-risk OT events "
+        "because the impact extends to physical processes and may affect safety systems."
+    ),
+    "polling": (
+        "OT devices communicate in tightly controlled, deterministic cycles.  A burst of "
+        "abnormally high or irregular polling can indicate configuration errors, a "
+        "malfunctioning HMI, unauthorized scanning, or a denial-of-service condition "
+        "against the controller.  Sustained abnormal polling can exhaust controller "
+        "resources and disrupt process control."
+    ),
+    "recon": (
+        "Discovery and enumeration map which controllers exist, what they are, and which "
+        "registers or tags hold process values.  Engineering tools do this routinely; the "
+        "same activity from an unknown host is a common precursor to targeted manipulation."
+    ),
+    "c2": (
+        "Periodic callbacks, encoded DNS queries, and attack-tool fingerprints indicate a "
+        "compromised host keeping contact with an outside operator.  In OT, that host may be "
+        "one step away from the controllers."
+    ),
+    "credentials": (
+        "Credentials recovered from OT traffic usually work on more than one system and are "
+        "rarely rotated.  An attacker who has them operates with legitimate access, which "
+        "monitoring is least likely to question."
+    ),
+    "engineering": (
+        "Engineering protocols are how controller programs are uploaded, downloaded, and "
+        "changed.  Access to them is equivalent to the ability to rewrite the process logic, "
+        "and a modified program persists through reboots."
+    ),
+    "cleartext": (
+        "Most legacy OT protocols were designed for isolated networks and lack "
+        "authentication and encryption.  Where IT/OT connectivity exists, cleartext "
+        "communications expose process data, commands, and credentials to any host "
+        "with network visibility."
+    ),
+    "boundary": (
+        "OT network segmentation is a primary defense layer.  Direct communication "
+        "between IT and OT zones creates pathways through which IT-side compromise can "
+        "reach control systems.  Public IP exposure extends that risk to internet threats."
+    ),
+    "it_noise": (
+        "Windows name-resolution broadcasts (LLMNR, NetBIOS) and discovery protocols can be "
+        "answered by any host on the segment.  Tools such as Responder exploit them to capture "
+        "credentials from HMIs and engineering workstations."
+    ),
+    "dhcp": (
+        "A rogue DHCP server can assign clients a malicious gateway or DNS server, putting "
+        "an attacker in the path of every new connection on the segment."
+    ),
+    "tcp_anomaly": (
+        "OT protocols depend on stable, long-lived sessions.  Repeated resets or failed "
+        "connections can starve an HMI of data, or show a host probing for services."
+    ),
+    "ipv6": (
+        "Most OT security controls are configured for IPv4 only.  IPv6 link-local traffic "
+        "(router and neighbor discovery, DHCPv6, LLMNR) can carry spoofing and name-poisoning "
+        "attacks that IPv4 controls never see."
+    ),
+    "icmp": (
+        "ICMP reachability lets anyone on the segment discover which controllers are alive. "
+        "Ping-based monitoring is common, but it should come from known monitoring hosts."
+    ),
+    "time": (
+        "Without synchronized time, events from different devices cannot be put in order, "
+        "alarms cannot be correlated, and certificate validity cannot be trusted."
+    ),
+    "capture": (
+        "The analysis can only see what the capture contains; gaps and short windows hide "
+        "activity and reduce confidence in absence findings."
+    ),
+    "av": (
+        "Audio/video systems (IP cameras, DVR/NVR platforms, VoIP phones) on an OT "
+        "segment usually sit outside patch and inventory management.  Camera and DVR "
+        "platforms have a long history of critical vulnerabilities and default "
+        "credentials, making them a common initial foothold, and their continuous "
+        "high-bandwidth streams compete with deterministic control traffic on shared "
+        "switches.  Video paths can also carry sensitive process imagery off-site."
+    ),
+}
+
+_AUDITOR_GUIDANCE: Dict[str, List[str]] = {
+    "dos": [
+        "Ask operations whether HMIs lost communication or alarms fired during the window.",
+        "Identify the flooding host's switch port and owner.",
+        "Check the controller's diagnostics for communication faults or restarts.",
+        "If the host is not an approved load-testing tool, treat as an attack and escalate.",
+    ],
+    "mitm": [
+        "Map each MAC address in the finding to its physical switch port using the switch's MAC address table.",
+        "Rule out legitimate causes: VRRP/HSRP gateway failover, NIC teaming, a replaced device that kept its IP, or a migrated virtual machine.",
+        "Review switch port-security and ARP inspection logs for the affected subnet during the attack window.",
+        "Check what the impostor could have changed: compare controller programs, setpoints, and recent writes with a known-good backup.",
+        "If no legitimate explanation exists, treat as active intrusion and escalate immediately.",
+    ],
+    "replay": [
+        "Validate whether the affected device was in a normal operating state during the capture.",
+        "Ask site staff whether any protocol gateways, redundant servers, or test equipment answer for this device.",
+        "Compare the captured Modbus responses against known-good process values for the same period.",
+        "If no legitimate explanation exists, treat as potential replay injection and investigate the network path.",
+    ],
+    "write": [
+        "Confirm the source host has an authorized role to issue write or control commands.",
+        "Verify that the write activity aligns with a known maintenance window or approved change record.",
+        "Confirm the destination device is the expected target for commands from this source.",
+        "Request operator logs and change records covering the capture timestamp.",
+        "If the source is not an approved HMI or engineering workstation, escalate immediately.",
+    ],
+    "restart": [
+        "Confirm the command source is an approved engineering workstation.",
+        "Match the event to a scheduled, documented maintenance window.",
+        "Ask operations whether alarms or process data were lost around the event.",
+        "If unexplained, review the controller's event log and the source host for compromise.",
+    ],
+    "polling": [
+        "Confirm whether abnormal polling rates correspond to a known maintenance or troubleshooting period.",
+        "Verify the polling source is a licensed, approved HMI or SCADA system.",
+        "Check whether the controller's CPU utilization was affected during the burst period.",
+        "If unexplained, check for rogue HMI software, misconfigured historian, or unauthorized device.",
+    ],
+    "recon": [
+        "Confirm the source IP is an authorized engineering workstation, scanner, or licensed HMI.",
+        "Check whether a maintenance window, commissioning activity, or diagnostic session was underway during the capture period.",
+        "Request the site's approved communication matrix and verify this flow is documented.",
+        "If the source is unknown or undocumented, treat as unauthorized reconnaissance and escalate.",
+    ],
+    "cleartext": [
+        "Confirm whether the protocol has a secure mode that is not currently enabled.",
+        "Verify whether the exposed traffic includes credentials, process commands, or sensitive data.",
+        "Confirm whether this traffic crosses zone boundaries to IT or external networks.",
+        "Assess whether the vendor has issued guidance for securing this service.",
+    ],
+    "credentials": [
+        "Identify every system that accepts the exposed credentials and schedule their rotation.",
+        "Confirm whether the accounts are shared or default, and whether they have administrative rights.",
+        "Check authentication logs for use of the credentials from unexpected hosts.",
+        "Confirm a secure alternative protocol is available for the service.",
+    ],
+    "boundary": [
+        "Confirm whether the cross-zone communication is intentional and documented in the site's architecture.",
+        "Request the segmentation diagram and verify controls at the zone boundary.",
+        "Confirm whether firewall rules explicitly permit or deny the observed flow.",
+        "Assess whether the remote host has been included in the site's threat model.",
+    ],
+    "av": [
+        "Ask the site which camera, CCTV, intercom, or VoIP systems are deployed and whether they are intended to share this segment with control equipment.",
+        "Compare the stream source and destination IPs against the approved device inventory — flag any video consumer that is not a known VMS/NVR or operator workstation.",
+        "Confirm A/V equipment is included in firmware/patch management; DVR and camera platforms with known vulnerabilities should be isolated or upgraded.",
+        "If streams are multicast, verify IGMP snooping is enabled on OT switches so video cannot flood control-traffic ports.",
+    ],
+    "ipv6": [
+        "Ask whether IPv6 is used on the OT network at all.",
+        "List the hosts in the finding and confirm IPv6 is either disabled on them or covered by firewall rules and monitoring.",
+        "Check whether any IPv6 router advertisements came from unexpected hosts.",
+    ],
+}
+
+_BENIGN_EXPLANATION: Dict[str, str] = {
+    "dos": "This finding would be benign only if an approved load or penetration test was running against the device at that time.",
+    "mitm": "This finding would be benign only if the second MAC belongs to a legitimate failover partner (VRRP/HSRP, NIC teaming) or a replacement device that took over the IP — none of which sends unsolicited ARP replies to other hosts or relays the original host's traffic.",
+    "replay": "This finding would be benign if a protocol gateway or redundant server pair legitimately answers for the device, or if the capture merged two mirror sources that duplicated frames (TCP retransmissions are already excluded).",
+    "restart": "This finding would be benign if the source is an authorized engineering workstation and the restart was part of a scheduled, documented maintenance window.",
+    "write": "This finding would be benign if the source is an authorized HMI or engineering workstation performing approved maintenance or commissioning during a documented change window.",
+    "polling": "This finding would be benign if the increased polling rate was a deliberate configuration change or occurred during a scheduled data-collection or commissioning activity.",
+    "recon": "This finding would be benign if the source is a licensed engineering workstation or approved scanner performing routine commissioning, maintenance, or diagnostics with site approval.",
+    "cleartext": "This would be acceptable only if the traffic is confined to a physically isolated, non-routable segment with no IT or external connectivity — which must be confirmed with the site.",
+    "boundary": "This finding would be benign if the cross-zone communication is explicitly documented, monitored, and intentionally permitted through a reviewed segmentation policy.",
+    "it_noise": "This finding would be benign if the hosts are Windows HMIs with default settings and the segment is isolated — it is still worth disabling these protocols.",
+    "tcp_anomaly": "This finding would be benign if the resets come from a client or service that is known to close connections this way, or from an approved scan.",
+    "ipv6": "This finding would be benign if the IPv6 traffic is default link-local chatter from Windows or virtual machines on an isolated segment, or IPv6 is deliberately deployed and monitored.",
+    "icmp": "This finding would be benign if the ICMP comes from the site's approved monitoring system.",
+    "av": "This finding would be benign if the site confirms the endpoints are its own CCTV, intercom, paging, or VoIP equipment and the network placement matches the approved design — in that case treat it as an inventory observation, not an incident.",
+}
+
+
 def why_this_matters_for_finding(finding: "Finding") -> str:
     """Explain why a finding is risky in practical OT terms."""
-    text = " ".join(
-        [
-            finding.title,
-            finding.description,
-            finding.category,
-            finding.protocol,
-            " ".join(finding.tags),
-        ]
-    ).lower()
-    if any(term in text for term in ("write", "operate", "reset", "stop/start", "control operation", "writeproperty", "direct operate")):
-        return "This finding matters because it indicates traffic that can change controller state, process values, or device configuration rather than just observe data."
-    if any(term in text for term in ("cleartext", "http", "ftp", "telnet", "snmp", "basic authentication", "securitymode none",
-                                     "securitypolicy none", "without tls", "anonymous", "noauth", "without authentication")):
-        return "This finding matters because the protocol or session protection is weak enough that credentials, commands, or process data may be exposed or modified by anyone with network visibility."
-    if any(term in text for term in ("scan", "recon", "who-is", "list identity", "browse", "identify all", "read szl", "wildcard")):
-        return "This finding matters because it is consistent with discovery or enumeration activity, which is often a precursor to targeted manipulation or exploitation."
-    if any(term in text for term in ("boundary", "public ip", "dual-zone", "ot-to-it", "public", "segmentation")):
-        return "This finding matters because it weakens OT segmentation and increases the chance that IT-side compromise or internet exposure can directly reach control systems."
-    if any(term in text for term in ("project file", "ladder", "firmware", "credential", "artifact")):
-        return "This finding matters because it exposes engineering artifacts, credentials, or controller-specific metadata that can be reused for offline analysis, replay, unauthorized uploads, or follow-on access."
-    if "av_media" in text:
-        return "This finding matters because audio/video systems on a control network are usually unmanaged, rarely patched endpoints whose continuous high-bandwidth streams share switching capacity with control traffic — and camera/DVR platforms are a frequent initial foothold for attackers."
-    if "absence" in text:
-        return "This finding matters because missing expected traffic can mean the capture point had limited visibility, a device was offline, or segmentation is preventing expected communications."
+    family = narrative_family(finding)
+    if family in _WHY_THIS_MATTERS:
+        return _WHY_THIS_MATTERS[family]
     if finding.severity == SEVERITY_INTRUSION:
         return "This finding matters because it combines multiple suspicious behaviors into a pattern that is more concerning than any single packet or protocol event on its own."
     return "This finding matters because it reflects behavior that is inconsistent with a minimal, well-segmented, and tightly controlled OT network."
@@ -1419,41 +1781,14 @@ def why_this_matters_for_finding(finding: "Finding") -> str:
 
 def recommended_fix_for_finding(finding: "Finding") -> str:
     """Provide concrete remediation guidance tailored to a finding."""
-    text = " ".join(
-        [
-            finding.title,
-            finding.description,
-            finding.category,
-            finding.protocol,
-            " ".join(finding.tags),
-        ]
-    ).lower()
-    if any(term in text for term in ("modbus", "bacnet", "dnp3", "cip", "s7", "opc-ua", "opcua", "mqtt")) and any(
-        term in text for term in ("write", "operate", "reset", "control", "writeproperty", "direct operate")
-    ):
-        return "Restrict write-capable functions to approved engineering or HMI hosts only, block all other sources at the firewall or switch ACL layer, and disable unused write services where the vendor allows it."
-    if "umas" in text:
-        return "Allow TCP/502 to the PLC only from its HMIs and the engineering workstation, set an application password on the PLC project, and use the controller's memory-protect setting so programs cannot be changed outside an approved engineering session."
-    if any(term in text for term in ("noauth", "without authentication")):
-        return "Enable authentication on the interface (for Node-RED, configure adminAuth; for cameras, disable anonymous RTSP and set unique credentials), restrict who can reach it at the firewall, and move administration to an encrypted channel."
-    if any(term in text for term in ("securitymode none", "securitypolicy none", "without tls", "cleartext", "http", "ftp", "telnet", "basic authentication", "anonymous")):
-        return "Enable the strongest supported authentication and encryption for the protocol, disable insecure legacy access methods, rotate any exposed credentials, and limit access to a dedicated management subnet."
-    if any(term in text for term in ("public ip", "ot-to-it", "dual-zone", "boundary", "segmentation")):
-        return "Remove direct routing where possible, place a firewall or industrial DMZ between the zones, permit only explicitly required ports, and force administration through an approved jump host."
-    if any(term in text for term in ("scan", "recon", "who-is", "list identity", "identify all", "browse", "read szl", "wildcard")):
-        return "Identify the scanning source, confirm whether it is an approved management station, and if not, block its access to OT ports, disable unnecessary discovery services, and alert operations that device enumeration occurred."
-    if any(term in text for term in ("project file", "ladder", "firmware")):
-        return "Limit file-transfer paths between corporate, engineering, and control assets; disable unnecessary FTP, TFTP, SMB, or web download functions on PLC-facing systems; and require authenticated engineering workstations for any program transfer."
-    if any(term in text for term in ("credential", "password", "web user")):
-        return "Rotate the exposed credentials, remove any default or shared administrative passwords, enforce unique role-based accounts, and disable any management interface that exposes authentication material in cleartext."
-    if "av_media" in text:
-        return "Inventory the audio/video endpoints, move cameras, DVR/NVR platforms, and VoIP systems onto a dedicated VLAN separated from control traffic, enable IGMP snooping where multicast video is used, and bring camera and DVR firmware under patch management."
-    if "absence" in text:
-        return "Retake the capture from a better vantage point, confirm the device was online during collection, and compare expected protocol flows against firewall rules and switch topology."
-    if "dns" in text:
-        return "Point OT assets only to approved internal DNS services if name resolution is required, or remove DNS access entirely from controllers that should operate by IP only."
-    if "ntp" in text:
-        return "Use a local internal time source for OT assets and block direct queries to public time servers from the control network."
+    family = narrative_family(finding)
+    title = finding.title.lower()
+    if family in ("cleartext", "unknown") and "node-red" in title:
+        return "Configure adminAuth for the Node-RED editor, put it behind TLS, and restrict TCP/1880 to the engineering hosts that need it."
+    if family == "cleartext" and "rtsp" in title:
+        return "Disable anonymous RTSP access on the camera, set unique credentials, and restrict which hosts can request streams."
+    if family in _RECOMMENDED_FIX:
+        return _RECOMMENDED_FIX[family]
     if finding.severity in {SEVERITY_CRITICAL, SEVERITY_INTRUSION}:
         return "Start with the initiating host and target devices, verify the behavior against change records, then block, disable, or reconfigure the exposed path so the same action cannot be repeated from an unauthorized source."
     return finding.next_steps
@@ -1480,6 +1815,7 @@ _WIRESHARK_GUIDE: List[Tuple[Tuple[str, ...], str, List[str]]] = [
          "Add the column 'arp.opcode' (View → Columns) and check for 'reply' opcodes that don't follow a corresponding 'request' from the same target.",
          "Compare the Ethernet source MAC (eth.src) against the ARP sender MAC (arp.src.hw_mac) — when they disagree, that's a MITM toolkit's signature.",
          "Right-click any suspicious ARP frame → Conversation Filter → Ethernet to see all traffic that flowed through that MAC during the spoof window.",
+         "Filter eth.addr == <impostor MAC> (named in the finding) and compare the eth.src of the victim IP's packets before, during, and after the attack window — during interception they come from the impostor.",
      ]),
     (("register value anomaly",),
      "modbus",
@@ -1653,7 +1989,14 @@ _WIRESHARK_GUIDE: List[Tuple[Tuple[str, ...], str, List[str]]] = [
          "Right-click → 'Follow → HTTP Stream' to read the full request/response including headers, cookies, and body.",
          "Use 'File → Export Objects → HTTP' to extract any files transferred over the suspicious connection.",
      ]),
-    (("possible ot protocol scanning", "tcp reset storm", "unanswered syn", "icmp sweep", "icmp unreachable", "icmp traffic"),
+    (("icmp traffic involving",),
+     "icmp",
+     [
+         "Use 'Statistics → Endpoints → IPv4' with the icmp filter applied to list which hosts ping the controllers.",
+         "Add the column 'icmp.type': 8/0 are echo request/reply (monitoring or discovery), 3 is destination unreachable.",
+         "Confirm each pinging host is the site's monitoring system; anything else is mapping which controllers are alive.",
+     ]),
+    (("possible ot protocol scanning", "tcp reset storm", "unanswered syn", "icmp sweep", "icmp unreachable"),
      "(tcp.flags.reset == 1) || (tcp.flags.syn == 1 && tcp.flags.ack == 0) || icmp",
      [
          "Use 'Statistics → Endpoints' filtered by the relevant protocol to see top talkers — the scanner stands out by destination diversity.",
@@ -1674,7 +2017,15 @@ _WIRESHARK_GUIDE: List[Tuple[Tuple[str, ...], str, List[str]]] = [
          "Use 'Statistics → Resolved Addresses' or external whois to corroborate the report's PTR/RDAP enrichment.",
          "Check whether the source is genuinely an OT-classed device or a misclassified IT host that legitimately needs internet access.",
      ]),
-    (("dual-zone", "direct ot-to-it", "sharing the same vlan", "multiple vlans", "ipv6 traffic"),
+    (("ipv6 traffic",),
+     "ipv6",
+     [
+         "Use 'Statistics → Endpoints → IPv6' to list every IPv6 address: fe80:: addresses are link-local; anything else is routable.",
+         "Filter icmpv6.type == 134 to find router advertisements — an unexpected advertising host is how IPv6 adversary-in-the-middle attacks begin.",
+         "A link-local address containing ff:fe in the middle (EUI-64) embeds the host's MAC; match it to the IPv4 host with the same eth.src.",
+         "Filter dhcpv6 || llmnr || udp.port == 3702 to see the Windows discovery traffic that usually accounts for link-local IPv6.",
+     ]),
+    (("dual-zone", "direct ot-to-it", "sharing the same vlan", "multiple vlans"),
      "",
      [
          "Use 'Statistics → Conversations → IPv4' and filter on the host to list every peer it talks to; peers in both IT and OT subnets confirm the bridge.",
@@ -1822,6 +2173,12 @@ def related_findings_for_finding(session: "SessionState", finding: "Finding", li
     return related
 
 
+def lead_sentences(text: str, count: int = 2) -> str:
+    """Return the first `count` sentences of a description."""
+    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z])", text.strip())
+    return " ".join(sentences[:count])
+
+
 def correlation_summary_lines(session: "SessionState") -> List[str]:
     """Build a compact summary of related/high-order findings.
 
@@ -1835,33 +2192,9 @@ def correlation_summary_lines(session: "SessionState") -> List[str]:
     # MITM chain: emit a single human-readable sentence when the
     # combined-signal MITM finding fired.
     mitm_findings = [f for f in session.findings if "mitm" in f.tags]
-    for f in mitm_findings[:3]:
-        spoofed_ip = f.source_ips[0] if f.source_ips else "(unknown)"
-        # Pull MAC details from the finding's evidence if present.
-        mac_hint = ""
-        for ev in f.evidence:
-            if ev.startswith("Claimant MACs:"):
-                mac_hint = ev.replace("Claimant MACs:", "").strip()
-                break
-        write_count = 0
-        for ev in f.evidence:
-            m = re.match(r"(\d+)\s+subsequent OT-write finding", ev)
-            if m:
-                write_count = int(m.group(1))
-                break
-        narrative = (
-            f"⚠ ACTIVE ATTACK CHAIN: ARP-based Adversary-in-the-Middle on {spoofed_ip}"
-        )
-        if mac_hint:
-            narrative += f" (claimants: {mac_hint})"
-        if write_count:
-            narrative += (
-                f" — followed by {write_count} OT write/control operation(s) in the same subnet. "
-                "Treat as an active intrusion: attacker has both the position AND has used it."
-            )
-        else:
-            narrative += " — attack position confirmed; investigate immediately."
-        lines.append(narrative)
+    for f in sorted(mitm_findings, key=lambda item: SEVERITY_ORDER.get(item.severity, 0), reverse=True)[:3]:
+        prefix = "⚠ ACTIVE ATTACK" if f.severity == SEVERITY_INTRUSION else "⚠ ATTACK POSITION"
+        lines.append(f"{prefix}: {lead_sentences(f.description, 2)}")
 
     correlated = [
         finding for finding in session.findings
@@ -2496,6 +2829,7 @@ NON_SCORING_CATEGORIES = {"Protection Guidance", "Assessor Notes"}
 _MITRE_ICS_NAMES: Dict[str, str] = {
     "T0812": "Default Credentials",
     "T0814": "Denial of Service",
+    "T0826": "Loss of Availability",
     "T0816": "Device Restart/Shutdown",
     "T0828": "Loss of Productivity and Revenue",
     "T0830": "Adversary-in-the-Middle",
@@ -2533,38 +2867,34 @@ def _finding_id_prefix(category: str) -> str:
 
 def detection_confidence_for_finding(finding: "Finding") -> str:
     """Estimate how confident the tool is that the detection is accurate."""
-    text = " ".join([finding.title, finding.category, " ".join(finding.tags)]).lower()
-    if any(t in text for t in ("arp spoof", "multiple mac", "adversary-in-the-middle",
-                                "mitm attack")):
-        return "High"
-    if any(t in text for t in ("register scanning", "polling burst", "register value anomaly",
-                                "public ip", "cleartext credentials", "dnp3 direct operate",
-                                "dnp3 cold restart", "dnp3 warm restart", "plc stop",
-                                "s7 write", "authentication failure")):
-        return "High"
-    if any(t in text for t in ("replay", "duplicate or unsolicited modbus", "possible",
-                                "may indicate")):
-        return "Medium"
-    if any(t in text for t in ("unknown", "unclassified", "absence")):
+    family = narrative_family(finding)
+    title = finding.title.lower()
+    if family in ("absence", "unknown"):
         return "Low"
+    if family in ("mitm", "write", "restart", "credentials", "engineering", "file_transfer", "cleartext", "ipv6", "icmp",
+                  "it_noise", "dhcp", "av"):
+        return "High"
+    if family in ("polling", "value_anomaly") or any(t in title for t in ("register scanning", "public ip", "sweep", "walk")):
+        return "High"
+    if family in ("replay", "c2", "tcp_anomaly") or "possible" in title:
+        return "Medium"
     return "Medium"
 
 
 def maliciousness_confidence_for_finding(finding: "Finding") -> str:
     """Estimate how likely the detected behavior is malicious vs. operationally normal."""
-    text = " ".join([finding.title, finding.category, " ".join(finding.tags)]).lower()
+    family = narrative_family(finding)
     if finding.severity == SEVERITY_INTRUSION:
         return "High"
-    if any(t in text for t in ("adversary-in-the-middle attack pattern", "mitm attack",
-                                "suspicious tool", "mimikatz", "cobalt strike", "metasploit")):
-        return "High"
-    if any(t in text for t in ("replay", "duplicate or unsolicited modbus", "arp spoof",
-                                "gratuitous arp burst")):
+    if family == "mitm":
+        return "High" if finding.severity == SEVERITY_CRITICAL else "Low / Medium — requires site validation"
+    if family in ("replay", "c2", "dos"):
         return "Medium"
-    if any(t in text for t in ("modbus register scanning", "register scanning",
-                                "polling burst", "polling anomaly")):
+    if family in ("polling", "recon"):
         return "Low — may be authorized maintenance"
-    if any(t in text for t in ("unknown", "unclassified", "absence")):
+    if family in ("cleartext", "credentials", "ipv6", "icmp", "it_noise", "boundary", "time", "capture", "av"):
+        return "Low — a weakness or exposure rather than an attack"
+    if family in ("absence", "unknown"):
         return "Unknown"
     if finding.severity == SEVERITY_CRITICAL:
         return "Medium"
@@ -2575,91 +2905,9 @@ def maliciousness_confidence_for_finding(finding: "Finding") -> str:
 
 def ot_significance_for_finding(finding: "Finding") -> str:
     """Return an OT-focused explanation of why this finding matters to an IT auditor."""
-    text = " ".join([
-        finding.title, finding.description, finding.category, " ".join(finding.tags),
-    ]).lower()
-    if any(t in text for t in ("register scanning",)):
-        return (
-            "Reads that sweep many different register addresses, each only once or twice, are "
-            "consistent with reconnaissance of a controller's internal state — mapping which "
-            "registers hold process values, setpoints, or status bits.  An HMI instead re-reads "
-            "the same short scan list every cycle.  An engineer may sweep a map during "
-            "commissioning, but the same pattern from an unknown host is a common precursor to "
-            "targeted manipulation."
-        )
-    if any(t in text for t in ("polling burst", "polling anomaly")):
-        return (
-            "OT devices communicate in tightly controlled, deterministic cycles.  A burst of "
-            "abnormally high or irregular polling can indicate configuration errors, a "
-            "malfunctioning HMI, unauthorized scanning, or a denial-of-service condition "
-            "against the controller.  Sustained abnormal polling can exhaust controller "
-            "resources and disrupt process control."
-        )
-    if any(t in text for t in ("replay", "duplicate or unsolicited modbus")):
-        return (
-            "A Modbus server answers each request exactly once.  A second answer to the same "
-            "transaction, or an answer to a request that was never sent, is how injected or "
-            "replayed responses appear on the wire — the technique an attacker uses to show "
-            "operators false process values while the real process changes.  This is "
-            "particularly serious in safety-critical processes where operators rely on "
-            "controller feedback."
-        )
-    if any(t in text for t in ("arp spoof", "adversary-in-the-middle", "mitm")):
-        return (
-            "In an OT network, an Adversary-in-the-Middle position between an HMI and a PLC "
-            "allows real-time observation, modification, or replay of any command or process "
-            "value.  This bypasses application-layer authentication and is one of the most "
-            "serious network-layer threats to OT data integrity and process safety."
-        )
-    if any(t in text for t in ("write", "direct operate", "control operation", "writeproperty")):
-        return (
-            "In OT environments, write-capable commands have direct physical consequences: "
-            "they can change setpoints, open or close valves, start or stop motors, and modify "
-            "controller configuration.  Unapproved writes are among the highest-risk OT events "
-            "because the impact extends to physical processes and may affect safety systems."
-        )
-    if any(t in text for t in ("plc stop", "cold restart", "warm restart", "disable spontaneous")):
-        return (
-            "Commands that stop, restart, or suppress reporting from a PLC or RTU have "
-            "immediate operational impact — halting production, disabling safety monitoring, "
-            "or disrupting the operator's view of the process.  In MITRE ATT&CK for ICS "
-            "these are classified as impact-stage techniques."
-        )
-    if any(t in text for t in ("register value anomaly",)):
-        return (
-            "Sudden large jumps in register values can indicate spoofed or injected Modbus "
-            "responses rather than real sensor readings.  In safety-critical processes, "
-            "acting on spoofed data can cause equipment damage, process upsets, or safety "
-            "system failures."
-        )
-    if any(t in text for t in ("cleartext", "without tls", "no authentication", "anonymous")):
-        return (
-            "Most legacy OT protocols were designed for isolated networks and lack "
-            "authentication and encryption.  Where IT/OT connectivity exists, cleartext "
-            "communications expose process data, commands, and credentials to any host "
-            "with network visibility."
-        )
-    if any(t in text for t in ("boundary", "it-to-ot", "ot-to-it", "public ip", "segmentation")):
-        return (
-            "OT network segmentation is a primary defense layer.  Direct communication "
-            "between IT and OT zones creates pathways through which IT-side compromise can "
-            "reach control systems.  Public IP exposure extends that risk to internet threats."
-        )
-    if any(t in text for t in ("firmware", "program download", "logic download", "block download")):
-        return (
-            "Firmware and logic downloads modify the program driving physical processes.  "
-            "Unauthorized downloads are among the most serious OT security events because a "
-            "compromised PLC program persists through reboots and can cause physical harm."
-        )
-    if "av_media" in text:
-        return (
-            "Audio/video systems (IP cameras, DVR/NVR platforms, VoIP phones) on an OT "
-            "segment usually sit outside patch and inventory management.  Camera and DVR "
-            "platforms have a long history of critical vulnerabilities and default "
-            "credentials, making them a common initial foothold, and their continuous "
-            "high-bandwidth streams compete with deterministic control traffic on shared "
-            "switches.  Video paths can also carry sensitive process imagery off-site."
-        )
+    family = narrative_family(finding)
+    if family in _OT_SIGNIFICANCE:
+        return _OT_SIGNIFICANCE[family]
     return (
         "In OT environments, traffic anomalies that would be low-risk in IT can have direct "
         "consequences for physical processes, equipment, and safety.  This finding warrants "
@@ -2670,64 +2918,9 @@ def ot_significance_for_finding(finding: "Finding") -> str:
 
 def auditor_guidance_for_finding(finding: "Finding") -> List[str]:
     """Return 3–5 auditor action bullets for validating a finding."""
-    text = " ".join([finding.title, finding.category, " ".join(finding.tags)]).lower()
-    if any(t in text for t in ("register scanning",)):
-        return [
-            "Confirm the source IP is an authorized engineering workstation or licensed HMI.",
-            "Check whether a maintenance window, commissioning activity, or diagnostic session was underway during the capture period.",
-            "Request the site's approved communication matrix and verify this flow is documented.",
-            "If the source is unknown or undocumented, treat as unauthorized reconnaissance and escalate.",
-        ]
-    if any(t in text for t in ("write", "direct operate", "control operation", "writeproperty")):
-        return [
-            "Confirm the source host has an authorized role to issue write or control commands.",
-            "Verify that the write activity aligns with a known maintenance window or approved change record.",
-            "Confirm the destination device is the expected target for commands from this source.",
-            "Request operator logs and change records covering the capture timestamp.",
-            "If the source is not an approved HMI or engineering workstation, escalate immediately.",
-        ]
-    if any(t in text for t in ("polling burst", "polling anomaly")):
-        return [
-            "Confirm whether abnormal polling rates correspond to a known maintenance or troubleshooting period.",
-            "Verify the polling source is a licensed, approved HMI or SCADA system.",
-            "Check whether the controller's CPU utilization was affected during the burst period.",
-            "If unexplained, check for rogue HMI software, misconfigured historian, or unauthorized device.",
-        ]
-    if any(t in text for t in ("replay", "duplicate or unsolicited modbus")):
-        return [
-            "Validate whether the affected device was in a normal operating state during the capture.",
-            "Ask site staff whether any protocol gateways, redundant servers, or test equipment answer for this device.",
-            "Compare the captured Modbus responses against known-good process values for the same period.",
-            "If no legitimate explanation exists, treat as potential replay injection and investigate the network path.",
-        ]
-    if any(t in text for t in ("arp spoof", "adversary-in-the-middle", "mitm")):
-        return [
-            "Map the MAC addresses involved to specific physical ports on the switch.",
-            "Determine whether any network monitoring appliance, IDS sensor, or traffic mirror could explain multiple MACs.",
-            "Review switch port security configuration and ARP table logs for the affected subnet.",
-            "If no legitimate explanation exists, treat as active intrusion and escalate immediately.",
-        ]
-    if any(t in text for t in ("cleartext", "without tls", "no authentication")):
-        return [
-            "Confirm whether the protocol has a secure mode that is not currently enabled.",
-            "Verify whether the exposed traffic includes credentials, process commands, or sensitive data.",
-            "Confirm whether this traffic crosses zone boundaries to IT or external networks.",
-            "Assess whether the vendor has issued guidance for securing this service.",
-        ]
-    if any(t in text for t in ("boundary", "it-to-ot", "public ip")):
-        return [
-            "Confirm whether the cross-zone communication is intentional and documented in the site's architecture.",
-            "Request the segmentation diagram and verify controls at the zone boundary.",
-            "Confirm whether firewall rules explicitly permit or deny the observed flow.",
-            "Assess whether the remote host has been included in the site's threat model.",
-        ]
-    if "av_media" in text:
-        return [
-            "Ask the site which camera, CCTV, intercom, or VoIP systems are deployed and whether they are intended to share this segment with control equipment.",
-            "Compare the stream source and destination IPs against the approved device inventory — flag any video consumer that is not a known VMS/NVR or operator workstation.",
-            "Confirm A/V equipment is included in firmware/patch management; DVR and camera platforms with known vulnerabilities should be isolated or upgraded.",
-            "If streams are multicast, verify IGMP snooping is enabled on OT switches so video cannot flood control-traffic ports.",
-        ]
+    family = narrative_family(finding)
+    if family in _AUDITOR_GUIDANCE:
+        return _AUDITOR_GUIDANCE[family]
     return [
         "Confirm with site personnel whether the observed behavior is expected and authorized.",
         "Cross-reference the source and destination IPs against the site's approved communication matrix.",
@@ -2738,25 +2931,9 @@ def auditor_guidance_for_finding(finding: "Finding") -> List[str]:
 
 def benign_explanation_for_finding(finding: "Finding") -> str:
     """One sentence describing what site context would make this finding benign."""
-    text = " ".join([finding.title, finding.category, " ".join(finding.tags)]).lower()
-    if any(t in text for t in ("register scanning",)):
-        return "This finding would be benign if the source is a licensed engineering workstation performing routine commissioning, maintenance, or diagnostic reads with site approval."
-    if any(t in text for t in ("polling burst",)):
-        return "This finding would be benign if the increased polling rate was a deliberate configuration change or occurred during a scheduled data-collection or commissioning activity."
-    if any(t in text for t in ("replay", "duplicate or unsolicited modbus")):
-        return "This finding would be benign if a protocol gateway or redundant server pair legitimately answers for the device, or if the capture merged two mirror sources that duplicated frames (TCP retransmissions are already excluded)."
-    if any(t in text for t in ("arp spoof", "adversary-in-the-middle", "mitm")):
-        return "This finding would be benign if a network monitoring appliance, IDS sensor, or traffic mirror was installed on the subnet using promiscuous mode or transparent bridging."
-    if any(t in text for t in ("write", "direct operate", "control operation")):
-        return "This finding would be benign if the source is an authorized HMI or engineering workstation performing approved maintenance or commissioning during a documented change window."
-    if any(t in text for t in ("cleartext",)):
-        return "This would be acceptable only if the traffic is confined to a physically isolated, non-routable segment with no IT or external connectivity — which must be confirmed with the site."
-    if any(t in text for t in ("boundary", "it-to-ot", "public ip")):
-        return "This finding would be benign if the cross-zone communication is explicitly documented, monitored, and intentionally permitted through a reviewed segmentation policy."
-    if any(t in text for t in ("plc stop", "cold restart", "warm restart")):
-        return "This finding would be benign if the source is an authorized engineering workstation and the restart was part of a scheduled, documented maintenance window."
-    if "av_media" in text:
-        return "This finding would be benign if the site confirms the endpoints are its own CCTV, intercom, paging, or VoIP equipment and the network placement matches the approved design — in that case treat it as an inventory observation, not an incident."
+    family = narrative_family(finding)
+    if family in _BENIGN_EXPLANATION:
+        return _BENIGN_EXPLANATION[family]
     return "This finding would be benign if confirmed by site personnel as representing authorized, expected communications during normal or approved maintenance operations."
 
 
@@ -2822,6 +2999,36 @@ def build_network_interpretation_summary(session: "SessionState") -> List[str]:
             "describe them; review with the site which of them are expected."
         )
 
+    observed = [(dev.ip, note) for dev in devices.values() for note in dev.evidence]
+    if observed:
+        paragraphs.append(
+            "Host observations from the analysis: "
+            + "; ".join(f"{ip_text} — {note}" for ip_text, note in observed[:8])
+            + "."
+        )
+
+    folded = [(address, dev.ip) for dev in devices.values() for address in dev.ipv6_addresses]
+    if folded:
+        paragraphs.append(
+            "IPv6 link-local addresses matched to their IPv4 hosts by MAC address: "
+            + ", ".join(f"{address} → {ip_text}" for address, ip_text in folded[:10])
+            + ".  They are listed under the IPv4 host in the device inventory."
+        )
+
+    groups = session.analysis_metadata.get("group_addresses") or {}
+    if groups:
+        ranked = sorted(groups.items(), key=lambda item: -item[1].get("packets", 0))
+        parts = []
+        for address, info in ranked[:10]:
+            protocols = ", ".join(info.get("protocols", [])[:3])
+            senders = ", ".join(info.get("senders", [])[:3])
+            detail = "; ".join(part for part in (protocols, f"from {senders}" if senders else "") if part)
+            parts.append(f"{address} ({detail})" if detail else address)
+        paragraphs.append(
+            f"Broadcast and multicast destinations ({len(groups)}), which are not hosts and are kept out of the "
+            "device inventory: " + ", ".join(parts) + ("…" if len(groups) > 10 else "") + "."
+        )
+
     paragraphs.append(
         "Network zone assignments and device roles above are inferred from traffic patterns "
         "alone.  Validate all device identifications against the site's network documentation, "
@@ -2851,6 +3058,7 @@ class OTPcapAnalyzer:
         self.public_ip_cache: Dict[str, Dict[str, str]] = {}
         # TCP connections whose SYN was seen: endpoint pair -> server endpoint.
         self._tcp_servers: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Tuple[str, int]] = {}
+        self._host_address_cache: Dict[str, bool] = {}
 
     TCP_ORIENTATION_CAP = 500_000
     EVIDENCE_CAP = 50
@@ -3000,7 +3208,7 @@ class OTPcapAnalyzer:
             # Bounded merges: per-packet detectors can hit the same key
             # millions of times, so evidence and host lists stop growing at
             # a cap instead of being re-sorted without limit.
-            existing.evidence = self._bounded_union(existing.evidence, finding.evidence, self.EVIDENCE_CAP)
+            existing.evidence = self._bounded_extend(existing.evidence, finding.evidence, self.EVIDENCE_CAP)
             existing.source_ips = self._bounded_union(existing.source_ips, finding.source_ips, self.MERGED_IP_CAP)
             existing.destination_ips = self._bounded_union(existing.destination_ips, finding.destination_ips,
                                                            self.MERGED_IP_CAP)
@@ -3016,6 +3224,21 @@ class OTPcapAnalyzer:
         self.session.findings.append(finding)
         if finding.dedupe_key:
             self.finding_index[finding.dedupe_key] = finding
+
+    @staticmethod
+    def _bounded_extend(existing: List[str], new: Sequence[str], cap: int) -> List[str]:
+        """Order-preserving union of two lists that stops growing at `cap`."""
+        if len(existing) >= cap:
+            return existing
+        merged = list(existing)
+        seen = set(merged)
+        for item in new:
+            if len(merged) >= cap:
+                break
+            if item not in seen:
+                seen.add(item)
+                merged.append(item)
+        return merged
 
     @staticmethod
     def _bounded_union(existing: List[str], new: Sequence[str], cap: int) -> List[str]:
@@ -3053,7 +3276,7 @@ class OTPcapAnalyzer:
             category=category,
             title=title,
             description=description,
-            evidence=list(sorted(set(item for item in evidence if item))),
+            evidence=list(dict.fromkeys(item for item in evidence if item)),
             source_ips=list(sorted(set(item for item in source_ips if item))),
             destination_ips=list(sorted(set(item for item in destination_ips if item))),
             protocol=protocol,
@@ -3067,6 +3290,7 @@ class OTPcapAnalyzer:
             mitre_ids=list(sorted(set(mitre_ids or []) | set(mitre_for_finding(category, title, tags)))),
             advisory_refs=advisories_for_finding(category, title, tags),
         )
+        finding.next_steps = recommended_fix_for_finding(finding)
         self._merge_finding(finding)
 
     # ------------------------------------------------------------------
@@ -3230,6 +3454,57 @@ class OTPcapAnalyzer:
         ])
         return hashlib.sha1(fingerprint_base.encode("utf-8")).hexdigest()
 
+    def _is_host_address(self, ip_text: str, mac_text: str = "") -> bool:
+        """True when an address belongs to a host (not broadcast, multicast, or unset)."""
+        if not ip_text or (mac_text and is_group_mac(mac_text)):
+            return False
+        cached = self._host_address_cache.get(ip_text)
+        if cached is None:
+            if len(self._host_address_cache) > 200_000:
+                self._host_address_cache.clear()
+            cached = not (is_group_address(ip_text) or is_unspecified_address(ip_text))
+            self._host_address_cache[ip_text] = cached
+        return cached
+
+    def _note_group_destination(self, ip_text: str, sender_ip: str, protocol: str) -> None:
+        """Count traffic to a broadcast / multicast address (kept out of the device list)."""
+        assert self.session is not None
+        groups = self.session.analysis_metadata.setdefault("group_addresses", {})
+        entry = groups.get(ip_text)
+        if entry is None:
+            if len(groups) >= 500:
+                return
+            entry = groups[ip_text] = {"packets": 0, "senders": [], "protocols": []}
+        entry["packets"] += 1
+        if sender_ip and sender_ip not in entry["senders"] and len(entry["senders"]) < 10:
+            entry["senders"].append(sender_ip)
+        if protocol and protocol not in entry["protocols"] and len(entry["protocols"]) < 10:
+            entry["protocols"].append(protocol)
+
+    def _register_arp_sender(self, row: Dict[str, str], pcap_name: str) -> None:
+        """Record the sender of a self-consistent ARP frame as a host.
+
+        Hosts that only ever ARP (quiet devices, or an attacker poisoning
+        caches from its own address) would otherwise never appear in the
+        inventory.  Frames whose ARP sender MAC differs from the Ethernet
+        source are someone speaking for another host and are skipped.
+        """
+        arp_ip = row.get("arp.src.proto_ipv4") or ""
+        arp_mac = (row.get("arp.src.hw_mac") or "").lower()
+        if not arp_ip or not arp_mac or arp_mac != (row.get("eth.src") or "").lower():
+            return
+        if not self._is_host_address(arp_ip, arp_mac):
+            return
+        device = self._device(arp_ip)
+        device.outgoing_count += 1
+        self._remember_unique(device.source_pcaps, pcap_name)
+        self._remember_unique(device.subnets, subnet_from_ip(arp_ip))
+        self._remember_unique(device.macs, arp_mac)
+        vendor = lookup_oui_vendor(arp_mac)
+        if vendor:
+            self._remember_unique(device.vendors, vendor)
+        self._remember_unique(device.protocols, "ARP")
+
     def _register_packet_row(self, row: Dict[str, str], pcap_name: str) -> bool:
         """Merge packet-derived information into the unified session."""
         assert self.session is not None
@@ -3247,6 +3522,10 @@ class OTPcapAnalyzer:
                 self.session.duplicate_packets[fingerprint].append(pcap_name)
             return False
         self.packet_fingerprint_set.add(fingerprint)
+        if row.get("arp.opcode"):
+            self._register_arp_sender(row, pcap_name)
+        host_ips = {ip for ip, mac in ((source_ip, ""), (destination_ip, row.get("eth.dst", "")))
+                    if self._is_host_address(ip, mac)}
         vlan_id = row.get("vlan.id", "").strip()
         # Passive OS fingerprint: only look at TCP SYN (flags 0x02) from the source.
         os_guess = ""
@@ -3263,6 +3542,10 @@ class OTPcapAnalyzer:
             (destination_ip, row.get("eth.dst", ""), "in"),
         ):
             if not ip_text:
+                continue
+            if ip_text not in host_ips:
+                if direction == "in" and not is_unspecified_address(ip_text):
+                    self._note_group_destination(ip_text, source_ip, protocol)
                 continue
             device = self._device(ip_text)
             self._remember_unique(device.source_pcaps, pcap_name)
@@ -3289,11 +3572,13 @@ class OTPcapAnalyzer:
         if service_port and source_ip and destination_ip:
             if source_port == destination_port:
                 for ip_text in (source_ip, destination_ip):
-                    self._remember_unique(self._device(ip_text).ports, service_port)
-                    self._remember_unique(self._device(ip_text).client_ports, service_port)
+                    if ip_text in host_ips:
+                        self._remember_unique(self._device(ip_text).ports, service_port)
+                        self._remember_unique(self._device(ip_text).client_ports, service_port)
             elif to_server:
-                self._remember_unique(self._device(client_ip).client_ports, service_port)
-            elif not _tcp_flag_bits(row) & 0x04:
+                if client_ip in host_ips:
+                    self._remember_unique(self._device(client_ip).client_ports, service_port)
+            elif not _tcp_flag_bits(row) & 0x04 and server_ip in host_ips:
                 self._remember_unique(self._device(server_ip).ports, service_port)
         if source_ip and destination_ip:
             self._register_connection(client_ip, server_ip, protocol, transport, service_port, pcap_name,
@@ -3489,50 +3774,72 @@ class OTPcapAnalyzer:
         return 0
 
     def _prune_low_confidence_devices(self, min_packets: int = 2) -> Dict[str, int]:
-        """Remove device records that are almost certainly not real endpoints.
+        """Remove device records that are not real endpoints, then consolidate.
 
-        A device is considered low-confidence and dropped when ALL of these
-        hold:
-          * It never appears as a packet source (incoming_count == 0 and
-            outgoing_count == 0 by our counting, or only as a destination).
-          * Its IP is broadcast/multicast/reserved (.255, 224-239.x, ff..)
-            OR it was seen fewer than ``min_packets`` total packets.
-
-        Rationale: large multi-file OT captures routinely produce millions
-        of "devices" that are just broadcast/multicast destinations or
-        transient spoofed IPs.  A real endpoint either (a) sources traffic
-        or (b) is an intentional multicast group with enough activity to
-        justify tracking — both are preserved.  Returns a small dict of
-        statistics for reporting.
+        Broadcast / multicast / unspecified addresses are never devices (new
+        sessions do not create them; older sessions may carry them) and are
+        summarized under ``analysis_metadata["group_addresses"]`` instead.
+        Destination-only IPs seen fewer than ``min_packets`` times are
+        dropped.  IPv6 link-local addresses are then folded into the IPv4
+        host that uses the same MAC, and the "ARP" protocol label is kept
+        only for hosts seen in nothing but ARP.
         """
         assert self.session is not None
         stats = {"kept": 0, "dropped_multicast": 0, "dropped_sparse": 0,
-                 "dropped_dest_only": 0, "kept_multicast_active": 0}
+                 "dropped_dest_only": 0, "folded_ipv6": 0}
         to_delete: List[str] = []
         for ip, dev in self.session.devices.items():
             total_pkts = dev.incoming_count + dev.outgoing_count
-            is_bcast  = ip.endswith(".255")
-            is_mcast  = (ip[:4] in {f"{o}." for o in range(224, 240)}
-                         or ip.lower().startswith("ff"))
-            is_zero   = ip in {"0.0.0.0", "::", ""}
-            # Never-a-source test: only seen as packet destination
-            dest_only = dev.outgoing_count == 0
-            if is_zero:
+            group_macs_only = bool(dev.macs) and all(is_group_mac(mac) for mac in dev.macs)
+            if is_unspecified_address(ip) or ip in {"", "::"}:
                 to_delete.append(ip); stats["dropped_sparse"] += 1; continue
-            if (is_bcast or is_mcast) and total_pkts < 20:
-                # Low-traffic multicast/broadcast groups are noise
+            if is_group_address(ip) or group_macs_only:
+                groups = self.session.analysis_metadata.setdefault("group_addresses", {})
+                entry = groups.setdefault(ip, {"packets": 0, "senders": [], "protocols": []})
+                entry["packets"] = max(entry["packets"], total_pkts)
+                for protocol in dev.protocols[:10]:
+                    if protocol not in entry["protocols"]:
+                        entry["protocols"].append(protocol)
                 to_delete.append(ip); stats["dropped_multicast"] += 1; continue
-            if (is_bcast or is_mcast):
-                stats["kept_multicast_active"] += 1
-                stats["kept"] += 1; continue
-            if dest_only and total_pkts < min_packets:
+            if dev.outgoing_count == 0 and total_pkts < min_packets:
                 to_delete.append(ip); stats["dropped_dest_only"] += 1; continue
             if total_pkts < min_packets and len(dev.source_pcaps) < 1:
                 to_delete.append(ip); stats["dropped_sparse"] += 1; continue
             stats["kept"] += 1
         for ip in to_delete:
             del self.session.devices[ip]
+        stats["folded_ipv6"] = self._fold_link_local_ipv6()
+        for dev in self.session.devices.values():
+            if "ARP" in dev.protocols and len(dev.protocols) > 1:
+                dev.protocols.remove("ARP")
         return stats
+
+    def _fold_link_local_ipv6(self) -> int:
+        """Merge IPv6 link-local device records into the IPv4 host with the same MAC."""
+        assert self.session is not None
+        ipv4_by_mac: Dict[str, List[str]] = defaultdict(list)
+        for ip, dev in self.session.devices.items():
+            if ":" not in ip:
+                for mac in dev.macs:
+                    ipv4_by_mac[mac.lower()].append(ip)
+        folded = 0
+        for ip in [ip for ip in self.session.devices if is_link_local_ipv6(ip)]:
+            dev = self.session.devices[ip]
+            macs = [mac.lower() for mac in dev.macs if not is_group_mac(mac)]
+            if len(macs) != 1 or len(ipv4_by_mac.get(macs[0], [])) != 1:
+                continue
+            host = self.session.devices[ipv4_by_mac[macs[0]][0]]
+            self._remember_unique(host.ipv6_addresses, ip)
+            self.session.analysis_metadata.setdefault("ipv6_links", {})[ip] = {"host": host.ip, "mac": macs[0]}
+            for attr in ("protocols", "ports", "client_ports", "source_pcaps", "vendors", "vlans"):
+                target = getattr(host, attr)
+                for value in getattr(dev, attr):
+                    self._remember_unique(target, value)
+            host.outgoing_count += dev.outgoing_count
+            host.incoming_count += dev.incoming_count
+            del self.session.devices[ip]
+            folded += 1
+        return folded
 
     def _all_processed_packet_count(self) -> int:
         """Return the total raw packet count across processed pcaps."""
@@ -3724,7 +4031,8 @@ class OTPcapAnalyzer:
         if raw_device_count > total_unique_ips:
             print(
                 f"[✓] Device confidence filter: kept {total_unique_ips:,} / {raw_device_count:,} IPs "
-                f"(dropped {prune_stats['dropped_multicast']:,} low-traffic multicast/broadcast, "
+                f"(set aside {prune_stats['dropped_multicast']:,} broadcast/multicast addresses, "
+                f"folded {prune_stats['folded_ipv6']:,} IPv6 link-local into their IPv4 hosts, "
                 f"{prune_stats['dropped_dest_only']:,} destination-only, "
                 f"{prune_stats['dropped_sparse']:,} sparse)."
             )
@@ -4284,6 +4592,307 @@ class OTPcapAnalyzer:
             else:
                 device.inferred_zone = "Unknown"
 
+    @staticmethod
+    def _arp_conflict_verdicts(hyg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Decide who owns, and who impersonates, every IP claimed by 2+ MACs in ARP.
+
+        Spoofing signals per claimant MAC: unsolicited ARP replies claiming
+        the IP; being a "phantom" identity whose claims were only ever sent
+        from another Ethernet source; sending ARP frames on behalf of other
+        hosts (MITM tools do this when they restore caches); and claiming
+        the IP while using a different address as its own.  The MAC with the
+        fewest signals (then the most traffic sent as the IP) is the owner;
+        other claimants with signals are impostors.  A conflict with no
+        signals at all is reported as such (failover, duplicate address).
+        """
+        claims: Dict[Tuple[str, str], Dict[str, Any]] = hyg.get("arp_claims", {})
+        bindings: Dict[Tuple[str, str], List[float]] = hyg.get("ip_mac", {})
+        by_ip: Dict[str, List[str]] = defaultdict(list)
+        spoken_for: Dict[str, List[Tuple[str, str, List[float]]]] = defaultdict(list)
+        own_ips: Dict[str, set] = defaultdict(set)
+        for (ip, mac), claim in claims.items():
+            by_ip[ip].append(mac)
+            for sender, stats in claim["senders"].items():
+                if sender != mac:
+                    spoken_for[sender].append((ip, mac, stats))
+            if mac in claim["senders"] and claim["frames"] > claim["replies"]:
+                own_ips[mac].add(ip)
+        verdicts: List[Dict[str, Any]] = []
+        for ip, macs in by_ip.items():
+            macs = sorted(set(macs))
+            if len(macs) < 2:
+                continue
+            signals: Dict[str, List[str]] = {}
+            score: Dict[str, int] = {}
+            for mac in macs:
+                claim = claims[(ip, mac)]
+                reasons: List[str] = []
+                points = 0
+                if claim["unsolicited"]:
+                    reasons.append(f"{claim['unsolicited']} unsolicited ARP repl{'y' if claim['unsolicited'] == 1 else 'ies'} "
+                                   f"claiming {ip}")
+                    points += 1
+                if mac not in claim["senders"]:
+                    reasons.append(f"every claim of {ip} at {mac} was sent from another MAC "
+                                   f"({', '.join(sorted(claim['senders']))})")
+                    points += 2
+                spoke = spoken_for.get(mac, [])
+                if spoke:
+                    reasons.append("sent ARP frames on behalf of " + ", ".join(f"{i} at {m}" for i, m, _ in spoke[:3]))
+                    points += 2
+                others = sorted(own_ips.get(mac, set()) - {ip})
+                if others and ip not in own_ips.get(mac, set()):
+                    reasons.append(f"uses {', '.join(others[:3])} as its own address")
+                    points += 1
+                signals[mac] = reasons
+                score[mac] = points
+            tx = {mac: (bindings.get((ip, mac)) or [0, 0, 0, 0])[0] for mac in macs}
+            owner = min(macs, key=lambda m: (score[m], -tx[m], claims[(ip, m)]["first"] or float("inf")))
+            impostors = [mac for mac in macs if mac != owner and score[mac] > 0]
+            verdicts.append({
+                "ip": ip, "owner": owner, "macs": macs, "impostors": impostors,
+                "signals": signals, "own_ips": {mac: sorted(own_ips.get(mac, set()) - {ip}) for mac in macs},
+                "spoken_for": {mac: spoken_for.get(mac, []) for mac in macs},
+            })
+        return verdicts
+
+    def _emit_arp_findings(self, hyg: Dict[str, Any], verdicts: List[Dict[str, Any]], pcap_names: List[str],
+                           mac_label: Callable[[str], str],
+                           window_line: Callable[..., Optional[str]]) -> None:
+        """Emit ARP spoofing / Adversary-in-the-Middle findings from the conflict verdicts."""
+        assert self.session is not None
+        claims: Dict[Tuple[str, str], Dict[str, Any]] = hyg.get("arp_claims", {})
+        bindings: Dict[Tuple[str, str], List[float]] = hyg.get("ip_mac", {})
+        details: Dict[Tuple[str, str], Dict[str, Any]] = hyg.get("ip_mac_detail", {})
+        impostor_macs: set = set()
+        mitm_ips: set = set()
+
+        def _span(epochs: Sequence[float]) -> Tuple[float, float]:
+            values = [value for value in epochs if value]
+            return (min(values), max(values)) if values else (0.0, 0.0)
+
+        def _window_text(start: float, end: float) -> str:
+            seconds = max(0.0, end - start)
+            duration = f"{seconds:.0f} s" if seconds < 120 else f"{seconds / 60:.1f} min"
+            return (f"{format_epoch(start)} – {format_epoch(end)} ({duration}) — Wireshark: "
+                    f"frame.time_epoch >= {start:.6f} && frame.time_epoch <= {end:.6f}")
+
+        # ---- impostors, grouped so one finding covers every IP a MAC impersonated
+        by_impostor: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for verdict in verdicts:
+            for mac in verdict["impostors"]:
+                by_impostor[mac].append(verdict)
+        for impostor, impersonations in sorted(by_impostor.items()):
+            impostor_macs.add(impostor)
+            victims = sorted(v["ip"] for v in impersonations)
+            mitm_ips.update(victims)
+            own_ips = sorted({ip for v in impersonations for ip in v["own_ips"].get(impostor, [])})
+            frame_senders = sorted({s for v in impersonations for s in claims[(v["ip"], impostor)]["senders"]} - {impostor})
+            evidence: List[str] = []
+            epochs: List[float] = []
+            targets: Dict[Tuple[str, str], int] = Counter()
+            replies = unsolicited = 0
+            for v in impersonations:
+                claim = claims[(v["ip"], impostor)]
+                replies += claim["replies"]
+                unsolicited += claim["unsolicited"]
+                epochs += [claim["first"], claim["last"]]
+                for target, count in claim["targets"].items():
+                    targets[target] += count
+            identity = f"Impostor MAC: {mac_label(impostor)}"
+            if own_ips:
+                identity += f" — its own address is {', '.join(own_ips)}"
+            if frame_senders:
+                identity += f" — its ARP frames were sent from {', '.join(mac_label(s) for s in frame_senders)}"
+            evidence.append(identity)
+            for v in impersonations:
+                evidence.append(f"Impersonated host: {v['ip']} (real MAC {mac_label(v['owner'])})")
+            target_ips: List[str] = []
+            for (target_ip, target_mac), count in sorted(targets.items(), key=lambda item: -item[1]):
+                target_ips.append(target_ip)
+                evidence.append(f"Poisoned ARP cache: {target_ip}" + (f" ({mac_label(target_mac)})" if target_mac else "")
+                                + f" — {count} spoofed ARP repl{'y' if count == 1 else 'ies'}")
+            intercepted_tx = intercepted_rx = 0
+            peers: Counter[str] = Counter()
+            labels: Counter[str] = Counter()
+            samples: List[Tuple[bool, str]] = []
+            for v in impersonations:
+                stats = bindings.get((v["ip"], impostor))
+                if stats and (stats[0] or stats[1]):
+                    intercepted_tx += int(stats[0])
+                    intercepted_rx += int(stats[1])
+                    epochs += [stats[2], stats[3]]
+                    detail = details.get((v["ip"], impostor)) or {}
+                    peers.update(detail.get("peers", {}))
+                    labels.update(detail.get("labels", {}))
+                    for label, line in detail.get("samples", {}).items():
+                        samples.append((label in ("ICMP", "TCP", "ICMPv6", "ARP"), line))
+            intercepted = intercepted_tx + intercepted_rx
+            sample_lines: List[str] = []
+            if intercepted:
+                peer_text = ", ".join(peers) if peers else "its peers"
+                label_text = ", ".join(label for label, _ in labels.most_common(4)) or "IP"
+                evidence.append(f"Intercepted traffic: {intercepted_tx:,} frames sent as {', '.join(victims)} and "
+                                f"{intercepted_rx:,} frames addressed to it passed through {impostor} — {label_text} "
+                                f"with {peer_text}")
+            sample_lines = [line for _, line in sorted(samples, key=lambda item: item[0])[:2]]
+            restores: List[str] = []
+            for ip, real_mac, stats in [item for v in impersonations for item in v["spoken_for"].get(impostor, [])]:
+                restores.append(f"ARP restore: {impostor} re-announced {ip} at {real_mac} ({int(stats[0])} frame(s), "
+                                f"last @{stats[2]:.6f}) — MITM tools do this when they stop")
+                epochs += [stats[1], stats[2]]
+            start, end = _span(epochs)
+            if start:
+                evidence.append(f"Attack window: {_window_text(start, end)}")
+            evidence += sample_lines
+            evidence += restores[:3]
+            evidence.append(f"Wireshark: eth.addr == {impostor} lists every frame the impostor sent or received")
+            for v in impersonations:
+                for reason in v["signals"].get(impostor, []):
+                    evidence.append(f"Spoofing indicator: {reason}")
+            # Write/control commands to or from the hosts in the poisoned path, inside the window.
+            writes = []
+            for f in self.session.findings:
+                ends = set(f.source_ips) | set(f.destination_ips)
+                if "write" not in f.tags or not (ends & set(victims)) or (target_ips and not ends & set(target_ips)):
+                    continue
+                try:
+                    seen_from = float(f.first_seen) if f.first_seen else None
+                    seen_to = float(f.last_seen) if f.last_seen else seen_from
+                except ValueError:
+                    seen_from = seen_to = None
+                if seen_from is None or not start or (seen_from <= end + 1 and (seen_to or seen_from) >= start - 1):
+                    writes.append(f)
+            for f in writes[:5]:
+                evidence.append(f"Write/control during the attack: [{f.severity}] {f.title} — "
+                                f"{', '.join(f.source_ips[:2])} → {', '.join(f.destination_ips[:2])}")
+            victim_text = " and ".join(victims)
+            target_text = ", ".join(target_ips) if target_ips else "other hosts"
+            real_text = "; ".join(f"the real {v['ip']} is {v['owner']}" for v in impersonations)
+            narrative = (f"MAC {mac_label(impostor)}{', whose own address is ' + ', '.join(own_ips) + ',' if own_ips else ''} "
+                         f"sent {replies} spoofed ARP repl{'y' if replies == 1 else 'ies'} to {target_text} claiming to be "
+                         f"{victim_text} ({real_text}).")
+            if intercepted:
+                severity = SEVERITY_INTRUSION
+                title = "ARP-based Adversary-in-the-Middle attack pattern detected — traffic intercepted"
+                narrative += (f" From {format_epoch(start)} to {format_epoch(end)}, {victim_text}'s traffic"
+                              f"{' with ' + ', '.join(peers) if peers else ''} passed through that MAC: {intercepted:,} "
+                              "frames. A host in that position can read, alter, or drop every command and process value "
+                              "in the session.")
+            elif writes:
+                severity = SEVERITY_INTRUSION
+                title = "ARP-based Adversary-in-the-Middle attack pattern detected — OT writes during poisoning"
+                narrative += (" Write/control commands crossed the poisoned path while the spoofed entries were live; "
+                              "this capture point did not see them pass through the impostor, but any that reached a "
+                              "poisoned host's cache would have.")
+            else:
+                severity = SEVERITY_CRITICAL
+                title = "ARP-based Adversary-in-the-Middle attack pattern detected"
+                narrative += (" No traffic was seen passing through the impostor from this capture point, which may "
+                              "only see part of the path; treat the position as established.")
+            if restores:
+                narrative += " The impostor later re-announced the real MAC — the clean-up step of MITM tools."
+            self.add_finding(
+                severity, "Intrusion Indicators", title, narrative, evidence,
+                own_ips, sorted(set(victims) | set(target_ips)), "ARP", pcap_names,
+                f"intrusion::mitm-arp::{impostor}",
+                tags=["arp_spoof", "mitm", "intrusion"],
+                first_seen=f"{start:.6f}" if start else None, last_seen=f"{end:.6f}" if end else None,
+            )
+            window_note = f" between {format_epoch(start)} and {format_epoch(end)}" if start else ""
+            for ip in victims:
+                device = self.session.devices.get(ip)
+                if device is not None:
+                    self._remember_unique(device.evidence, f"Impersonated by MAC {impostor}{window_note} "
+                                                           "(ARP-based Adversary-in-the-Middle finding)")
+            for ip in own_ips:
+                device = self.session.devices.get(ip)
+                if device is not None:
+                    self._remember_unique(device.evidence, f"Impostor: MAC {impostor} claimed {victim_text} in ARP"
+                                                           f"{window_note}")
+            for ip in target_ips:
+                device = self.session.devices.get(ip)
+                if device is not None:
+                    self._remember_unique(device.evidence, f"ARP cache poisoned by MAC {impostor}{window_note}")
+
+        # ---- conflicts without spoofing signals (failover, duplicate address) ----
+        for verdict in verdicts:
+            if verdict["impostors"]:
+                continue
+            ip = verdict["ip"]
+            lines = []
+            for mac in verdict["macs"]:
+                claim = claims[(ip, mac)]
+                stats = bindings.get((ip, mac))
+                carried = (f"; carried {int(stats[0]):,} frames sent as {ip}" if stats and stats[0] else "")
+                lines.append(f"{mac_label(mac)}: {claim['frames']} ARP frame(s) claiming {ip}, "
+                             f"@{claim['first']:.6f} – @{claim['last']:.6f}{carried}")
+            window = window_line(ip=ip)
+            self.add_finding(
+                SEVERITY_HIGH, "Network Hygiene and Segmentation", "IP address claimed by multiple MACs in ARP",
+                f"{ip} was claimed by {len(verdict['macs'])} MAC addresses in ARP, without spoofing indicators "
+                "(no unsolicited replies, no frames sent on another host's behalf). Likely causes: VRRP/HSRP failover, "
+                "NIC teaming, a duplicate address, or a device replaced while keeping its IP — validate which.",
+                lines + ([window] if window else []), [ip], [], "ARP", pcap_names,
+                f"arp::ip-multi-mac::{ip}", tags=["arp_spoof", "mac_conflict"],
+            )
+
+        # ---- signals not explained by an impostor finding -------------------------
+        for mac, count in hyg.get("gratuitous_arp_by_src", Counter()).items():
+            if count >= 10 and mac and mac not in impostor_macs:
+                ips_claimed = sorted(hyg["mac_to_ips"].get(mac, set()))
+                window = window_line(mac=mac)
+                self.add_finding(
+                    SEVERITY_HIGH, "Network Hygiene and Segmentation", "Gratuitous ARP burst observed",
+                    f"MAC {mac_label(mac)} sent {count} gratuitous ARP frames. Bursts of gratuitous ARP are commonly "
+                    "used to poison neighbor caches for adversary-in-the-middle attacks, or can indicate failover/HA "
+                    "flapping. Validate against expected HA/VRRP events.",
+                    [f"Gratuitous ARP count: {count}", f"IPs claimed by {mac_label(mac)}: {', '.join(ips_claimed[:10])}"]
+                    + ([window] if window else []),
+                    ips_claimed[:5], [], "ARP", pcap_names, f"arp::grat::{mac}",
+                    tags=["arp_spoof", "gratuitous_arp"],
+                )
+        for mac, ips in hyg.get("mac_to_ips", {}).items():
+            if len(ips) >= 3 and mac and mac not in impostor_macs:
+                window = window_line(mac=mac)
+                self.add_finding(
+                    SEVERITY_MEDIUM, "Network Hygiene and Segmentation", "Single MAC claims multiple IPs via ARP",
+                    f"MAC {mac_label(mac)} announced itself as {len(ips)} distinct IPv4 addresses in ARP. "
+                    "Legitimate reasons include routers, proxy-ARP, VIPs, and teaming — but this is also a "
+                    "signature of ARP spoofing and of rogue devices.",
+                    [f"Claimed IPs: {', '.join(sorted(ips)[:15])}"] + ([window] if window else []),
+                    sorted(ips)[:5], [], "ARP", pcap_names, f"arp::mac-multi-ip::{mac}", tags=["arp_spoof"],
+                )
+        for pn, eth_mac, arp_mac, arp_ip in hyg.get("eth_mac_mismatch", []):
+            if eth_mac in impostor_macs or arp_mac in impostor_macs or arp_ip in mitm_ips:
+                continue
+            window = window_line(ip=arp_ip, mac=arp_mac)
+            self.add_finding(
+                SEVERITY_HIGH, "Network Hygiene and Segmentation", "ARP sender MAC differs from Ethernet source MAC",
+                f"{mac_label(eth_mac)} sent an ARP frame claiming {arp_ip} is at {mac_label(arp_mac)}. A host speaking "
+                "for another host's address is a strong ARP spoofing indicator used by MITM toolkits.",
+                [f"Ethernet src={mac_label(eth_mac)}, ARP src={mac_label(arp_mac)}, ARP sender IP={arp_ip}"]
+                + ([window] if window else []),
+                [arp_ip] if arp_ip else [], [], "ARP", [pn],
+                f"arp::mac-mismatch::{eth_mac}::{arp_mac}::{arp_ip}", tags=["arp_spoof", "intrusion"],
+            )
+        reply_only: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+        for _pn, mac, sender_ip, target_ip in hyg.get("arp_reply_no_request", []):
+            reply_only[mac].append((sender_ip, target_ip))
+        for mac, pairs in reply_only.items():
+            if len(pairs) >= 5 and mac and mac not in impostor_macs:
+                claimed = sorted({ip for ip, _ in pairs if ip})
+                targets = sorted({ip for _, ip in pairs if ip})
+                self.add_finding(
+                    SEVERITY_MEDIUM, "Network Hygiene and Segmentation", "ARP replies without matching requests",
+                    f"MAC {mac_label(mac)} sent {len(pairs)} ARP replies nobody asked for, claiming "
+                    f"{', '.join(claimed[:5])} to {', '.join(targets[:5])}. Some HA setups do this; so does ARP spoofing.",
+                    [f"Unsolicited ARP replies: {len(pairs)}", f"Claimed: {', '.join(claimed[:10])}",
+                     f"Sent to: {', '.join(targets[:10])}"],
+                    claimed[:10], targets[:10], "ARP", pcap_names, f"arp::unsolicited-reply::{mac}",
+                    tags=["arp_spoof"],
+                )
+
     def check_network_hygiene(self, pcaps: Sequence[Path]) -> int:
         """Analyze segmentation and hygiene conditions across the unified dataset."""
         assert self.session is not None
@@ -4334,6 +4943,21 @@ class OTPcapAnalyzer:
 
         self._log_ts("      [hygiene 1/5] inferring roles and zones …")
         self._infer_roles_and_zones()
+        # RST / SYN / ARP state comes from the streaming combined pass.
+        _hyg: Dict[str, Any] = getattr(self, "_hygiene_tcp_state", None) or {}
+        arp_verdicts = self._arp_conflict_verdicts(_hyg) if _hyg else []
+        arp_conflict_ips = {verdict["ip"] for verdict in arp_verdicts}
+        bindings: Dict[Tuple[str, str], List[float]] = _hyg.get("ip_mac", {})
+
+        def _binding_line(ip: str, mac: str) -> str:
+            stats = bindings.get((ip, mac.lower()))
+            vendor = lookup_oui_vendor(mac)
+            label = f"{mac} ({vendor})" if vendor else mac
+            if not stats:
+                return f"{label}: no OT/monitored traffic carried"
+            return (f"{label}: {int(stats[0]):,} frames sent as {ip}, {int(stats[1]):,} frames addressed to it, "
+                    f"{format_epoch(stats[2])} – {format_epoch(stats[3])} (@{stats[2]:.6f} – @{stats[3]:.6f})")
+
         self._log_ts(f"      [hygiene 2/5] per-device MAC drift "
                      f"({n_devices:,} devices) …")
         # MACs fronting many IPs are routers / firewalls / L3 switches: every
@@ -4353,11 +4977,13 @@ class OTPcapAnalyzer:
                 mac for mac in device.macs
                 if mac.lower() not in gateway_macs and not mac.lower().startswith(("ff:ff:ff", "01:00:5e", "33:33"))
             )
-            if len(station_macs) > 1:
+            if len(station_macs) > 1 and device.ip not in arp_conflict_ips:
                 _capped_add("multi_mac", SEVERITY_HIGH, "Multiple MAC addresses observed for one IP",
-                    f"{device.ip} appeared with multiple MAC addresses, which can indicate ARP instability or spoofing.",
-                    [f"MACs: {', '.join(station_macs)}"], [device.ip], [], "ARP",
-                    device.source_pcaps, f"net::multi-mac::{device.ip}", [])
+                    f"{device.ip}'s traffic was carried by {len(station_macs)} different MAC addresses. Without an "
+                    "ARP conflict in the capture this can be a failover pair or a replaced NIC — or interception whose "
+                    "ARP poisoning happened out of the capture's view.",
+                    [_binding_line(device.ip, mac) for mac in station_macs], [device.ip], [], "IP",
+                    device.source_pcaps, f"net::multi-mac::{device.ip}", ["mac_conflict"])
 
         self._log_ts(f"      [hygiene 3/5] OT/IT crossings, DNS/ICMP, IPv6 "
                      f"({n_connections:,} connections) …")
@@ -4366,13 +4992,17 @@ class OTPcapAnalyzer:
         icmp_pairs: List[str] = []
         icmp_ips: set = set()
         icmp_pcaps: set = set()
-        ipv6_pairs: List[str] = []
-        ipv6_ips: set = set()
+        ipv6_hosts: Dict[str, set] = defaultdict(set)
         ipv6_pcaps: set = set()
         for connection in self.session.connections.values():
             conn_iter += 1
             if conn_log_every and conn_iter % conn_log_every == 0:
                 self._log_ts(f"          … {conn_iter:,}/{n_connections:,} connections")
+            if ":" in connection.source_ip or ":" in connection.destination_ip:
+                ipv6_pcaps.update(connection.source_pcaps)
+                for address in (connection.source_ip, connection.destination_ip):
+                    if address and not is_group_address(address) and not is_unspecified_address(address):
+                        ipv6_hosts[address].add(connection.protocol)
             source_device = self.session.devices.get(connection.source_ip)
             destination_device = self.session.devices.get(connection.destination_ip)
             if not source_device or not destination_device:
@@ -4398,11 +5028,6 @@ class OTPcapAnalyzer:
                     [connection.source_ip], [connection.destination_ip], connection.protocol,
                     connection.source_pcaps,
                     f"net::ot-it::{connection.source_ip}::{connection.destination_ip}", ["boundary"])
-            if ":" in connection.source_ip or ":" in connection.destination_ip:
-                if len(ipv6_pairs) < 40:
-                    ipv6_pairs.append(f"{connection.source_ip} -> {connection.destination_ip} ({connection.protocol})")
-                ipv6_ips.update((connection.source_ip, connection.destination_ip))
-                ipv6_pcaps.update(connection.source_pcaps)
         if icmp_pairs:
             self.add_finding(
                 SEVERITY_LOW, "Network Hygiene and Segmentation", "ICMP traffic involving OT devices",
@@ -4411,12 +5036,43 @@ class OTPcapAnalyzer:
                 icmp_pairs, sorted(icmp_ips)[:30], [], "ICMP", sorted(icmp_pcaps),
                 "net::icmp-ot", tags=["icmp"],
             )
-        if ipv6_pairs:
+        if ipv6_hosts:
+            owner_of: Dict[str, DeviceRecord] = {}
+            for device in self.session.devices.values():
+                for address in device.ipv6_addresses:
+                    owner_of[address] = device
+            routable = sorted(address for address in ipv6_hosts if not is_link_local_ipv6(address))
+            ipv6_lines: List[str] = []
+            ipv6_assets: List[str] = []
+            for address in sorted(ipv6_hosts):
+                protocols = ", ".join(sorted(ipv6_hosts[address])) or "IPv6"
+                host = owner_of.get(address)
+                device = self.session.devices.get(address)
+                if host is not None:
+                    link = (self.session.analysis_metadata.get("ipv6_links") or {}).get(address, {})
+                    via = f" (same MAC {link['mac']})" if link.get("mac") else ""
+                    ipv6_lines.append(f"{address} — same host as {host.ip}{via}: {protocols}")
+                    ipv6_assets.append(host.ip)
+                else:
+                    macs = [mac for mac in (device.macs if device else []) if not is_group_mac(mac)]
+                    mac_text = ", ".join(f"{mac} ({lookup_oui_vendor(mac)})" if lookup_oui_vendor(mac) else mac
+                                         for mac in macs[:2]) or "MAC unknown"
+                    ipv6_lines.append(f"{address} — {mac_text}, no IPv4 address seen: {protocols}")
+                    ipv6_assets.append(address)
+            if routable:
+                ipv6_severity = SEVERITY_MEDIUM
+                ipv6_description = (f"{len(ipv6_hosts)} host address(es) used IPv6, including routable address(es) "
+                                    f"{', '.join(routable[:5])}. Most OT firewalls and monitoring are configured for "
+                                    "IPv4 only; confirm IPv6 is intended and covered by policy.")
+            else:
+                ipv6_severity = SEVERITY_LOW
+                ipv6_description = (f"{len(ipv6_hosts)} host(s) used IPv6 link-local only — router/neighbor discovery, "
+                                    "DHCPv6, LLMNR, or WS-Discovery that Windows and VM hosts send by default. Unneeded "
+                                    "IPv6 is an unmonitored path for spoofing and name-poisoning attacks; disable it on OT "
+                                    "hosts or include it in monitoring.")
             self.add_finding(
-                SEVERITY_MEDIUM, "Network Hygiene and Segmentation", "IPv6 traffic observed",
-                "IPv6 traffic was observed in an OT-adjacent dataset. Many OT environments do not expect IPv6, "
-                "so confirm whether it is intentional or unmanaged link-local chatter.",
-                ipv6_pairs, sorted(ipv6_ips)[:30], [], "IPv6", sorted(ipv6_pcaps),
+                ipv6_severity, "Network Hygiene and Segmentation", "IPv6 traffic observed",
+                ipv6_description, ipv6_lines[:40], sorted(set(ipv6_assets))[:30], [], "IPv6", sorted(ipv6_pcaps),
                 "net::ipv6", tags=["ipv6"],
             )
         for device in self.session.devices.values():
@@ -4491,9 +5147,10 @@ class OTPcapAnalyzer:
         # We fall back to a direct tshark read only if this method is somehow
         # called before the streaming pass (e.g. from a unit test or future
         # check re-ordering).
-        _hyg: Dict[str, Any] = getattr(self, "_hygiene_tcp_state", None) or {}
+        rst_after_fin: Counter[Tuple[str, str]] = Counter()
         if _hyg:
             rst_counts: Counter[Tuple[str, str]] = _hyg.get("rst_counts", Counter())
+            rst_after_fin = _hyg.get("rst_after_fin", Counter())
             syn_counts: Counter[Tuple[str, str]] = _hyg.get("syn_counts", Counter())
             synack_counts: Counter[Tuple[str, str]] = _hyg.get("synack_counts", Counter())
             hygiene_pcap_names: List[str] = sorted(_hyg.get("pcap_names", set()))
@@ -4503,12 +5160,19 @@ class OTPcapAnalyzer:
             syn_counts = Counter()
             synack_counts = Counter()
             seen_pcap_names: set[str] = set()
-            for pcap_file, row in self._filtered_rows(pcaps, "tcp.flags.reset==1 || tcp.flags.syn==1"):
+            fin_seen: set = set()
+            for pcap_file, row in self._filtered_rows(pcaps, "tcp.flags.reset==1 || tcp.flags.syn==1 || tcp.flags.fin==1"):
                 seen_pcap_names.add(pcap_file.name)
                 flags = _tcp_flag_bits(row)
                 pair = (row_source_ip(row), row_destination_ip(row))
+                ends = sorted([(pair[0], row_source_port(row)), (pair[1], row_destination_port(row))])
+                if flags & 0x01:
+                    fin_seen.add(tuple(ends))
                 if flags & 0x04:
-                    rst_counts[pair] += 1
+                    if tuple(ends) in fin_seen:
+                        rst_after_fin[pair] += 1
+                    else:
+                        rst_counts[pair] += 1
                 if flags & 0x12 == 0x02:
                     syn_counts[pair] += 1
                 elif flags & 0x12 == 0x12:
@@ -4519,9 +5183,13 @@ class OTPcapAnalyzer:
         for pair, count in rst_counts.items():
             if count >= 20:
                 _capped_add("rst_storm", SEVERITY_HIGH, "TCP reset storm observed",
-                    "A high number of TCP resets were observed between two hosts, which can indicate scanning or connection disruption.",
-                    [f"RST count: {count}"], [pair[0]], [pair[1]], "TCP",
-                    hygiene_pcap_names, f"net::rst::{pair[0]}::{pair[1]}", [])
+                    f"{pair[0]} reset {count} TCP connections with {pair[1]} without a normal close. Repeated aborts "
+                    "indicate refused connection attempts (scanning), a service that keeps failing, or deliberate "
+                    "connection disruption. RSTs that follow a FIN exchange are routine teardown and are not counted.",
+                    [f"Aborting RSTs: {count}",
+                     f"RSTs after a normal FIN close (not counted): {rst_after_fin.get(pair, 0)}"],
+                    [pair[0]], [pair[1]], "TCP",
+                    hygiene_pcap_names, f"net::rst::{pair[0]}::{pair[1]}", ["tcp_anomaly"])
         for pair, count in syn_counts.items():
             unanswered = count - synack_counts.get((pair[1], pair[0]), 0)
             if unanswered >= 20:
@@ -4529,7 +5197,7 @@ class OTPcapAnalyzer:
                     f"{pair[0]} sent {count} connection attempts to {pair[1]}, {unanswered} of which got no SYN-ACK. "
                     "Unanswered connection attempts indicate scanning, a blocked path, or a service that is down.",
                     [f"SYN count: {count}", f"Unanswered: {unanswered}"], [pair[0]], [pair[1]], "TCP",
-                    hygiene_pcap_names, f"net::syn::{pair[0]}::{pair[1]}", [])
+                    hygiene_pcap_names, f"net::syn::{pair[0]}::{pair[1]}", ["tcp_anomaly"])
 
         # ---- ARP spoof / MAC-IP drift findings -------------------------
         # Helper: annotate a MAC with its OUI vendor when known.  Surfacing
@@ -4572,201 +5240,7 @@ class OTPcapAnalyzer:
             )
 
         if _hyg:
-            # 1) Gratuitous ARP bursts from a single MAC (> threshold)
-            for mac, count in _hyg.get("gratuitous_arp_by_src", Counter()).items():
-                if count >= 10 and mac:
-                    ips_claimed = sorted(_hyg["mac_to_ips"].get(mac, set()))
-                    _grat_evidence = [
-                        f"Gratuitous ARP count: {count}",
-                        f"IPs claimed by {_mac_with_vendor(mac)}: {', '.join(ips_claimed[:10])}",
-                    ]
-                    _grat_window = _arp_window_evidence(mac=mac)
-                    if _grat_window:
-                        _grat_evidence.append(_grat_window)
-                    self.add_finding(
-                        SEVERITY_HIGH,
-                        "Network Hygiene and Segmentation",
-                        "Gratuitous ARP burst observed",
-                        f"MAC {_mac_with_vendor(mac)} sent {count} gratuitous ARP frames. Bursts of gratuitous ARP are commonly used to "
-                        "poison neighbor caches for adversary-in-the-middle attacks, or can indicate failover/HA flapping. "
-                        "Validate against expected HA/VRRP events.",
-                        _grat_evidence,
-                        ips_claimed[:5],
-                        [],
-                        "ARP",
-                        hygiene_pcap_names,
-                        f"arp::grat::{mac}",
-                        tags=["arp_spoof", "gratuitous_arp", "boundary"],
-                    )
-            # 2) Same MAC claiming multiple IPs (possible impersonation / router OK)
-            for mac, ips in _hyg.get("mac_to_ips", {}).items():
-                if len(ips) >= 3 and mac:
-                    self.add_finding(
-                        SEVERITY_MEDIUM,
-                        "Network Hygiene and Segmentation",
-                        "Single MAC claims multiple IPs via ARP",
-                        f"MAC {_mac_with_vendor(mac)} announced itself as {len(ips)} distinct IPv4 addresses in ARP. "
-                        "Legitimate reasons include routers, proxy-ARP, VIPs, and teaming — but this is also a "
-                        "signature of ARP spoofing and of rogue devices.",
-                        [
-                            f"Claimed IPs: {', '.join(sorted(ips)[:15])}",
-                            f"MAC vendor: {_mac_with_vendor(mac)}",
-                        ] + ([_arp_window_evidence(mac=mac)] if _arp_window_evidence(mac=mac) else []),
-                        sorted(ips)[:5],
-                        [],
-                        "ARP",
-                        hygiene_pcap_names,
-                        f"arp::mac-multi-ip::{mac}",
-                        tags=["arp_spoof"],
-                    )
-            # 3) Same IP claimed by multiple MACs (classic MITM)
-            for ip, macs in _hyg.get("ip_to_macs", {}).items():
-                if len(macs) >= 2 and ip:
-                    vendors = {lookup_oui_vendor(m) for m in macs if lookup_oui_vendor(m)}
-                    same_vendor_note = (
-                        f" All claimant MACs resolve to the same vendor ({next(iter(vendors))}), "
-                        "which strongly suggests an attacker VM/host on the same broadcast domain "
-                        "rather than legitimate HA failover."
-                        if len(vendors) == 1 else ""
-                    )
-                    self.add_finding(
-                        SEVERITY_HIGH,
-                        "Network Hygiene and Segmentation",
-                        "IP address claimed by multiple MACs in ARP",
-                        f"{ip} was claimed by {len(macs)} distinct MAC addresses in ARP traffic. "
-                        "This is the classic signature of ARP spoofing / adversary-in-the-middle." + same_vendor_note,
-                        [f"Claimant MACs: {_macs_with_vendors(macs)}"]
-                            + ([_arp_window_evidence(ip=ip)] if _arp_window_evidence(ip=ip) else []),
-                        [ip],
-                        [],
-                        "ARP",
-                        hygiene_pcap_names,
-                        f"arp::ip-multi-mac::{ip}",
-                        tags=["arp_spoof", "boundary"],
-                    )
-            # 4) Ethernet sender MAC != ARP sender MAC
-            for pn, eth_mac, arp_mac, arp_ip in _hyg.get("eth_mac_mismatch", []):
-                self.add_finding(
-                    SEVERITY_HIGH,
-                    "Network Hygiene and Segmentation",
-                    "ARP sender MAC differs from Ethernet source MAC",
-                    "An ARP frame advertised a sender MAC that did not match the Ethernet frame source MAC. "
-                    "This field mismatch is a strong ARP spoofing indicator used by MITM toolkits.",
-                    [f"Ethernet src={_mac_with_vendor(eth_mac)}, ARP src={_mac_with_vendor(arp_mac)}, ARP sender IP={arp_ip}"]
-                        + ([_arp_window_evidence(ip=arp_ip, mac=arp_mac)] if _arp_window_evidence(ip=arp_ip, mac=arp_mac) else []),
-                    [arp_ip] if arp_ip else [],
-                    [],
-                    "ARP",
-                    [pn],
-                    f"arp::mac-mismatch::{eth_mac}::{arp_mac}::{arp_ip}",
-                    tags=["arp_spoof", "intrusion"],
-                )
-            # ---- Combined-signal MITM correlation ----
-            # When multiple ARP-spoof signals converge on the same IP AND
-            # there are subsequent OT-write findings touching that IP or
-            # its peers, emit ONE high-priority intrusion-class finding
-            # tying the chain together.  This is what makes MITM
-            # unmissable: a single SEVERITY_INTRUSION block at the top of
-            # the report titled exactly what it is, instead of three
-            # separate HIGH findings the reader has to mentally combine.
-            ip_to_macs_full: Dict[str, set] = _hyg.get("ip_to_macs", {})
-            mismatch_ips: set = {arp_ip for _, _, _, arp_ip in _hyg.get("eth_mac_mismatch", []) if arp_ip}
-            mitm_candidates: List[str] = []
-            for ip, macs in ip_to_macs_full.items():
-                if len(macs) >= 2 and ip and ip in mismatch_ips:
-                    mitm_candidates.append(ip)
-            if mitm_candidates:
-                # Look for OT writes that touch the spoofed IP OR any peer
-                # in the same /24 — the attacker is typically positioned
-                # between two OT hosts in the same subnet.
-                write_tags = {"write", "modbus", "dnp3", "cip", "iec104", "s7", "opcua_write"}
-                related_writes: List[Finding] = []
-                for f in self.session.findings:
-                    if not any(t in write_tags for t in f.tags):
-                        continue
-                    flow_ips = set(f.source_ips) | set(f.destination_ips)
-                    for cand_ip in mitm_candidates:
-                        cand_subnet = subnet_from_ip(cand_ip)
-                        if cand_ip in flow_ips or any(subnet_from_ip(ip2) == cand_subnet for ip2 in flow_ips):
-                            related_writes.append(f)
-                            break
-                for cand_ip in mitm_candidates:
-                    macs = sorted(ip_to_macs_full[cand_ip])
-                    vendors = {lookup_oui_vendor(m) for m in macs if lookup_oui_vendor(m)}
-                    same_vendor = len(vendors) == 1 and next(iter(vendors), "")
-                    chain_evidence: List[str] = [
-                        f"Spoofed IP: {cand_ip}",
-                        f"Claimant MACs: {_macs_with_vendors(macs)}",
-                    ]
-                    _mitm_window = _arp_window_evidence(ip=cand_ip)
-                    if _mitm_window:
-                        chain_evidence.append(_mitm_window)
-                    if same_vendor:
-                        chain_evidence.append(
-                            f"Both MACs share vendor '{same_vendor}' — strong indicator of an attacker "
-                            "VM/host rather than legitimate HA/failover."
-                        )
-                    chain_evidence.append(
-                        f"ARP sender/Ethernet source mismatch also seen for {cand_ip} "
-                        "(see 'ARP sender MAC differs from Ethernet source MAC' finding)."
-                    )
-                    if related_writes:
-                        chain_evidence.append(
-                            f"{len(related_writes)} subsequent OT-write finding(s) overlap with "
-                            f"the spoofed subnet {subnet_from_ip(cand_ip)}:"
-                        )
-                        for f in related_writes[:6]:
-                            chain_evidence.append(
-                                f"  • [{f.severity}] {f.title} — "
-                                f"{','.join(f.source_ips[:2])} → {','.join(f.destination_ips[:2])}"
-                            )
-                    sev = SEVERITY_INTRUSION if related_writes else SEVERITY_CRITICAL
-                    title_suffix = " with subsequent OT writes" if related_writes else ""
-                    self.add_finding(
-                        sev,
-                        "Network Hygiene and Segmentation",
-                        f"ARP-based Adversary-in-the-Middle attack pattern detected{title_suffix}",
-                        f"Multiple independent ARP-spoofing signals converged on {cand_ip}: "
-                        "(a) the IP is claimed by two or more distinct MAC addresses, AND "
-                        "(b) at least one ARP frame's sender-MAC field disagrees with the Ethernet "
-                        "source-MAC field. This is the textbook signature of an active ARP cache "
-                        "poisoning / Adversary-in-the-Middle attack — an attacker on the same "
-                        "broadcast domain is impersonating a legitimate host to intercept and "
-                        "potentially modify traffic between two endpoints. "
-                        + ("Subsequent OT write/control operations were observed in the same subnet, "
-                           "indicating the attacker may have used the MITM position to actively "
-                           "manipulate process state. Treat as an active intrusion." if related_writes
-                           else "No write/control operations were correlated yet, but the attack "
-                           "position is confirmed. Investigate immediately."),
-                        chain_evidence,
-                        [cand_ip],
-                        sorted({ip2 for f in related_writes for ip2 in (f.source_ips + f.destination_ips)})[:10],
-                        "ARP",
-                        hygiene_pcap_names,
-                        f"intrusion::mitm-arp::{cand_ip}",
-                        tags=["arp_spoof", "mitm", "intrusion", "boundary"],
-                    )
-
-            # 5) Replies with no matching request (noisy; only cap-limited list emitted)
-            reply_only_by_mac: Counter[str] = Counter()
-            for pn, mac, sip, dip in _hyg.get("arp_reply_no_request", []):
-                reply_only_by_mac[mac] += 1
-            for mac, count in reply_only_by_mac.items():
-                if count >= 5 and mac:
-                    self.add_finding(
-                        SEVERITY_MEDIUM,
-                        "Network Hygiene and Segmentation",
-                        "ARP replies without matching requests",
-                        f"MAC {mac} issued {count} unsolicited ARP replies. "
-                        "These can indicate ARP spoofing, though some HA setups also do this.",
-                        [f"Unsolicited ARP replies: {count}"],
-                        [],
-                        [],
-                        "ARP",
-                        hygiene_pcap_names,
-                        f"arp::unsolicited-reply::{mac}",
-                        tags=["arp_spoof"],
-                    )
+            self._emit_arp_findings(_hyg, arp_verdicts, hygiene_pcap_names, _mac_with_vendor, _arp_window_evidence)
         # VLAN anomaly checks using VLAN IDs captured during inventory
         ot_vlans: set[str] = set()
         it_vlans: set[str] = set()
@@ -4901,6 +5375,33 @@ class OTPcapAnalyzer:
                     f"{source_ip} connected to MQTT without credentials and used control-oriented topics, which materially raises risk.",
                     [f"Anonymous MQTT indicators: {tag_counts['anonymous_mqtt']} | Control-topic indicators: {tag_counts['control_topic']}"],
                     [source_ip], [], "MQTT", pcap_names, f"intrusion::mqtt-anon-control::{source_ip}", tags=["intrusion"])
+        # Denial of service: two or more different availability indicators
+        # (failed or aborted connections, hammer-rate or bursting requests)
+        # between the same client and server.
+        dos_tags = {"tcp_anomaly", "polling_pattern", "timing_anomaly"}
+        dos_by_pair: Dict[Tuple[str, str], List[Finding]] = defaultdict(list)
+        for finding in self.session.findings:
+            if not dos_tags.intersection(finding.tags):
+                continue
+            for end_a in finding.source_ips[:5]:
+                for end_b in finding.destination_ips[:5]:
+                    dos_by_pair[(min(end_a, end_b), max(end_a, end_b))].append(finding)
+        for (end_a, end_b), related in sorted(dos_by_pair.items()):
+            if len({f.title for f in related}) < 2:
+                continue
+            initiators = Counter(f.source_ips[0] for f in related if f.source_ips and "reset storm" not in f.title.lower())
+            attacker = initiators.most_common(1)[0][0] if initiators else end_a
+            target = end_b if attacker == end_a else end_a
+            self.add_finding(
+                SEVERITY_CORRELATION, "Intrusion Indicators", "Possible denial-of-service against an OT device",
+                f"{attacker} directed several availability-affecting patterns at {target}: "
+                f"{'; '.join(sorted({f.title for f in related}))}. Together they match a request flood or "
+                "connection-exhaustion attack — a controller that runs out of connections or CPU stops answering "
+                "its HMIs.",
+                [f"[{f.severity}] {f.title}: {lead_sentences(f.description, 1)}" for f in related[:6]],
+                [attacker], [target], "Correlation", pcap_names,
+                f"correlation::dos::{attacker}::{target}", tags=["correlation", "dos"],
+            )
         threshold = self.config.get("write_burst_count", DEFAULT_WRITE_BURST_COUNT)
         for source_ip, targets in write_targets_by_source.items():
             if len(targets) >= threshold and source_ip.lower() not in known_hmis:
@@ -5021,7 +5522,7 @@ class OTPcapAnalyzer:
         # classification happens Python-side in the AV dispatch block).
         "(udp && ip.dst == 224.0.0.0/4) || "
         "(udp.srcport >= 16384 && udp.dstport >= 16384 && frame.len >= 200) || "
-        "tcp.flags.reset==1 || tcp.flags.syn==1"
+        "tcp.flags.reset==1 || tcp.flags.syn==1 || tcp.flags.fin==1"
     )
 
     def _run_streaming_protocol_checks(self, pcaps: Sequence[Path]) -> None:
@@ -5050,9 +5551,15 @@ class OTPcapAnalyzer:
             # hammering hits one address at a high rate.
             "read_starts": defaultdict(Counter),
             "read_span": {},
-            # Outstanding requests: (pair, client port, transaction id) ->
-            # [func, ref, TCP sequence of the first response or None].
-            "pending": {},
+            # Per connection (pair, client port): the queue of unanswered
+            # requests [(func, ref)], recent request transaction IDs, decoded
+            # request count, and recent segment sequence numbers per direction
+            # (TCP retransmissions are skipped).  Servers answer a connection's
+            # requests in order, so answers pop the queue; an answer with an
+            # empty queue is extra.  tshark is read with occurrence=f, so a
+            # segment carrying several PDUs is counted from the "modbus" layers
+            # in frame.protocols (one per PDU).
+            "conns": {},
             "first_seen": {},
             "responses": Counter(),
             "duplicate_responses": Counter(),
@@ -5174,6 +5681,16 @@ class OTPcapAnalyzer:
         # network_hygiene TCP state (RST / SYN anomalies) + ARP anomalies
         hyg: Dict[str, Any] = {
             "rst_counts": Counter(), "syn_counts": Counter(), "synack_counts": Counter(), "pcap_names": set(),
+            # RSTs that follow a FIN on the same connection are routine teardown.
+            "fin_seen": set(), "rst_after_fin": Counter(),
+            # ARP identity claims: (ip, mac) -> frames / replies / unsolicited
+            # replies, first/last time, the Ethernet senders of those frames,
+            # and the hosts whose caches the replies targeted.
+            "arp_claims": {},
+            # Which MAC actually carried each IP's traffic: (ip, mac) ->
+            # [frames sent as ip, frames addressed to ip, first, last].  Peers,
+            # protocols and sample frames are kept once an IP shows 2+ MACs.
+            "ip_mac": {}, "ip_first_mac": {}, "ip_mac_conflicts": set(), "ip_mac_detail": {},
             # ARP spoof detection state
             "gratuitous_arp_by_src": Counter(),       # count per sender MAC
             "mac_to_ips":  defaultdict(set),          # MAC -> {IPs it claimed}
@@ -5275,24 +5792,50 @@ class OTPcapAnalyzer:
                         mb["rows_seen"] = True
                         mb["pcap_names"].add(pn)
                         func = _int_field(row, "modbus.func_code")
+                        pair_mb = (client, server)
+                        conn_mb = (pair_mb, sport if to_server else dport)
+                        state = mb["conns"].get(conn_mb)
+                        if state is None:
+                            if len(mb["conns"]) > 100_000:
+                                mb["conns"].clear()
+                            state = mb["conns"][conn_mb] = {
+                                "queue": [], "tids": [], "requests": 0, "undecoded": 0, "seqs": {True: [], False: []}}
+                        if to_server and not ("modbus" in fp and func >= 0):
+                            # Request bytes tshark did not decode as Modbus — a TCP
+                            # retransmission, or the segment after capture loss.  Their
+                            # answers are not extra, so they earn answer credits.
+                            state["undecoded"] = min(64, state["undecoded"] + max(1, _int_field(row, "tcp.len", 0) // 12))
                         if "modbus" in fp and func >= 0:
-                            pair_mb = (client, server)
                             try:
                                 ts_mb = float(_ts_e or "0")
                             except ValueError:
                                 ts_mb = 0.0
                             mb["first_seen"].setdefault(pair_mb, ts_mb)
+                            pdus = max(1, fp_layers.count("modbus"), fp_layers.count("mbtcp"))
                             tid = _int_field(row, "mbtcp.trans_id")
+                            seq_mb = row.get("tcp.seq") or ""
+                            recent = state["seqs"][to_server]
+                            retransmission = bool(seq_mb) and seq_mb in recent
+                            if seq_mb and not retransmission:
+                                recent.append(seq_mb)
+                                del recent[:-16]
                             if func == 90:
                                 umas["rows_seen"] = True
                                 umas["pcap_names"].add(pn)
                                 umas["pairs"].add(pair_mb)
                                 if len(umas["samples"]) < 5:
                                     umas["samples"].append(ev)
-                            if to_server:
-                                if len(mb["timestamps"][pair_mb]) < 20000:
-                                    mb["timestamps"][pair_mb].append(ts_mb)
+                            if to_server and not retransmission:
                                 ref = _int_field(row, "modbus.reference_num")
+                                state["requests"] += pdus
+                                for index in range(pdus):
+                                    state["queue"].append((func, ref if index == 0 else -1))
+                                    if len(mb["timestamps"][pair_mb]) < 20000:
+                                        mb["timestamps"][pair_mb].append(ts_mb)
+                                del state["queue"][:-256]
+                                if tid >= 0:
+                                    state["tids"].append(tid)
+                                    del state["tids"][:-64]
                                 if func in MODBUS_READ_FUNCTIONS:
                                     mb["read_masters"].add(client)
                                     if ref >= 0:
@@ -5300,7 +5843,7 @@ class OTPcapAnalyzer:
                                         span = mb["read_span"].setdefault((pair_mb, ref), [ts_mb, ts_mb])
                                         span[1] = ts_mb
                                 if func in MODBUS_WRITE_FUNCTIONS:
-                                    mb["write_sources"][pair_mb] += 1
+                                    mb["write_sources"][pair_mb] += pdus
                                     self.add_finding(
                                         SEVERITY_HIGH, "Modbus TCP", "Modbus write operation observed",
                                         f"Modbus write requests were sent from {client} to {server}. Write-capable function codes should be validated as intentional.",
@@ -5316,37 +5859,54 @@ class OTPcapAnalyzer:
                                             [ev], [client], [server], "Modbus TCP", [pn],
                                             f"modbus::unit0::{client}::{server}", tags=["write", "modbus"],
                                         )
-                                if tid >= 0:
-                                    if len(mb["pending"]) >= 50_000:
-                                        # Answers arrive within milliseconds; drop the oldest requests.
-                                        for stale in list(mb["pending"])[:10_000]:
-                                            del mb["pending"][stale]
-                                    mb["pending"][(pair_mb, sport, tid)] = [func, ref, None]
-                            else:
-                                mb["responses"][pair_mb] += 1
+                            elif not to_server and not retransmission:
+                                mb["responses"][pair_mb] += pdus
                                 if row.get("modbus.exception_code"):
                                     mb["exception_counts"][server] += 1
-                                if tid >= 0:
-                                    entry = mb["pending"].get((pair_mb, dport, tid))
-                                    seq_mb = row.get("tcp.seq") or ""
-                                    if entry is None:
-                                        # Ignore replies to requests sent before the capture began.
-                                        if ts_mb - mb["first_seen"][pair_mb] > 2.0:
-                                            mb["unsolicited_responses"][pair_mb] += 1
-                                            if len(mb["response_samples"][pair_mb]) < 5:
-                                                mb["response_samples"][pair_mb].append(f"{ev} (no matching request)")
-                                    elif entry[2] is None:
-                                        entry[2] = seq_mb
+                                if not state["requests"]:
+                                    # Requests split into segments too small for tshark's
+                                    # Modbus dissector (some embedded clients send one byte
+                                    # per segment) never decode; the answers still show
+                                    # what was asked, so they are not "unsolicited".
+                                    if func in MODBUS_READ_FUNCTIONS:
+                                        mb["read_masters"].add(client)
+                                    if func in MODBUS_WRITE_FUNCTIONS:
+                                        mb["write_sources"][pair_mb] += pdus
+                                        self.add_finding(
+                                            SEVERITY_HIGH, "Modbus TCP", "Modbus write operation observed",
+                                            f"Modbus write requests were sent from {client} to {server}. Write-capable function codes should be validated as intentional.",
+                                            [f"{ev} (write confirmed by the server's answer; the request was split into TCP "
+                                             "segments too small for tshark to decode as Modbus)"],
+                                            [client], [server], "Modbus TCP", [pn],
+                                            f"modbus::write::{client}::{server}", tags=["write", "modbus"],
+                                            first_seen=_ts_e or None, last_seen=_ts_e or None,
+                                        )
+                                else:
+                                    matched = state["queue"][:pdus]
+                                    del state["queue"][:pdus]
+                                    if pdus == 1 and matched:
+                                        req_func, req_ref = matched[0]
                                         value = _int_field(row, "modbus.regval_uint16")
-                                        if entry[0] in (3, 4) and entry[1] >= 0 and value >= 0:
-                                            bucket_rv = mb["register_values"][(server, client, entry[1])]
+                                        if req_func in (3, 4) and req_ref >= 0 and value >= 0:
+                                            bucket_rv = mb["register_values"][(server, client, req_ref)]
                                             if len(bucket_rv) < 500:
                                                 bucket_rv.append((ts_mb, value))
-                                    elif not seq_mb or seq_mb != entry[2]:
-                                        # Same sequence number = TCP retransmission, not a second answer.
-                                        mb["duplicate_responses"][pair_mb] += 1
-                                        if len(mb["response_samples"][pair_mb]) < 5:
-                                            mb["response_samples"][pair_mb].append(f"{ev} (duplicate response, transaction {tid})")
+                                    extra = pdus - len(matched)
+                                    if extra > 0 and state["undecoded"]:
+                                        absorbed = min(extra, state["undecoded"])
+                                        state["undecoded"] -= absorbed
+                                        extra -= absorbed
+                                    if extra > 0:
+                                        if tid >= 0 and tid in state["tids"]:
+                                            mb["duplicate_responses"][pair_mb] += extra
+                                            if len(mb["response_samples"][pair_mb]) < 5:
+                                                mb["response_samples"][pair_mb].append(
+                                                    f"{ev} (second answer to an already answered transaction {tid})")
+                                        elif ts_mb - mb["first_seen"][pair_mb] > 2.0:
+                                            # Replies to requests sent before the capture began are ignored.
+                                            mb["unsolicited_responses"][pair_mb] += extra
+                                            if len(mb["response_samples"][pair_mb]) < 5:
+                                                mb["response_samples"][pair_mb].append(f"{ev} (no matching request)")
 
                     # ---- BACNET ------------------------------------------
                     if _l7 and (dport == 47808 or sport == 47808):
@@ -6263,13 +6823,57 @@ class OTPcapAnalyzer:
                     # ---- NETWORK HYGIENE (RST / SYN anomalies) -----------
                     pair = (src, dst)
                     tcp_bits = _tcp_flag_bits(row)
-                    if tcp_bits & 0x04:
-                        hyg["rst_counts"][pair] += 1
+                    if tcp_bits & 0x05:
+                        conn_key = (src, sport, dst, dport) if (src, sport) <= (dst, dport) else (dst, dport, src, sport)
+                        if tcp_bits & 0x01 and len(hyg["fin_seen"]) < 200_000:
+                            hyg["fin_seen"].add(conn_key)
+                        if tcp_bits & 0x04:
+                            if conn_key in hyg["fin_seen"]:
+                                hyg["rst_after_fin"][pair] += 1
+                            else:
+                                hyg["rst_counts"][pair] += 1
                     if tcp_bits & 0x12 == 0x02:
                         hyg["syn_counts"][pair] += 1
                     elif tcp_bits & 0x12 == 0x12:
                         hyg["synack_counts"][pair] += 1
                     hyg["pcap_names"].add(pn)
+
+                    # ---- WHICH MAC CARRIES EACH IP -------------------------
+                    eth_src_row = (row.get("eth.src") or "").lower()
+                    eth_dst_row = (row.get("eth.dst") or "").lower()
+                    if src and dst and eth_src_row:
+                        try:
+                            ts_bind = float(_ts_e or "0")
+                        except ValueError:
+                            ts_bind = 0.0
+                        for ip_key, mac_key, direction, peer in ((src, eth_src_row, 0, dst), (dst, eth_dst_row, 1, src)):
+                            if not mac_key or (direction and is_group_mac(mac_key)):
+                                continue
+                            first_mac = hyg["ip_first_mac"].get(ip_key)
+                            if first_mac is None:
+                                if len(hyg["ip_first_mac"]) < 300_000:
+                                    hyg["ip_first_mac"][ip_key] = mac_key
+                            elif first_mac != mac_key:
+                                hyg["ip_mac_conflicts"].add(ip_key)
+                            binding = hyg["ip_mac"].get((ip_key, mac_key))
+                            if binding is None:
+                                if len(hyg["ip_mac"]) >= 300_000:
+                                    continue
+                                binding = hyg["ip_mac"][(ip_key, mac_key)] = [0, 0, ts_bind, ts_bind]
+                            binding[direction] += 1
+                            if ts_bind:
+                                binding[2] = min(binding[2] or ts_bind, ts_bind)
+                                binding[3] = max(binding[3], ts_bind)
+                            if ip_key in hyg["ip_mac_conflicts"]:
+                                detail = hyg["ip_mac_detail"].setdefault(
+                                    (ip_key, mac_key), {"peers": Counter(), "labels": Counter(), "samples": {}})
+                                if len(detail["peers"]) < 8 or peer in detail["peers"]:
+                                    detail["peers"][peer] += 1
+                                label = row.get("_ws.col.Protocol") or "IP"
+                                if len(detail["labels"]) < 6 or label in detail["labels"]:
+                                    detail["labels"][label] += 1
+                                if label not in detail["samples"] and len(detail["samples"]) < 6:
+                                    detail["samples"][label] = f"{ev} (eth {eth_src_row} -> {eth_dst_row})"
 
                     # ---- ARP SPOOFING / MAC-IP BINDING -------------------
                     arp_op = row.get("arp.opcode", "")
@@ -6300,6 +6904,28 @@ class OTPcapAnalyzer:
                             hyg["mac_to_ips"][arp_src_mac].add(arp_src_ip)
                             hyg["ip_to_macs"][arp_src_ip].add(arp_src_mac)
                             hyg["arp_pcap_by_pair"][(arp_src_mac, arp_src_ip)].add(pn)
+                        claim = None
+                        if arp_src_mac and arp_src_ip and arp_src_ip != "0.0.0.0":
+                            claim = hyg["arp_claims"].get((arp_src_ip, arp_src_mac))
+                            if claim is None and len(hyg["arp_claims"]) < 100_000:
+                                claim = hyg["arp_claims"][(arp_src_ip, arp_src_mac)] = {
+                                    "frames": 0, "replies": 0, "unsolicited": 0,
+                                    "first": _arp_ts, "last": _arp_ts, "senders": {}, "targets": {},
+                                }
+                        if claim is not None:
+                            claim["frames"] += 1
+                            if _arp_ts:
+                                claim["first"] = min(claim["first"] or _arp_ts, _arp_ts)
+                                claim["last"] = max(claim["last"], _arp_ts)
+                            if eth_src_mac and (eth_src_mac in claim["senders"] or len(claim["senders"]) < 5):
+                                sender = claim["senders"].setdefault(eth_src_mac, [0, _arp_ts, _arp_ts])
+                                sender[0] += 1
+                                sender[2] = max(sender[2], _arp_ts)
+                            if arp_op == "2":
+                                claim["replies"] += 1
+                                target = (arp_dst_ip, (row.get("eth.dst") or "").lower())
+                                if arp_dst_ip and (target in claim["targets"] or len(claim["targets"]) < 10):
+                                    claim["targets"][target] = claim["targets"].get(target, 0) + 1
                         # Gratuitous ARP: reply (op=2) where sender IP == target IP,
                         # or request where sender IP == target IP (announcement).
                         if arp_src_ip and arp_dst_ip and arp_src_ip == arp_dst_ip:
@@ -6318,6 +6944,8 @@ class OTPcapAnalyzer:
                             # suspect (but gratuitous ARPs legitimately have none, so
                             # exclude sender==target case which we've already flagged).
                             if arp_src_ip != arp_dst_ip and not arp_requests_seen.get((arp_dst_ip, arp_src_ip)):
+                                if claim is not None:
+                                    claim["unsolicited"] += 1
                                 if len(hyg["arp_reply_no_request"]) < 50:
                                     hyg["arp_reply_no_request"].append(
                                         (pn, arp_src_mac, arp_src_ip, arp_dst_ip)
@@ -6344,9 +6972,16 @@ class OTPcapAnalyzer:
                     ["No tcp.port == 502 packets matched."], [], [], "Modbus TCP", pcap_name_list, "absence::modbus")
         else:
             for (src, dst), count in mb["write_sources"].items():
+                write_finding = self.finding_index.get(f"modbus::write::{src}::{dst}")
+                if write_finding is not None:
+                    write_finding.description = (
+                        f"{src} sent {count:,} Modbus write request(s) to {dst}. Write-capable function codes should "
+                        "be validated as intentional.")
                 if src not in mb["read_masters"]:
-                    self.add_finding(SEVERITY_CRITICAL, "Modbus TCP", "Unexpected Modbus write source",
-                        f"{src} issued Modbus write requests to {dst} without also appearing as a normal polling master.",
+                    self.add_finding(SEVERITY_HIGH, "Modbus TCP", "Unexpected Modbus write source",
+                        f"{src} sent {count} Modbus write request(s) to {dst} but never read from any Modbus server. "
+                        "Write-only clients exist (gateways or panels pushing setpoints), but an unknown host writing "
+                        "without polling is also how a process gets manipulated; confirm this host is an authorized writer.",
                         [f"Write requests: {count}"], [src], [dst], "Modbus TCP", sorted(mb["pcap_names"]),
                         f"modbus::unexpected-writer::{src}::{dst}", tags=["write", "unexpected_writer"])
             # Register scanning: many start addresses, each read once or twice.
@@ -7731,10 +8366,25 @@ class OTPcapAnalyzer:
             drivers.append((contribution, group[0], len(group)))
         score = sum(contribution for contribution, _, _ in drivers)
         drivers.sort(key=lambda item: item[0], reverse=True)
+        # A confirmed intrusion is never "low risk", however few findings
+        # surround it; CRITICAL and correlated findings set a lower floor.
+        band = risk_band(score)
+        band_reason = ""
+        floors = (
+            (SEVERITY_INTRUSION, "HIGH", "a confirmed intrusion finding is present"),
+            (SEVERITY_CORRELATION, "MODERATE", "a correlated attack-pattern finding is present"),
+            (SEVERITY_CRITICAL, "MODERATE", "a CRITICAL finding is present"),
+        )
+        for severity, floor, reason in floors:
+            scoring = any(f.severity == severity and f.category not in NON_SCORING_CATEGORIES
+                          for f in self.session.findings)
+            if scoring and RISK_BANDS.index(floor) > RISK_BANDS.index(band):
+                band, band_reason = floor, f"raised to {floor} because {reason}"
         summary = {
             "counts": dict(counts),
             "score": score,
-            "band": risk_band(score),
+            "band": band,
+            "band_reason": band_reason,
             "top_contributors": [
                 {
                     "severity": finding.severity,
@@ -8080,7 +8730,8 @@ class OTPcapAnalyzer:
 
         _top_conns = sorted(
             self.session.connections.values(),
-            key=lambda c: c.packet_count,
+            key=lambda c: (c.source_ip in self.session.devices and c.destination_ip in self.session.devices,
+                           c.packet_count),
             reverse=True,
         )
 
@@ -8360,17 +9011,19 @@ class OTPcapAnalyzer:
                 key=lambda f: SEVERITY_ORDER.get(f.severity, 0),
                 default=None,
             )
+            band_note = f"; {risk['band_reason']}" if risk.get("band_reason") else ""
             document.add_paragraph(
-                f"Risk Score: {risk['score']} ({risk['band']}).  "
+                f"Risk Score: {risk['score']} ({risk['band']}{band_note}).  "
                 f"Finding breakdown: {sev_line}."
             )
             if top_asset_text:
                 document.add_paragraph(f"Top affected assets: {top_asset_text}.")
             if highest_finding:
                 document.add_paragraph(
-                    f"The primary security concern in this capture is in the "
-                    f"{highest_finding.category} category.  The highest-severity finding is: "
-                    f"{highest_finding.title}.  "
+                    f"Highest-severity finding ({highest_finding.severity}, {highest_finding.category}): "
+                    f"{highest_finding.title}.  {lead_sentences(highest_finding.description, 3)}"
+                )
+                document.add_paragraph(
                     "Because OT traffic is highly context-dependent, the auditor should "
                     "validate asset roles, maintenance windows, and approved communications "
                     "with site personnel before concluding that any finding represents "
@@ -8389,17 +9042,18 @@ class OTPcapAnalyzer:
             actionable.sort(key=lambda f: SEVERITY_ORDER.get(f.severity, 0), reverse=True)
             if actionable:
                 document.add_paragraph("Immediate Next Steps:")
-                seen_titles: set = set()
+                seen_actions: Dict[str, List[str]] = {}
                 for f in actionable:
-                    if f.title in seen_titles:
+                    action = recommended_fix_for_finding(f)
+                    if action in seen_actions:
+                        if f.title not in seen_actions[action]:
+                            seen_actions[action].append(f.title)
                         continue
-                    seen_titles.add(f.title)
-                    if len(seen_titles) > 3:
-                        break
-                    document.add_paragraph(
-                        f"{f.title} — {recommended_fix_for_finding(f)}",
-                        style="List Bullet",
-                    )
+                    if len(seen_actions) >= 3:
+                        continue
+                    seen_actions[action] = [f.title]
+                for action, titles in seen_actions.items():
+                    document.add_paragraph(f"{'; '.join(titles)} — {action}", style="List Bullet")
             document.add_paragraph(
                 "Companion artifacts generated alongside this report: "
                 "JSON addendum (complete machine-readable findings), "
@@ -8695,7 +9349,8 @@ class OTPcapAnalyzer:
             total_devices = len(all_devices_sorted)
             document.add_paragraph(
                 f"Total observed devices: {total_devices:,}.  "
-                "Top 15 by traffic are shown below.  "
+                "Top 15 by traffic are shown below.  Broadcast and multicast destinations are not "
+                "devices; they are listed in the Network Interpretation Summary.  "
                 "The complete Device Inventory CSV (all devices, all fields) is written "
                 "alongside this report."
             )
@@ -8704,18 +9359,26 @@ class OTPcapAnalyzer:
                 item["ip"]: item["score"]
                 for item in self.compute_per_device_risk(top_n=50)
             }
-            dev_sum_table = document.add_table(rows=1, cols=5)
+            dev_sum_table = document.add_table(rows=1, cols=6)
             _style_table(dev_sum_table)
             dsh = dev_sum_table.rows[0].cells
-            for ci, h in enumerate(["IP", "Inferred Role", "Zone", "Protocols", "Risk Score"]):
+            for ci, h in enumerate(["IP", "MAC (vendor)", "Inferred Role", "Zone", "Protocols", "Risk Score"]):
                 dsh[ci].text = h
             for device in all_devices_sorted[:DEVICE_SUMMARY_CAP]:
                 dr = dev_sum_table.add_row().cells
-                dr[0].text = device.ip
-                dr[1].text = device.inferred_role or "—"
-                dr[2].text = device.inferred_zone or "—"
-                dr[3].text = ", ".join(device.protocols[:5]) or "—"
-                dr[4].text = str(device_risk_lookup.get(device.ip, 0))
+                dr[0].text = device.ip + (f" / {', '.join(device.ipv6_addresses[:1])}" if device.ipv6_addresses else "")
+                mac_parts = [f"{mac} ({lookup_oui_vendor(mac)})" if lookup_oui_vendor(mac) else mac
+                             for mac in device.macs[:2]]
+                dr[1].text = ("⚠ " if len(device.macs) > 1 else "") + ("; ".join(mac_parts) or "—")
+                dr[2].text = device.inferred_role or "—"
+                dr[3].text = device.inferred_zone or "—"
+                dr[4].text = ", ".join(device.protocols[:5]) or "—"
+                dr[5].text = str(device_risk_lookup.get(device.ip, 0))
+            observed = [(device.ip, note) for device in all_devices_sorted for note in device.evidence]
+            if observed:
+                document.add_paragraph("Device observations:")
+                for ip_text, note in observed[:20]:
+                    document.add_paragraph(f"{ip_text}: {note}", style="List Bullet")
 
             # ================================================================
             # 9. FLOW ALLOWLIST SUMMARY
@@ -8962,7 +9625,8 @@ class OTPcapAnalyzer:
                 f"Session: {self.session.name}",
                 f"Generated: {utc_now_iso()}",
                 "",
-                f"Overall Risk Score: {risk['score']} ({risk['band']})",
+                f"Overall Risk Score: {risk['score']} ({risk['band']})"
+                + (f" — {risk['band_reason']}" if risk.get("band_reason") else ""),
                 "",
                 "Correlation Summary:",
             ]
@@ -9134,6 +9798,7 @@ class OTPcapAnalyzer:
             "outgoing_pkts", "incoming_pkts", "total_pkts",
             "protocols", "ports", "vlans", "mac_addresses", "subnets",
             "source_pcaps", "is_critical_in_findings",
+            "client_ports", "ipv6_link_local", "observations",
         ])
         for d in all_devices:
             total_pkts = d.outgoing_count + d.incoming_count
@@ -9153,6 +9818,9 @@ class OTPcapAnalyzer:
                 "|".join(sorted(d.subnets)),
                 "|".join(sorted(d.source_pcaps)),
                 "yes" if d.ip in critical_ips else "no",
+                "|".join(str(p) for p in sorted(d.client_ports)),
+                "|".join(d.ipv6_addresses),
+                " | ".join(d.evidence),
             ])
         inventory_path.write_text(buf.getvalue(), encoding="utf-8")
         print(colorize(
@@ -9230,6 +9898,7 @@ class OTPcapAnalyzer:
         summary = self.compute_risk_summary()
         print_header("Risk Summary")
         print(colorize(risk_banner(summary["band"]), SEVERITY_CRITICAL if summary["band"] in {"HIGH", "SEVERE"} else SEVERITY_MEDIUM, bold=True))
+        print(f"    Score {summary['score']}" + (f" — band {summary['band_reason']}" if summary.get("band_reason") else ""))
         for item in summary["top_contributors"]:
             print(f"    - [{item['severity']}] {item['title']} (weight {item['weight']})")
         # Print top-5 riskiest devices for quick triage

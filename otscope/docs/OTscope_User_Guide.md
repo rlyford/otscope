@@ -4,7 +4,7 @@
 
 Interactive multi-pcap OT/ICS traffic analysis with session persistence, role inference, attack-chain correlation, MITRE ATT&CK for ICS mapping, Wireshark investigation guidance, Purdue-Model architecture diagrams, and machine-readable artifacts.
 
-> **Version 2.8.0**  ·  October 2026
+> **Version 2.8.1**  ·  October 2026
 > Authored by Ryan Lyford  ·  © 2026 Ryan Lyford. All rights reserved.
 
 ---
@@ -247,6 +247,7 @@ Always runs. One full tshark pass per pcap that builds the unified device and fl
 
 - **Flow direction.** Every flow is oriented client → server. The server side comes from the TCP handshake (SYN / SYN-ACK) when the capture contains it; otherwise from well-known service ports. A flow is recorded once as *client → server : service port* — the client's ephemeral port never becomes a "destination port", and a device's **ports** are the services it actually answered on (its **client ports** are the services it used).
 - **Truncated captures.** A capture that ends mid-packet or has a damaged record (common when a capture is stopped abruptly or copied while still being written) is analyzed up to the damage, flagged `truncated` in the JSON report, and noted on the console — it is not dropped.
+- **Hosts only.** Broadcast and multicast destinations (`x.x.x.255`, `255.255.255.255`, `224.0.0.0/4`, `ff00::/8`) are not devices; they are counted separately and listed in the report's Network Interpretation Summary. Hosts seen only in ARP — quiet devices, or an attacker poisoning caches from its own address — are added from their ARP frames. An IPv6 link-local address is folded into the IPv4 host that uses the same MAC, so one machine appears once.
 
 ### 6.2 Phase 2 — Streaming Protocol Pass
 
@@ -254,7 +255,7 @@ ONE combined tshark read per pcap with a single display filter that covers all p
 
 Detectors read structured tshark fields — function codes, transaction IDs, TLS handshake fields, SNMP community and PDU type, MQTT flags — rather than parsing the Info column. Fields an older tshark does not know are simply read as empty. Checks keyed on a port need application data: a refused connection (SYN answered by RST), a bare ACK, or an ICMP error quoting a probe does not count as that protocol's traffic. Command and write detectors only fire on requests travelling client → server, never on the device's reply.
 
-- Modbus TCP — write requests (by function code), Unit ID 0 broadcast writes, register-map sweeps (many start addresses read once or twice each), exceptions per server, polling bursts (one-second request rate far above the pair's own baseline), hammer-rate single-address polling (≥1,000 reads at ≥20/s), duplicate or unsolicited responses matched by transaction ID (TCP retransmissions excluded), register value anomaly, Schneider UMAS engineering traffic (function code 90), and Read Device Identification (MEI).
+- Modbus TCP — write requests (by function code), Unit ID 0 broadcast writes, register-map sweeps (many start addresses read once or twice each), exceptions per server, polling bursts (one-second request rate far above the pair's own baseline), hammer-rate single-address polling (≥1,000 reads at ≥20/s), duplicate or unsolicited responses (answers are matched to each connection's queue of outstanding requests; segments that carry several requests, TCP retransmissions, and request bytes tshark could not decode are all accounted for), register value anomaly, writes confirmed from the server's answer when a client's requests are split into segments too small for tshark to decode, Schneider UMAS engineering traffic (function code 90), and Read Device Identification (MEI).
 - BACnet/IP — Who-Is/I-Am, WriteProperty requests, BBMD/forwarded NPDU.
 - DNP3 — Direct Operate, Freeze, Disable Spontaneous, Cold/Warm Restart, broadcast (link-layer destination 0xFFFD–0xFFFF), no-Secure-Authentication (no SA function codes 32/33/131 seen).
 - IEC 61850 / GOOSE / MMS — control operations, GOOSE state-number anomalies, MMS without TLS. Requires the MMS dissector, so S7comm on TCP/102 is not mistaken for MMS.
@@ -280,8 +281,8 @@ Detectors read structured tshark fields — function codes, transaction IDs, TLS
 - IT noise on OT — mDNS / LLMNR / NetBIOS / SSDP / WS-Discovery from subnets that hold OT devices.
 - DHCP rogue server detection.
 - ICMP sweep / unreachable burst.
-- TCP RST bursts and repeated unanswered SYNs (SYN-ACK counts separate answered from unanswered).
-- ARP — gratuitous-burst, multi-IP-per-MAC, multi-MAC-per-IP, eth/ARP MAC mismatch, unsolicited replies.
+- TCP RST bursts (aborted connections only — RSTs that follow a normal FIN close are routine teardown) and repeated unanswered SYNs (SYN-ACK counts separate answered from unanswered).
+- ARP — for every IP claimed by more than one MAC, the analysis decides which MAC owns it and which is impersonating it (see §6.4); gratuitous-ARP bursts, one MAC claiming many IPs, frames sent on another host's behalf, and unsolicited replies are reported separately only when no impostor explains them.
 
 ### 6.3 Phase 3 — Per-Category Passes
 
@@ -295,7 +296,12 @@ Phase 2 covers the majority of detection. Three checks need their own pass: Clea
 - Recon-then-write — strong reconnaissance and write/control commands from the same source IP → CORRELATION finding. Only scans, sweeps, SNMP walks, and scanner tooling count as reconnaissance; routine discovery that engineering tools perform (IEC 104 general interrogation, CIP List Identity, S7 Read SZL, Modbus Read Device ID, OPC UA browsing, PROFINET Identify All) is tagged *discovery* and does not trigger it.
 - Possible OT protocol scanning — one source touching ≥3 OT protocol ports on ≥5 endpoints, at least half of them with ≤4 packets (broad and shallow, unlike a SCADA master's long-lived sessions) → INTRUSION.
 - Write/control commands sent to many devices — one source writing to at least `write_burst_count` devices (known HMIs exempt) → HIGH.
-- ARP-based Adversary-in-the-Middle — multi-MAC-per-IP + eth/ARP mismatch on the same IP, escalates to INTRUSION when subsequent OT writes are seen in the same subnet.
+- ARP-based Adversary-in-the-Middle — for each IP claimed by two or more MACs, every claimant is checked for spoofing signals: unsolicited ARP replies, claims sent from a different Ethernet source, ARP frames sent on behalf of another host (the "restore" step of MITM tools), and using a different address as its own. The MAC without signals is the owner; a MAC with them is the impostor. One finding per impostor names its MAC and own IP, the impersonated host, the hosts whose caches were poisoned, the attack window, and how much of the victim's traffic passed through the impostor:
+  - **INTRUSION — traffic intercepted** when the victim's packets were carried by the impostor's MAC.
+  - **INTRUSION — OT writes during poisoning** when write/control commands crossed the poisoned path during the window, even if this capture point did not see them pass through the impostor.
+  - **CRITICAL** when the poisoning is clear but no intercepted traffic is visible from this capture point.
+  - An IP claimed by two MACs with no spoofing signals (VRRP/HSRP failover, NIC teaming, a duplicate address) stays a HIGH "IP address claimed by multiple MACs in ARP" finding.
+- Possible denial-of-service — two or more different availability indicators (unanswered SYNs, aborted connections, hammer-rate or bursting requests) between the same client and server → CORRELATION.
 - Anonymous MQTT plus control topics from the same source → CRITICAL.
 
 ### 6.5 Phase 5 — Risk Scoring
@@ -307,7 +313,7 @@ Weights:  INTRUSION 20 · CORRELATION 15 · CRITICAL 10 · HIGH 5 · MEDIUM 2 ·
 Score  =  Σ over distinct (category, title)  of  the weights of its 3 heaviest findings
 ```
 
-INFO findings, Suggested Controls, and Assessor Notes score zero.
+INFO findings, Suggested Controls, and Assessor Notes score zero. A confirmed intrusion is never reported as low risk: any INTRUSION finding raises the band to at least HIGH, and any CRITICAL or CORRELATION finding to at least MODERATE. The report states when a band was raised and why.
 
 | Score Range | Risk Band |
 | --- | --- |
@@ -327,7 +333,7 @@ OTscope writes up to six report artifacts alongside the session file, named with
 | --- | --- |
 | Word report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.docx` — the human-readable deliverable. |
 | JSON report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.json` — machine-readable findings + devices + risk for SIEM/ticketing. |
-| Device Inventory CSV | `OT_Device_Inventory_<site>_<YYYYMMDD>.csv` — full device list with per-device traffic, role, vendor, OS, VLAN, source pcaps, `is_critical_in_findings` flag. |
+| Device Inventory CSV | `OT_Device_Inventory_<site>_<YYYYMMDD>.csv` — full device list with per-device traffic, role, vendor, OS, VLAN, source pcaps, `is_critical_in_findings` flag, plus `client_ports` (services the device used), `ipv6_link_local` (folded IPv6 addresses), and `observations` (e.g. "impersonated by MAC …", "ARP cache poisoned by …"). |
 | Flow Allowlist CSV | `OT_Flow_Allowlist_<site>_<YYYYMMDD>.csv` — observed (client, server, service port, protocol) tuples sorted by frequency, with a default ALLOW action column for asset-owner review. |
 | Purdue Summary SVG | `OTscope_Purdue_Summary_<site>_<YYYYMMDD>.svg` — visual layered diagram (always written). |
 | Purdue Detail SVG | `OTscope_Purdue_Detail_<site>_<YYYYMMDD>.svg` — per-device visual diagram (only for ≤50 devices). |
@@ -340,7 +346,7 @@ The Word report is designed as an **auditor workpaper** for IT-oriented cybersec
 
 1. **Cover Page** — site, assessor, session name, generation time, risk score, and tool credit.
 2. **Table of Contents** — right-click → *Update Field* after opening to populate it.
-3. **Executive Summary** — risk score and band, finding breakdown by severity, top affected assets, the primary concern, attack-chain indicators, immediate next steps, and the companion artifacts.
+3. **Executive Summary** — risk score and band (with the reason when a confirmed intrusion raised it), finding breakdown by severity, top affected assets, the highest-severity finding with its narrative, attack-chain indicators, up to three distinct immediate actions, and the companion artifacts.
 4. **Environment Discovery and Context** — the questionnaire answers the analysis used.
 5. **Priority Findings** — every category that produced a scoring finding, ordered by its top severity. HIGH and above (plus the first finding of each category) get full detail:
    - Auto-sequential finding ID (e.g. `MODBUS-001`, `DNP3-002`) for cross-referencing
@@ -355,9 +361,9 @@ The Word report is designed as an **auditor workpaper** for IT-oriented cybersec
    Lower-severity findings get a compact summary: assets, MITRE IDs, description, evidence, and action.
 6. **Suggested Controls** — defensive measures suggested by what the capture contained (for example, IDS signatures for exposed credentials). Recommendations, not findings; not scored.
 7. **Assessor Notes** — free-text notes recorded during the session.
-8. **Network Interpretation Summary** — plain-language paragraphs describing the observed architecture: likely initiators and controllers, IT discovery protocols on OT subnets, services on dynamic ports.
+8. **Network Interpretation Summary** — plain-language paragraphs describing the observed architecture: likely initiators and controllers, host observations (impersonated, impostor, poisoned), IPv6 addresses matched to their IPv4 hosts, broadcast and multicast destinations, IT discovery protocols on OT subnets, services on dynamic ports.
 9. **MITRE ATT&CK for ICS Coverage** — technique IDs (hyperlinked to attack.mitre.org), names, and finding counts.
-10. **Device Inventory Summary** — top 15 devices by traffic with role, zone, protocols, and risk score; the full list is in the Device Inventory CSV.
+10. **Device Inventory Summary** — top 15 devices by traffic with MAC and vendor (⚠ marks an IP seen with more than one MAC), role, zone, protocols, and risk score, followed by any per-device observations; the full list is in the Device Inventory CSV.
 11. **Flow Allowlist Summary** — how to use the Flow Allowlist CSV for segmentation review.
 12. **Limitations of Analysis** — disclosures to carry into a formal audit.
 13. **Appendix A: Wireshark Investigation Guide** — the investigation guides that match the reported findings, grouped by category (see §8).
@@ -447,7 +453,7 @@ frame.time_epoch == 1745801234.567
 
 ### 8.2 Session-Aggregated Findings — Observation Window
 
-Findings built from session-level state (ARP spoof, public-IP, VLAN crossings) include an "Observation window" evidence line with two epochs to bracket the activity:
+Findings built from session-level state (ARP conflicts, public-IP, VLAN crossings) include an "Observation window" evidence line with two epochs to bracket the activity. The Adversary-in-the-Middle finding gives an "Attack window" line instead — the impostor's own activity, in UTC and as a Wireshark filter — and sets the finding's first/last-seen times to it:
 
 ```text
 Observation window: first seen @1745801234.567890, last seen @1745801999.123456
@@ -572,7 +578,8 @@ When the Word report opens, work top-down for fastest triage:
 - Baseline behavior is not auto-learned — you must capture a known-good run with `--save-baseline`.
 - Vendor names come from Wireshark's manufacturer database (`tshark -G manuf`, read offline, including /28 and /36 assignments). If that lookup fails, a small built-in table of industrial and IT vendors is the fallback.
 - Flow direction comes from the TCP handshake. For connections already open when the capture started (and for UDP), OTscope uses well-known service ports; when neither port is recognized the lower port is taken as the service.
-- Replay detection compares Modbus transaction IDs. A verbatim copy of an old frame (same TCP sequence number) is indistinguishable from a TCP retransmission and is not counted, and responses whose requests the capture dropped can look unsolicited.
+- Replay detection matches each Modbus answer to its connection's outstanding requests. A verbatim copy of an old frame (same TCP sequence number) is indistinguishable from a TCP retransmission and is not counted, and answers to requests the capture lost entirely can look unsolicited.
+- Interception is only visible on the part of the path the capture sees. A SPAN of the controller's switch port shows the impostor's frames to and from the controller, but not the attacker's leg to the HMI, so altered values on that leg cannot be compared with the originals.
 - Passive OS fingerprinting is heuristic (TCP SYN TTL + window) — accurate for Windows / Linux / BSD / IoT-class but not deterministic.
 - Public-IP RDAP/PTR enrichment is best-effort and skipped entirely under `--offline`. Reports under offline mode omit the "owner / network / country" fields on public IP findings.
 - Purdue Detail SVG is only emitted for ≤50 devices. Above that threshold the Summary SVG plus the Device Inventory CSV cover the picture.
@@ -584,6 +591,23 @@ When the Word report opens, work top-down for fastest triage:
 ## 14. Version History
 
 Running log of capabilities added in each release. Newest at the top.
+
+### Version 2.8.1 · October 2026
+
+Report accuracy release, driven by a review of the reports for a real one-minute ARP MITM capture (a one-hour Modbus capture taken at the PLC's switch port) and a Modbus flooding capture.
+
+- **Adversary-in-the-Middle findings name the attacker.** The ARP analysis now decides, for every IP claimed by more than one MAC, which MAC owns it and which is impersonating it, and emits one consolidated finding per impostor under Intrusion Indicators. It gives the impostor's MAC and own IP, the impersonated host, the poisoned hosts, the attack window (UTC and Wireshark filter), how much of the victim's traffic passed through the impostor, and any restore frames. Before, the finding listed the victim as the source, used a one-hour window, and claimed "subsequent OT writes" from unrelated Modbus findings. The separate "claimed by multiple MACs", "multiple MAC addresses", "ARP sender MAC differs", and "unsolicited ARP replies" findings are folded into it. It no longer requires an Ethernet/ARP mismatch to fire.
+- **False positives removed** (found on the real captures):
+  - "Duplicate or unsolicited Modbus responses" for clients that pack several requests into one TCP segment or reuse transaction ID 0, for clients whose requests are split one byte per segment, and for requests lost by the capture and then retransmitted.
+  - "TCP reset storm" for RSTs that follow a normal FIN close.
+  - "Unknown OT-adjacent traffic" for the Sentinel license manager (UDP 1947).
+- **Writes no longer missed** when a client's requests are too fragmented for tshark's Modbus dissector — the server's answer confirms them.
+- **Denial-of-service correlation** — two or more availability indicators between one client and one server produce a CORRELATION "Possible denial-of-service against an OT device" finding.
+- **Device inventory holds hosts only.** Broadcast and multicast destinations are listed in the Network Interpretation Summary instead of as devices; hosts seen only in ARP (such as an attacker's own address) are added; IPv6 link-local addresses fold into the IPv4 host with the same MAC. The Device Inventory CSV gains `client_ports`, `ipv6_link_local`, and `observations` columns; IPv6 subnets are written as valid prefixes; DHCPv6 flows are oriented correctly.
+- **Report text matches each finding.** Explanatory text (why it matters, OT significance, auditor guidance, benign explanation, recommended action) now comes from one classifier keyed on finding titles and tags. Since the 2.8.0 category rename it had matched "segmentation" in the category name, giving ARP, IPv6, and ICMP findings firewall/DMZ advice. Evidence lines keep the order detectors write them in instead of being sorted alphabetically.
+- **Risk band floors** — any INTRUSION finding sets the band to at least HIGH; CRITICAL or CORRELATION to at least MODERATE; the report says when and why.
+- **Executive summary** leads with the highest-severity finding's narrative; immediate next steps list distinct actions. The Device Inventory Summary shows MACs and vendors with a conflict marker and per-device observations. The Purdue Detail diagram lists host-to-host flows first. IPv6 findings are LOW when only link-local traffic is seen and name the IPv4 host behind each address.
+- **Regression suite** — 14 scenarios: new `attack_mitm_intercept` (modeled on the real capture) and the ARP MITM check updated for the consolidated finding; the DNP3 sample is found in `otscope/src/pcaps/`.
 
 ### Version 2.8.0 · October 2026
 
