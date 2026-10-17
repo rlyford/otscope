@@ -57,6 +57,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from xml.sax.saxutils import escape as _xml_escape
 
 # On Windows, piped/redirected stdout falls back to the legacy code page
 # (cp1252), which cannot encode characters like "✓" and aborts the run
@@ -70,7 +71,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 
 TOOL_NAME = "OTscope"
-VERSION = "2.7.0"
+VERSION = "2.8.0"
 __author__ = "Ryan Lyford"
 __copyright__ = "© 2026 Ryan Lyford. All rights reserved."
 
@@ -153,13 +154,14 @@ ANSI_GREEN = "\033[32m"
 ANSI_BRIGHT_RED = "\033[91m"
 ANSI_GREY = "\033[90m"
 
+# OT service ports.  Membership makes a device "OT-adjacent", so only ports
+# that are specific to industrial protocols belong here — SNMP, RTSP and
+# WS-Discovery are everywhere on IT networks and are deliberately excluded.
 KNOWN_OT_PORTS = {
     102: "IEC 61850 MMS / S7comm",
     502: "Modbus TCP",
-    554: "RTSP",
-    161: "SNMP",
-    3702: "ONVIF WS-Discovery",
     1883: "MQTT",
+    8883: "MQTT over TLS",
     2404: "IEC 60870-5-104",
     20000: "DNP3",
     2222: "EtherNet/IP I/O",
@@ -171,44 +173,72 @@ KNOWN_OT_PORTS = {
     34963: "PROFINET DCP",
     34964: "PROFINET DCP",
     3956: "GigE Vision GVCP",
+    9600: "Omron FINS",
+    18245: "GE SRTP",
+    5007: "Mitsubishi MELSEC",
+    5450: "OSIsoft PI Data Archive",
+    5457: "OSIsoft PI AF Server",
+    62541: "Ignition OPC UA server",
+    8060: "Ignition gateway network",
+    1880: "Node-RED",
 }
 
+# Ports whose server side is a field device (PLC / RTU / IED) rather than an
+# OT server, broker, or historian.  Used for role inference.
+CONTROLLER_PORTS = {102, 502, 2222, 2404, 20000, 44818, 47808, 34962, 34963, 34964, 9600, 18245, 5007}
+
 # 1935 RTMP, 5060/5061 SIP, 8000 Hikvision DVR / HTTP-alt, 37777 Dahua DVR —
-# A/V endpoints are IT-class gear, not OT devices.
-IT_PORTS = {21, 23, 53, 69, 80, 88, 123, 135, 137, 138, 139, 161, 389, 443, 445, 512, 513, 554, 636, 1935, 3389, 5060, 5061, 5900, 8000, 8080, 8554, 37777}
+# A/V endpoints are IT-class gear, not OT devices.  NTP and SNMP are neutral
+# infrastructure (OT devices use them too), so they are not IT indicators.
+IT_PORTS = {21, 23, 53, 69, 80, 88, 135, 137, 138, 139, 389, 443, 445, 512, 513, 554, 636, 1935, 3389, 5060, 5061, 5900, 8000, 8080, 8554, 37777}
+
+# Windows / Active Directory services.  An OT host serving these is a classic
+# IT/OT bridge (and ransomware pivot), unlike a PLC serving its own web UI.
+IT_INDICATOR_PORTS = {88, 135, 139, 389, 445, 636, 3389, 5985, 5986}
+
+# Well-known service ports used to decide which end of a flow is the server
+# when the capture missed the TCP handshake.
+_SERVICE_PORT_HINTS = set(KNOWN_OT_PORTS) | IT_PORTS | IT_INDICATOR_PORTS | {
+    22, 25, 110, 123, 143, 161, 162, 465, 514, 587, 993, 995, 1433, 1521, 1900,
+    3306, 3702, 5353, 5355, 5432, 5683, 5684, 8443,
+}
+
+# Periodic-by-design traffic that must never be scored as C2 beaconing.
+_BEACON_EXEMPT_PORTS = {53, 123, 137, 138, 161, 162, 514, 1900, 3702, 5353, 5355}
+
+CAPTURE_SUFFIXES = (".pcap", ".pcapng", ".cap", ".pcap.gz", ".pcapng.gz", ".cap.gz")
+
+MODBUS_READ_FUNCTIONS = {1, 2, 3, 4, 20, 23}
+MODBUS_WRITE_FUNCTIONS = {5, 6, 15, 16, 21, 22, 23}
 
 # ------------------------------------------------------------------
-# OUI → vendor table.  Key is the first three octets of the MAC in
-# lower-case colon form ("00:1b:1b").  Values are short vendor
-# labels.  Mostly industrial/OT vendors plus a handful of common IT
-# ones so reports surface who-made-what without an external lookup.
-# This is deliberately small: the goal is triage triage value, not a
-# full IEEE OUI registry.
+# OUI → vendor fallback table.  Vendor names normally come from
+# Wireshark's IEEE-derived manufacturer database (`tshark -G manuf`,
+# read locally — no network access); this small table is only used
+# when that database is unavailable.  Keys are the first three octets
+# in lower-case colon form ("00:1b:1b"); every entry matches the IEEE
+# registry owner.
 # ------------------------------------------------------------------
 OUI_VENDOR_MAP: Dict[str, str] = {
     "00:1b:1b": "Siemens",
     "00:0e:8c": "Siemens",
     "00:1c:06": "Siemens",
     "00:1f:f8": "Siemens",
-    "00:0c:d3": "Siemens",
     "00:00:bc": "Rockwell/Allen-Bradley",
     "00:1d:9c": "Rockwell/Allen-Bradley",
-    "00:a0:ec": "Rockwell/Allen-Bradley",
-    "00:80:f4": "Schneider Electric",
+    "00:80:f4": "Schneider Electric (Telemecanique)",
     "00:00:54": "Schneider Electric",
     "00:80:63": "Hirschmann",
     "00:90:e8": "Moxa",
     "00:a0:45": "Phoenix Contact",
     "00:01:05": "Beckhoff",
     "00:24:59": "ABB",
-    "00:e0:c4": "GE",
-    "00:0d:8d": "GE Fanuc",
+    "00:e0:c4": "Horner Electric",
+    "00:0d:8d": "ProSoft Technology",
     "00:06:8c": "3Com",
     "00:40:9d": "DigiBoard",
-    "00:20:4a": "Pepperl+Fuchs",
-    "00:1e:c1": "Emerson",
     "00:04:9f": "Freescale/NXP",
-    "00:0f:73": "Yokogawa",
+    "00:0f:73": "RS Automation",
     "00:80:a3": "Lantronix",
     "00:1d:71": "Cisco",
     "00:1e:13": "Cisco",
@@ -218,88 +248,38 @@ OUI_VENDOR_MAP: Dict[str, str] = {
     "00:15:5d": "Microsoft Hyper-V",
     "b8:27:eb": "Raspberry Pi",
     "dc:a6:32": "Raspberry Pi",
-    "00:04:f3": "Honeywell",
-    "00:a0:91": "Yokogawa",
-    "00:50:c2": "IEEE Reg Auth",
     "00:1c:42": "Parallels",
-    "00:0a:dc": "Rad Data Communications",
-    "00:60:d5": "Mitsubishi Electric",
-    "00:21:47": "Omron",
+    "00:0a:dc": "RuggedCom (Siemens)",
     "00:00:0d": "Fibronics",
-    # ---- Expanded OT vendor coverage ----
     # Siemens additional blocks
-    "00:09:8e": "Siemens",
-    "00:0f:c8": "Siemens",
-    "00:1f:f7": "Siemens",
     "08:00:06": "Siemens",
-    "20:b7:c0": "Siemens",
     "28:63:36": "Siemens",
-    "00:1c:b3": "Siemens",
-    # Rockwell / Allen-Bradley additional
-    "00:1f:9c": "Rockwell/Allen-Bradley",
-    "00:24:51": "Rockwell/Allen-Bradley",
-    # Schneider Electric additional
-    "00:30:f6": "Schneider Electric",
-    "00:50:ba": "Schneider Electric",
-    # ABB additional
-    "00:0e:18": "ABB",
-    "00:1d:9f": "ABB",
+    # OMICRON (protection-relay test equipment)
+    "20:b7:c0": "OMICRON electronics",
     # Omron additional
     "00:00:0a": "Omron",
-    "00:18:42": "Omron",
     # Mitsubishi additional
     "08:00:70": "Mitsubishi Electric",
-    "00:50:8b": "Mitsubishi Electric",
-    # Honeywell additional
-    "00:0a:8a": "Honeywell",
-    "00:1a:9f": "Honeywell",
     # Yokogawa additional
     "00:00:64": "Yokogawa",
-    # Emerson / Fisher / Rosemount
-    "00:30:9d": "Emerson",
-    "00:e0:dc": "Emerson",
-    # Hirschmann additional
-    "00:11:a8": "Hirschmann",
-    # Moxa additional
-    "00:0e:c6": "Moxa",
-    "00:1f:e4": "Moxa",
     # Phoenix Contact additional
     "a8:74:1d": "Phoenix Contact",
-    # Beckhoff additional
-    "00:01:e8": "Beckhoff",
-    # GE / GE Fanuc additional
-    "00:09:75": "GE",
-    "00:1c:25": "GE",
     # Wago
     "00:30:de": "Wago",
     # B&R Automation
     "00:60:65": "B&R Automation",
-    # Pilz
-    "00:11:ed": "Pilz",
     # Sick AG
     "00:06:77": "Sick AG",
-    "00:11:b9": "Sick AG",
     # Pepperl+Fuchs additional
     "00:0d:81": "Pepperl+Fuchs",
-    # Bedrock Automation
-    "70:b3:d5": "Bedrock Automation",
-    # Stratus
-    "00:04:8f": "Stratus",
-    # Red Lion
-    "00:05:b6": "Red Lion Controls",
     # Opto22
     "00:a0:3d": "Opto22",
     # Schweitzer Engineering Labs (SEL)
     "00:30:a7": "Schweitzer Engineering Labs",
-    # Bently Nevada
-    "00:09:d4": "Bently Nevada",
-    # Triconex / Invensys
-    "00:09:60": "Triconex",
     # Endress+Hauser
     "00:07:05": "Endress+Hauser",
-    # KUKA / industrial robotics
-    "00:e0:7c": "KUKA",
-    "00:0c:bf": "KUKA",
+    # Mettler-Toledo (industrial weighing)
+    "00:e0:7c": "Mettler-Toledo",
     # ---- Expanded IT/network coverage ----
     "00:1f:6c": "Cisco",
     "00:21:1b": "Cisco",
@@ -310,7 +290,6 @@ OUI_VENDOR_MAP: Dict[str, str] = {
     "00:0c:30": "Cisco",
     "00:0c:31": "Cisco",
     "00:1a:6c": "Cisco-Linksys",
-    "00:1f:9d": "Aruba/HP",
     "00:24:6c": "Aruba/HP",
     "94:b4:0f": "Aruba/HP",
     "00:18:fe": "HP",
@@ -324,7 +303,6 @@ OUI_VENDOR_MAP: Dict[str, str] = {
     "00:11:95": "D-Link",
     "00:14:bf": "Linksys",
     "00:1d:7e": "Linksys",
-    "00:50:8d": "Abocom/Netgear",
     "00:1b:2f": "Netgear",
     "00:09:5b": "Netgear",
     "00:14:6c": "Netgear",
@@ -379,7 +357,6 @@ OUI_VENDOR_MAP: Dict[str, str] = {
     "00:24:dc": "Juniper",
     "2c:21:31": "Juniper",
     "00:90:fb": "Portwell",
-    "00:1d:fc": "KACO",
     # Hypervisors / containers
     "00:1c:14": "VMware",
     "00:50:56": "VMware",
@@ -465,12 +442,48 @@ SUSPICIOUS_SERVER_KEYWORDS: Dict[str, Tuple[str, str]] = {
 _OUI_TABLE_BUILD_SIG = b"UnlhbiBMeWZvcmQgwqkgMjAyNiAtLSBPVCBQQ0FQIEFuYWx5emVyIG9yaWdpbmFs"
 
 
+_MANUF_DB: Optional[Dict[str, str]] = None
+
+
+def _wireshark_manuf_db() -> Dict[str, str]:
+    """Load tshark's built-in manufacturer table once (local data, no network).
+
+    Keys are lower-case hex prefixes of 6, 7 or 9 digits (/24, /28, /36 blocks).
+    """
+    global _MANUF_DB
+    if _MANUF_DB is not None:
+        return _MANUF_DB
+    table: Dict[str, str] = {}
+    try:
+        result = subprocess.run(["tshark", "-G", "manuf"], capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=60)
+        for line in result.stdout.splitlines():
+            parts = [part.strip() for part in line.split("\t")]
+            if len(parts) < 2 or not parts[0]:
+                continue
+            prefix, _, bits_text = parts[0].partition("/")
+            digits = int(bits_text) // 4 if bits_text.isdigit() else 6
+            hex_prefix = prefix.replace(":", "").replace("-", "").lower()
+            if len(hex_prefix) < digits or hex_prefix[:6] == "000000":
+                continue
+            table[hex_prefix[:digits]] = parts[2] if len(parts) > 2 and parts[2] else parts[1]
+    except (OSError, subprocess.SubprocessError):
+        table = {}
+    _MANUF_DB = table
+    return table
+
+
 def lookup_oui_vendor(mac: str) -> str:
-    """Return a short vendor label for a MAC address, or ''."""
+    """Return the IEEE-registered vendor for a MAC address, or ''."""
     if not mac or len(mac) < 8:
         return ""
-    prefix = mac[:8].lower()
-    return OUI_VENDOR_MAP.get(prefix, "")
+    hex_mac = mac.replace(":", "").replace("-", "").lower()
+    manuf = _wireshark_manuf_db()
+    for digits in (9, 7, 6):
+        name = manuf.get(hex_mac[:digits])
+        if name:
+            return name
+    return OUI_VENDOR_MAP.get(mac[:8].lower(), "")
 
 
 def passive_os_from_syn(ttl: int, window: int) -> str:
@@ -562,17 +575,16 @@ CHECK_ORDER: List[Tuple[str, str, str]] = [
 # against (category, title) concatenated.
 MITRE_ICS_MAP: List[Tuple[Tuple[str, ...], List[str]]] = [
     # --- Discovery / recon (TA0102)
-    (("who-is", "broadcast storm"),            ["T0842"]),                 # Network Sniffing proxy; storm is discovery-adjacent
+    (("who-is", "broadcast storm"),            ["T0846"]),                 # Remote System Discovery
     (("bacnet", "broadcast"),                  ["T0840"]),                 # Network Connection Enumeration
     (("list identity",),                       ["T0846"]),                 # Remote System Discovery
     (("read szl",),                            ["T0888", "T0846"]),        # Remote System Information Discovery
     (("identify all",),                        ["T0846"]),
     (("possible opc-ua reconnaissance",),      ["T0846"]),
     (("possible modbus register scanning",),   ["T0846"]),
-    (("possible ot protocol scanning",),       ["T0846", "T0841"]),
+    (("possible ot protocol scanning",),       ["T0846", "T0840"]),        # Remote System Discovery / Network Connection Enumeration
     (("general interrogation",),               ["T0846"]),
-    # --- Initial access / lateral movement
-    (("it-to-ot lateral movement",),           ["T0859"]),                 # Valid Accounts (lateral)
+    # --- Correlations
     (("recon-then-write pattern",),            ["T0846", "T0831"]),
     # --- Impair process control / impact (TA0105/TA0106)
     (("modbus write",),                        ["T0831", "T0855"]),
@@ -595,36 +607,32 @@ MITRE_ICS_MAP: List[Tuple[Tuple[str, ...], List[str]]] = [
     (("arp spoof", "arp reply without request", "gratuitous arp"),
                                                ["T0830"]),                 # Adversary-in-the-Middle
     (("multiple mac addresses",),              ["T0830"]),
-    (("goose state-number anomaly",),          ["T0858"]),                 # Manipulate I/O Image (replay-class)
+    (("goose state-number anomaly",),          ["T0856", "T0855"]),        # Spoof Reporting Message / Unauthorized Command Message
     # --- Cleartext / weak security
-    (("without tls", "cleartext", "no-tls"),   ["T0887"]),                 # Wireless Sniffing proxy for weak-channel
-    (("mqtt connection with no authentication",),
-                                               ["T0812", "T0859"]),        # Default Credentials / Valid Accounts
-    (("security mode none", "securitymode none"),
-                                               ["T0859"]),
+    (("without tls", "cleartext", "no-tls"),   ["T0842"]),                 # Network Sniffing
+    (("mqtt connection without credentials",), ["T0812", "T0859"]),        # Default Credentials / Valid Accounts
+    (("securitypolicy none", "securitymode none", "security mode none"),
+                                               ["T0842", "T0855"]),        # Network Sniffing / Unauthorized Command Message
     (("http basic authentication exposed",),   ["T0812"]),
     (("telnet observed", "ftp observed", "rsh",),
                                                ["T0812", "T0859"]),
     (("snmpv1", "snmpv2"),                     ["T0842"]),
     # --- Boundary / exposure
-    (("public ip",),                           ["T0884"]),                 # Connection Proxy
-    (("ot and it devices sharing",),           ["T0884"]),
-    (("direct ot-to-it communication",),       ["T0884"]),
-    # --- Baseline diff
-    (("new device since baseline",),           ["T0886"]),                 # Remote Services (new asset on wire)
-    (("new flow since baseline",),             ["T0886"]),
-    (("new protocol since baseline",),         ["T0886"]),
+    (("public ip",),                           ["T0883"]),                 # Internet Accessible Device
+    (("ot and it devices sharing",),           ["T0886"]),                 # Remote Services (flat-network lateral path)
+    (("direct ot-to-it communication",),       ["T0886"]),
+    (("dual-zone",),                           ["T0886"]),
     # ---- Tier-1 expansion ----
     (("ja3", "offensive tool tls fingerprint", "cobalt strike default",
       "metasploit framework", "cobalt strike beacon"),
-                                               ["T0885", "T0886", "T0859"]),  # Commonly Used Port / Command and Control / Valid Accounts
+                                               ["T0869", "T0885"]),           # Standard Application Layer Protocol / Commonly Used Port (C2)
     (("high-entropy dns", "entropy dns query"),
-                                               ["T0884", "T0886"]),           # Connection Proxy / C2
+                                               ["T0869"]),                    # Standard Application Layer Protocol (DNS C2)
     (("http form", "http post credential", "cleartext credentials extracted (http form)"),
                                                ["T0812"]),                    # Default Credentials
     (("suspicious tool user-agent", "mimikatz", "metasploit", "cobalt strike",
       "empire", "havoc", "sliver"),
-                                               ["T0886", "T0859"]),
+                                               ["T0869"]),                    # Standard Application Layer Protocol (C2 tooling)
     (("sqlmap", "nikto", "nmap", "masscan", "zgrab", "openvas", "nessus", "burp"),
                                                ["T0846", "T0840"]),
     (("authentication failure burst", "bruteforce"),
@@ -635,12 +643,12 @@ MITRE_ICS_MAP: List[Tuple[Tuple[str, ...], List[str]]] = [
     (("ssdp",),                                ["T0840"]),
     (("multiple dhcp servers", "dhcp rogue"),  ["T0830"]),
     (("adversary-in-the-middle attack pattern", "mitm attack pattern"),
-                                               ["T0830", "T0831", "T0858"]),
-    (("identical modbus response with anomalous timing", "possible replay"),
-                                               ["T0858", "T0856"]),       # Manipulate I/O Image / Spoof Reporting Message
+                                               ["T0830", "T0831"]),
+    (("duplicate or unsolicited modbus responses", "possible replay"),
+                                               ["T0856", "T0832"]),       # Spoof Reporting Message / Manipulation of View
     (("repetitive single-register polling pattern",),
-                                               ["T0846"]),                # Remote System Discovery
-    (("dnp3 disable spontaneous messages",),   ["T0878", "T0816"]),       # Alarm Suppression / Device Restart
+                                               ["T0814"]),                # Denial of Service (hammer-rate polling)
+    (("dnp3 disable spontaneous messages",),   ["T0878"]),                # Alarm Suppression
     (("dnp3 cold restart command", "dnp3 warm restart command"),
                                                ["T0816", "T0828"]),       # Device Restart/Shutdown / Loss of Productivity
     (("icmp sweep", "host-discovery"),         ["T0840", "T0846"]),
@@ -649,151 +657,133 @@ MITRE_ICS_MAP: List[Tuple[Tuple[str, ...], List[str]]] = [
     (("omron fins", "fins write", "fins control"),
                                                ["T0831", "T0856"]),        # Manipulate Controller / Spoof Reporting
     (("ge srtp", "ge-srtp write"),             ["T0831"]),                 # Manipulate Controller
-    (("schneider umas", "umas write"),         ["T0831", "T0836"]),        # Manipulate Controller / Modify Parameter
+    (("schneider umas",),                      ["T0886"]),                 # Remote Services (engineering protocol)
     (("mitsubishi melsec", "melsec write"),    ["T0831"]),                 # Manipulate Controller
     (("osisoft pi", "pi server historian"),    ["T0882", "T0856"]),        # Theft of Operational Information / Spoof
-    (("ignition gateway",),                    ["T0887"]),                 # Wireless Sniffing proxy for weak-channel
+    (("ignition gateway",),                    ["T0842"]),                 # Network Sniffing
     (("node-red", "flow deployment"),          ["T0843", "T0831"]),        # Program Download / Manipulate Controller
-    (("modbus register value anomaly",),       ["T0856", "T0858"]),        # Spoof Reporting Message / Manipulate I/O
+    (("modbus register value anomaly",),       ["T0856", "T0832"]),        # Spoof Reporting Message / Manipulation of View
+    (("ws-discovery",),                        ["T0840"]),
+    (("read device id",),                      ["T0888"]),                 # Remote System Information Discovery
+    (("write/control commands sent to many devices",),
+                                               ["T0855"]),                 # Unauthorized Command Message
+    (("beaconing pattern",),                   ["T0869"]),                 # Standard Application Layer Protocol
+    (("cleartext credentials extracted", "embedded credential string"),
+                                               ["T0859"]),                 # Valid Accounts
+    (("signed but not encrypted",),            ["T0842"]),                 # Network Sniffing
 ]
 
 
 # ----------------------------------------------------------------------
-# Advisory / CVE reference mapping
+# Advisory / standards reference mapping
 # ----------------------------------------------------------------------
-# Generic advisory references (CISA ICS-CERT, vendor PSIRT, NIST guides)
-# applicable to categories of finding.  Pure CVE numbers require version
-# information we don't have from a pcap alone, so this maps to advisory
-# bundles the asset owner should check against their actual firmware.
+# Standards and advisory sources relevant to each finding family.  Specific
+# CVE / ICSA numbers need product and firmware versions that a pcap cannot
+# supply, so findings cite the standard that defines the secure
+# configuration and the vendor PSIRT where product advisories are published.
 ADVISORY_MAP: List[Tuple[Tuple[str, ...], List[str]]] = [
-    (("modbus write", "modbus unit id", "modbus register scanning"),
-        ["CISA ICS-TIP-12-146-01A (Modbus security)", "NIST SP 800-82 §6 (ICS protocols)"]),
+    (("modbus write", "modbus unit id", "modbus register scanning", "modbus exceptions", "modbus polling"),
+        ["Modbus Organization: MODBUS/TCP Security Protocol Specification (TLS on TCP 802)", "NIST SP 800-82r3 (Guide to OT Security)"]),
     (("dnp3",),
-        ["CISA ICS-ALERT-13-116-01 (DNP3 implementations)", "IEEE 1815-2012 Secure Authentication"]),
+        ["IEEE 1815-2012 (DNP3 Secure Authentication v5)", "IEC 62351-5 (security for IEC 60870-5 and derivatives)"]),
     (("s7 ", "s7comm", "plc stop", "plc start", "logic download"),
-        ["CISA ICSA-16-348-05 (Siemens S7)", "Siemens SSA-731239", "Siemens SSA-538003"]),
+        ["Siemens ProductCERT security advisories (siemens.com/cert)", "ISA/IEC 62443-3-3 (system security requirements)"]),
     (("profinet",),
-        ["CISA ICSA-19-134-08 (PROFINET)", "Siemens SSA-434536"]),
-    (("ethernet/ip", "enip", "cip write", "cip reset"),
-        ["CISA ICSA-21-049-02 (Rockwell EtherNet/IP)", "Rockwell PN1354", "ODVA Vol.2 §5.5 (CIP Security)"]),
+        ["PROFIBUS & PROFINET International: PROFINET Security Guideline", "Siemens ProductCERT security advisories (siemens.com/cert)"]),
+    (("ethernet/ip", "enip", "cip write", "cip reset", "cip logic", "cip list identity"),
+        ["ODVA CIP Security (The CIP Networks Library, Volume 8)", "Rockwell Automation security advisories (Trust Center)"]),
     (("opc-ua", "opcua"),
-        ["CISA ICSA-22-104-01 (OPC-UA)", "OPC Foundation Security Bulletin"]),
+        ["IEC 62541-2 (OPC UA Part 2: Security Model)", "OPC Foundation security bulletins"]),
     (("bacnet",),
-        ["CISA ICSA-19-346-02 (BACnet)", "ASHRAE 135-2020 Clause 24 (BACnet/SC)"]),
+        ["ASHRAE 135-2020 Annex AB (BACnet Secure Connect)"]),
     (("iec 104", "iec 60870"),
-        ["CISA ICSA-19-225-01 (IEC 60870-5-104)", "IEC 62351-3/-5"]),
+        ["IEC 62351-3 (TLS profile; IEC 104 secure port TCP 19998)", "IEC 62351-5 (security for IEC 60870-5 and derivatives)"]),
     (("iec 61850", "goose"),
-        ["CISA ICSA-21-103-07 (IEC 61850)", "IEC 62351-6 (GOOSE/SV security)"]),
+        ["IEC 62351-6 (security for IEC 61850)", "IEC 62351-4 (MMS security profiles)"]),
     (("mqtt",),
-        ["CISA ICSA-20-063-01 (MQTT brokers)", "OASIS MQTT v5 §4.12 (auth)"]),
-    (("telnet", "ftp observed", "rsh", "http basic"),
-        ["NIST SP 800-82r3 §6.2.4 (Cleartext protocols)", "CIS Controls v8 §3.10"]),
+        ["OASIS MQTT Version 5.0 §5 (Security)", "NIST SP 800-82r3 (Guide to OT Security)"]),
+    (("telnet", "ftp observed", "rsh", "http basic", "pop3 observed", "imap observed"),
+        ["NIST SP 800-82r3 (Guide to OT Security)", "CIS Controls v8 Safeguard 3.10 (Encrypt Sensitive Data in Transit)"]),
     (("snmpv1", "snmpv2", "snmp community"),
-        ["CISA ST04-015 (SNMP)", "NIST SP 800-82r3 §6.2.10"]),
-    (("tls 1.0", "tls 1.1", "sslv2", "sslv3", "weak tls", "expired tls", "self-signed"),
-        ["NIST SP 800-52r2 (TLS guidelines)", "CISA BOD 18-01"]),
-    (("arp spoof", "gratuitous arp", "arp reply without request"),
-        ["NIST SP 800-82r3 §6.2.6 (Link-layer)", "MITRE D3FEND D3-ARPE"]),
+        ["RFC 3414 (SNMPv3 User-based Security Model)", "NIST SP 800-82r3 (Guide to OT Security)"]),
+    (("tls 1.0", "tls 1.1", "sslv2", "sslv3", "weak tls", "obsolete tls", "expired tls", "tls certificate"),
+        ["NIST SP 800-52r2 (TLS guidelines)", "RFC 8996 (Deprecating TLS 1.0 and TLS 1.1)", "CISA BOD 18-01"]),
+    (("arp spoof", "gratuitous arp", "arp reply without request", "claimed by multiple macs", "single mac claims"),
+        ["MITRE ATT&CK T1557.002 (ARP Cache Poisoning)", "NIST SP 800-82r3 (Guide to OT Security)"]),
     (("beacon", "c2 ", "periodic"),
-        ["CISA AA22-055A (C2 detection)", "MITRE D3FEND D3-NTA"]),
-    (("dga", "dns tunneling", "nxdomain"),
-        ["CISA AA22-074A (DNS abuse)", "NIST SP 800-81r1 (DNS security)"]),
-    (("public ip", "it-to-ot", "direct ot-to-it"),
-        ["ISA/IEC 62443-3-2 (Zones & Conduits)", "NIST SP 800-82r3 §5.3"]),
-    (("new device since baseline", "new flow since baseline", "new protocol since baseline"),
-        ["NIST SP 800-82r3 §6.2.1 (Asset inventory)", "CIS Controls v8 §1"]),
+        ["MITRE ATT&CK for ICS TA0101 (Command and Control)", "MITRE D3FEND D3-NTA (Network Traffic Analysis)"]),
+    (("public ip", "direct ot-to-it", "dual-zone", "ot and it devices sharing"),
+        ["ISA/IEC 62443-3-2 (zones and conduits)", "NIST SP 800-82r3 (Guide to OT Security)"]),
+    (("new device since baseline", "new flow since baseline", "new protocol", "new destination port"),
+        ["CIS Controls v8 Control 1 (Inventory and Control of Enterprise Assets)", "NIST SP 800-82r3 (Guide to OT Security)"]),
     (("firmware",),
-        ["CISA ICSA-19-213-05 (Firmware update abuse)", "NIST SP 800-193"]),
+        ["NIST SP 800-193 (Platform Firmware Resiliency)"]),
     (("capture discontinuity", "no ntp"),
-        ["NIST SP 800-92 (Log management)", "NIST SP 800-82r3 §6.2.14"]),
-    # ---- Tier-1 expansion ----
+        ["NIST SP 800-92 (Guide to Computer Security Log Management)"]),
     (("pipedream", "incontroller"),
-        ["CISA AA22-103A (Pipedream/Incontroller toolset)"]),
-    (("ot ttp", "ot-targeted",),
-        ["CISA AA20-205A (NSA/CISA ICS alert)", "CISA AA22-103A"]),
+        ["CISA AA22-103A (APT Cyber Tools Targeting ICS/SCADA Devices)"]),
+    (("ot ttp", "ot-targeted"),
+        ["CISA AA20-205A (NSA/CISA: reduce exposure across OT)", "CISA AA22-103A (APT Cyber Tools Targeting ICS/SCADA Devices)"]),
     (("ja3", "offensive tool tls fingerprint", "cobalt strike", "metasploit"),
-        ["CISA AA23-263A (Common offensive tooling)", "MITRE D3FEND D3-NTA",
-         "FoxIO JA3 fingerprint database (github.com/salesforce/ja3)"]),
-    (("high-entropy dns", "entropy dns", "dga", "dns tunneling"),
-        ["CISA AA22-074A (DNS abuse)", "NIST SP 800-81r1 (DNS security)",
-         "Palo Alto Unit42: DGA detection via entropy"]),
+        ["Salesforce JA3 (github.com/salesforce/ja3)", "MITRE D3FEND D3-NTA (Network Traffic Analysis)"]),
+    (("high-entropy dns", "entropy dns", "dga", "dns tunneling", "nxdomain"),
+        ["NIST SP 800-81-2 (Secure DNS Deployment Guide)", "MITRE ATT&CK T1568.002 (Domain Generation Algorithms)"]),
     (("http form", "http post credential", "form post"),
-        ["NIST SP 800-63B §5 (Credential transmission)", "OWASP Transport Layer Security Cheat Sheet",
-         "CIS Controls v8 §3.10 (Sensitive data encryption)"]),
-    (("suspicious tool user-agent", "metasploit", "cobalt strike", "mimikatz", "empire", "havoc", "sliver"),
-        ["MITRE D3FEND D3-NTA", "CISA AA23-263A (Common offensive tooling)"]),
+        ["NIST SP 800-63B (Digital Identity Guidelines: Authentication)", "CIS Controls v8 Safeguard 3.10 (Encrypt Sensitive Data in Transit)"]),
+    (("suspicious tool user-agent", "mimikatz", "empire", "havoc", "sliver"),
+        ["MITRE D3FEND D3-NTA (Network Traffic Analysis)"]),
     (("sqlmap", "nikto", "nessus", "openvas", "burp suite", "owasp zap"),
-        ["NIST SP 800-115 (Penetration testing)", "OWASP ASVS"]),
-    (("masscan", "nmap", "zgrab"),
-        ["NIST SP 800-115 §4 (Network scanning)"]),
-    (("outdated web-server banner", "iis 5", "iis 6", "apache 1", "apache 2.0", "openssl 0", "openssl 1.0"),
-        ["NIST SP 800-40r4 (Patch management)", "CISA BOD 22-01 (KEV catalog)"]),
+        ["NIST SP 800-115 (Technical Guide to Information Security Testing)"]),
+    (("masscan", "nmap", "zgrab", "ot protocol scanning", "register scanning", "icmp sweep", "icmp unreachable burst"),
+        ["NIST SP 800-115 (Technical Guide to Information Security Testing)", "MITRE D3FEND D3-NTA (Network Traffic Analysis)"]),
+    (("outdated web-server banner",),
+        ["NIST SP 800-40r4 (Enterprise Patch Management)", "CISA BOD 22-01 (Known Exploited Vulnerabilities)"]),
     (("authentication failure burst", "bruteforce", "password spray"),
-        ["NIST SP 800-63B §5 (Authenticator brute-force)", "CIS Controls v8 §6", "MITRE D3FEND D3-AL"]),
-    (("mdns",),
-        ["NIST SP 800-82r3 §6.2.4", "RFC 6762 §11 (mDNS security)"]),
-    (("llmnr",),
-        ["CISA Cybersecurity Advisory: Disable LLMNR", "Microsoft KB-Disable-LLMNR"]),
-    (("netbios-ns", "nbns"),
-        ["NIST SP 800-82r3 §6.2.4", "Microsoft Hardening Guide §NetBIOS"]),
-    (("ssdp",),
-        ["CISA: Disable UPnP/SSDP on OT", "RFC 3986/UPnP Forum"]),
+        ["NIST SP 800-63B (Digital Identity Guidelines: Authentication)", "CIS Controls v8 Control 6 (Access Control Management)", "MITRE D3FEND D3-AL (Account Locking)"]),
+    (("mdns", "ssdp", "ws-discovery"),
+        ["NIST SP 800-82r3 (Guide to OT Security)"]),
+    (("llmnr", "netbios-ns", "nbns"),
+        ["MITRE ATT&CK T1557.001 (LLMNR/NBT-NS Poisoning and SMB Relay)", "Microsoft Group Policy: Turn off multicast name resolution"]),
     (("multiple dhcp servers", "dhcp rogue", "rogue dhcp"),
-        ["NIST SP 800-82r3 §6.2.6", "CIS Benchmark - Network Devices §DHCP"]),
+        ["MITRE ATT&CK T1557.003 (DHCP Spoofing)", "NIST SP 800-82r3 (Guide to OT Security)"]),
     (("adversary-in-the-middle attack pattern", "mitm attack pattern", "arp-based adversary"),
-        ["NIST SP 800-82r3 §6.2.6 (Link-layer)", "MITRE D3FEND D3-ARPE",
-         "CISA AA22-103A (Pipedream/Incontroller)", "Dragos OT Cybersecurity Year in Review 2025 (dragos.com/year-in-review)"]),
-    (("identical modbus response", "possible replay", "modbus replay"),
-        ["CISA ICS-TIP-12-146-01A (Modbus security)", "MITRE D3FEND D3-NTA",
-         "Dragos OT Cybersecurity Year in Review 2025 (dragos.com/year-in-review)"]),
+        ["MITRE ATT&CK for ICS T0830 (Adversary-in-the-Middle)", "MITRE ATT&CK T1557.002 (ARP Cache Poisoning)", "CISA AA22-103A (APT Cyber Tools Targeting ICS/SCADA Devices)", "Dragos OT Cybersecurity Year in Review 2025 (dragos.com/year-in-review)"]),
+    (("duplicate or unsolicited modbus responses", "possible replay", "modbus replay", "modbus register value anomaly"),
+        ["Modbus Organization: MODBUS/TCP Security Protocol Specification (TLS on TCP 802)", "MITRE D3FEND D3-NTA (Network Traffic Analysis)", "Dragos OT Cybersecurity Year in Review 2025 (dragos.com/year-in-review)"]),
     (("repetitive single-register polling",),
-        ["CISA ICS-TIP-12-146-01A (Modbus security)", "NIST SP 800-82r3 §6 (ICS protocols)"]),
+        ["Modbus Organization: MODBUS/TCP Security Protocol Specification (TLS on TCP 802)", "NIST SP 800-82r3 (Guide to OT Security)"]),
     (("dnp3 disable spontaneous", "dnp3 cold restart", "dnp3 warm restart"),
-        ["CISA ICS-ALERT-13-116-01 (DNP3 implementations)",
-         "IEEE 1815-2012 Secure Authentication", "NIST SP 800-82r3 §6 (ICS protocols)"]),
-    (("icmp sweep", "host-discovery"),
-        ["NIST SP 800-115 §4.2", "MITRE D3FEND D3-NTA"]),
-    (("icmp unreachable burst",),
-        ["NIST SP 800-115 §4.2"]),
-    # Vendor-specific OT protocol advisories
+        ["IEEE 1815-2012 (DNP3 Secure Authentication v5)", "NIST SP 800-82r3 (Guide to OT Security)"]),
     (("omron fins", "fins write", "fins cleartext"),
-        ["Omron Cybersecurity Bulletins", "NIST SP 800-82r3 §6.2 (OT cleartext protocols)",
-         "CISA ICS-CERT: Omron Sysmac advisory series"]),
+        ["Omron cybersecurity advisories", "NIST SP 800-82r3 (Guide to OT Security)"]),
     (("ge srtp", "ge-srtp"),
-        ["GE Digital Security Advisories", "NIST SP 800-82r3 §6.2",
-         "CISA ICSA-18-205-01 (GE Communications)"]),
+        ["Emerson PACSystems security advisories (formerly GE Intelligent Platforms)", "NIST SP 800-82r3 (Guide to OT Security)"]),
     (("schneider umas", "umas"),
-        ["Schneider Electric Security Notifications", "NIST SP 800-82r3 §6.2",
-         "CISA ICSA-20-196-05 (Schneider Modicon)"]),
+        ["Schneider Electric security notifications", "NIST SP 800-82r3 (Guide to OT Security)"]),
     (("mitsubishi melsec", "melsec"),
-        ["Mitsubishi Electric PSIRT", "NIST SP 800-82r3 §6.2",
-         "CISA ICSA-21-049-01 (Mitsubishi MELSEC-Q/L)"]),
-    (("osisoft pi", "pi server"),
-        ["CISA ICSA-22-090-05 (OSIsoft PI Server)", "NIST SP 800-82r3 §5.4 (historian security)"]),
+        ["Mitsubishi Electric PSIRT advisories", "NIST SP 800-82r3 (Guide to OT Security)"]),
+    (("osisoft pi", "pi server", "pi data archive"),
+        ["AVEVA security advisories (PI System)", "NIST SP 800-82r3 (Guide to OT Security)"]),
     (("ignition gateway",),
-        ["Inductive Automation Security Advisories", "NIST SP 800-82r3 §5 (OT architecture)"]),
+        ["Inductive Automation security advisories", "NIST SP 800-82r3 (Guide to OT Security)"]),
     (("node-red",),
-        ["Node-RED Security Guide (nodered.org/docs/user-guide/security)",
-         "NIST SP 800-82r3 §6.2 (cleartext OT interfaces)"]),
-    (("modbus register value anomaly", "value anomaly"),
-        ["CISA ICS-TIP-12-146-01A (Modbus security)", "MITRE D3FEND D3-NTA",
-         "Dragos OT Cybersecurity Year in Review 2025 (dragos.com/year-in-review)"]),
-    # Vendor-specific PSIRT references
+        ["Securing Node-RED (nodered.org/docs/user-guide/runtime/securing-node-red)", "NIST SP 800-82r3 (Guide to OT Security)"]),
+    (("av_media",),
+        ["ISA/IEC 62443-3-2 (zones and conduits)", "NIST SP 800-82r3 (Guide to OT Security)"]),
     (("honeywell",),
-        ["Honeywell PSIRT (security.honeywell.com)"]),
+        ["Honeywell PSIRT advisories"]),
     (("emerson",),
-        ["Emerson Cybersecurity (emerson.com/security)"]),
+        ["Emerson cybersecurity notifications"]),
     (("yokogawa",),
-        ["Yokogawa Security Advisories"]),
+        ["Yokogawa security advisories"]),
     (("mitsubishi",),
-        ["Mitsubishi Electric PSIRT"]),
+        ["Mitsubishi Electric PSIRT advisories"]),
     (("omron",),
-        ["Omron Cybersecurity Bulletins"]),
+        ["Omron cybersecurity advisories"]),
     (("abb",),
-        ["ABB Cybersecurity Notifications"]),
-    (("ge ", "ge fanuc"),
-        ["GE Digital Security Advisories"]),
-    # Dragos / industry threat intel
+        ["ABB cybersecurity advisories"]),
+    (("ge fanuc", "pacsystems"),
+        ["Emerson PACSystems security advisories (formerly GE Intelligent Platforms)"]),
     (("modbus", "dnp3", "iec 104", "iec 61850", "s7comm", "ethernet/ip"),
         ["Dragos OT Cybersecurity Year in Review 2025 (dragos.com/year-in-review)"]),
 ]
@@ -878,6 +868,34 @@ def _versioned_path(folder: Path, base_name: str, ext: str) -> Path:
         if not candidate.exists():
             return candidate
         version += 1
+
+
+def is_capture_file(path: Path) -> bool:
+    """True for capture files tshark reads natively (incl. gzip-compressed)."""
+    return path.is_file() and path.name.lower().endswith(CAPTURE_SUFFIXES)
+
+
+def split_capture_name(name: str) -> Tuple[str, str]:
+    """Split 'site.pcap.gz' into ('site', 'pcap.gz') using the longest capture suffix."""
+    lowered = name.lower()
+    for suffix in sorted(CAPTURE_SUFFIXES, key=len, reverse=True):
+        if lowered.endswith(suffix):
+            return name[: -len(suffix)], name[-len(suffix) + 1:]
+    stem, _, ext = name.rpartition(".")
+    return stem or name, ext
+
+
+def service_port_for(sport: int, dport: int) -> int:
+    """Pick the server-side port of a flow whose handshake was not observed."""
+    if not sport or not dport:
+        return dport or sport
+    if sport == dport:
+        return dport
+    dport_known = dport in _SERVICE_PORT_HINTS
+    sport_known = sport in _SERVICE_PORT_HINTS
+    if dport_known != sport_known:
+        return dport if dport_known else sport
+    return min(sport, dport)
 
 
 def colorize(text: str, severity: Optional[str] = None, bold: bool = False) -> str:
@@ -1039,6 +1057,7 @@ class ProcessedPcap:
     packet_count: int = 0
     start_time: Optional[str] = None
     end_time: Optional[str] = None
+    truncated: bool = False
 
 
 @dataclass
@@ -1049,7 +1068,8 @@ class DeviceRecord:
     macs: List[str] = field(default_factory=list)
     hostnames: List[str] = field(default_factory=list)
     protocols: List[str] = field(default_factory=list)
-    ports: List[int] = field(default_factory=list)
+    ports: List[int] = field(default_factory=list)          # service ports this device answered on
+    client_ports: List[int] = field(default_factory=list)   # service ports this device connected to
     source_pcaps: List[str] = field(default_factory=list)
     subnets: List[str] = field(default_factory=list)
     vlans: List[str] = field(default_factory=list)
@@ -1103,6 +1123,7 @@ class Finding:
     dedupe_key: str = ""
     mitre_ids: List[str] = field(default_factory=list)
     advisory_refs: List[str] = field(default_factory=list)
+    occurrences: int = 1
 
 
 @dataclass
@@ -1214,11 +1235,16 @@ def load_config() -> Dict[str, Any]:
 
 def save_config(config: Dict[str, Any]) -> None:
     """Persist the config file."""
-    CONFIG_PATH.write_text(pretty_json(config), encoding="utf-8")
+    try:
+        CONFIG_PATH.write_text(pretty_json(config), encoding="utf-8")
+    except OSError as exc:
+        print(colorize(f"[!] Could not save preferences to {CONFIG_PATH}: {exc}", SEVERITY_MEDIUM))
 
 
 # Direct runtime dependencies only — everything else the tool uses is stdlib.
-_FIELD_REQUIREMENTS = "python-docx>=1.1.0\nscapy>=2.5.0\n"
+_FIELD_REQUIREMENTS = "python-docx>=1.1.0\n"
+# Earlier generated requirements files; replaced on upgrade unless hand-edited.
+_LEGACY_FIELD_REQUIREMENTS = ("python-docx>=1.1.0\nscapy>=2.5.0\n",)
 
 
 def _workspace_readme_text() -> str:
@@ -1228,7 +1254,7 @@ def _workspace_readme_text() -> str:
         "\n"
         "This workspace was set up automatically on first run:\n"
         "\n"
-        "  pcaps/    drop your .pcap / .pcapng capture files here\n"
+        "  pcaps/    drop your capture files here (.pcap / .pcapng / .cap, also .gz)\n"
         "            (captures left next to otscope.py are moved here automatically)\n"
         "  output/   reports, session files, and diagrams are written here\n"
         "\n"
@@ -1257,33 +1283,42 @@ def _bootstrap_workspace() -> None:
     a README_FIRST.txt quick-start.  Capture files dropped loose next to
     the script are adopted into pcaps/ so the "one folder" workflow just
     works.  Every step is best-effort — a read-only location (e.g. a
-    locked USB drive) must never stop the tool.
+    locked USB drive) must never stop the tool.  Generated files are only
+    replaced when they are an unmodified copy written by an older version.
     """
     try:
         _PCAPS_ROOT.mkdir(parents=True, exist_ok=True)
         _OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     except OSError:
         pass
+    readme_text = _workspace_readme_text()
     for name, content in (
         ("requirements.txt", _FIELD_REQUIREMENTS),
-        ("README_FIRST.txt", _workspace_readme_text()),
+        ("README_FIRST.txt", readme_text),
     ):
         target = _SCRIPT_DIR / name
         try:
             if not target.exists():
                 target.write_text(content, encoding="utf-8")
+                continue
+            existing = target.read_text(encoding="utf-8", errors="replace")
+            if name == "requirements.txt":
+                stale = existing in _LEGACY_FIELD_REQUIREMENTS
+            else:
+                first_line = existing.split("\n", 1)[0]
+                stale = first_line.startswith(f"{TOOL_NAME} v") and first_line != readme_text.split("\n", 1)[0]
+            if stale:
+                target.write_text(content, encoding="utf-8")
         except OSError:
             pass
     if _PCAPS_ROOT.is_dir():
         try:
-            loose = sorted(
-                item for item in _SCRIPT_DIR.iterdir()
-                if item.is_file() and item.suffix.lower() in {".pcap", ".pcapng"}
-            )
+            loose = sorted(item for item in _SCRIPT_DIR.iterdir() if is_capture_file(item))
         except OSError:
             loose = []
         for item in loose:
-            dest = _versioned_path(_PCAPS_ROOT, item.stem, item.suffix.lstrip("."))
+            base, ext = split_capture_name(item.name)
+            dest = _versioned_path(_PCAPS_ROOT, base, ext)
             try:
                 shutil.move(str(item), str(dest))
                 print(f"[i] Moved capture into workspace: {item.name} -> pcaps{os.sep}{dest.name}")
@@ -1300,10 +1335,6 @@ def ensure_runtime_dependencies() -> None:
         import docx  # noqa: F401
     except ImportError:
         missing.append("python-docx")
-    try:
-        import scapy.all  # noqa: F401
-    except ImportError:
-        missing.append("scapy")
     if missing:
         print_header("Missing Dependencies")
         print("[!] The following dependencies are required before analysis can run:")
@@ -1313,7 +1344,7 @@ def ensure_runtime_dependencies() -> None:
         print(f'    pip install -r "{_SCRIPT_DIR / "requirements.txt"}"')
         print("")
         print("    Debian/Ubuntu alternative:")
-        print("    sudo apt install tshark python3-scapy python3-docx")
+        print("    sudo apt install tshark python3-docx")
         print("")
         print("    tshark (part of the Wireshark suite) if missing:")
         print("      Windows:        winget install WiresharkFoundation.Wireshark")
@@ -1368,7 +1399,8 @@ def why_this_matters_for_finding(finding: "Finding") -> str:
     ).lower()
     if any(term in text for term in ("write", "operate", "reset", "stop/start", "control operation", "writeproperty", "direct operate")):
         return "This finding matters because it indicates traffic that can change controller state, process values, or device configuration rather than just observe data."
-    if any(term in text for term in ("cleartext", "http", "ftp", "telnet", "snmp", "basic authentication", "securitymode none", "without tls", "anonymous")):
+    if any(term in text for term in ("cleartext", "http", "ftp", "telnet", "snmp", "basic authentication", "securitymode none",
+                                     "securitypolicy none", "without tls", "anonymous", "noauth", "without authentication")):
         return "This finding matters because the protocol or session protection is weak enough that credentials, commands, or process data may be exposed or modified by anyone with network visibility."
     if any(term in text for term in ("scan", "recon", "who-is", "list identity", "browse", "identify all", "read szl", "wildcard")):
         return "This finding matters because it is consistent with discovery or enumeration activity, which is often a precursor to targeted manipulation or exploitation."
@@ -1400,7 +1432,11 @@ def recommended_fix_for_finding(finding: "Finding") -> str:
         term in text for term in ("write", "operate", "reset", "control", "writeproperty", "direct operate")
     ):
         return "Restrict write-capable functions to approved engineering or HMI hosts only, block all other sources at the firewall or switch ACL layer, and disable unused write services where the vendor allows it."
-    if any(term in text for term in ("securitymode none", "without tls", "cleartext", "http", "ftp", "telnet", "basic authentication", "anonymous")):
+    if "umas" in text:
+        return "Allow TCP/502 to the PLC only from its HMIs and the engineering workstation, set an application password on the PLC project, and use the controller's memory-protect setting so programs cannot be changed outside an approved engineering session."
+    if any(term in text for term in ("noauth", "without authentication")):
+        return "Enable authentication on the interface (for Node-RED, configure adminAuth; for cameras, disable anonymous RTSP and set unique credentials), restrict who can reach it at the firewall, and move administration to an encrypted channel."
+    if any(term in text for term in ("securitymode none", "securitypolicy none", "without tls", "cleartext", "http", "ftp", "telnet", "basic authentication", "anonymous")):
         return "Enable the strongest supported authentication and encryption for the protocol, disable insecure legacy access methods, rotate any exposed credentials, and limit access to a dedicated management subnet."
     if any(term in text for term in ("public ip", "ot-to-it", "dual-zone", "boundary", "segmentation")):
         return "Remove direct routing where possible, place a firewall or industrial DMZ between the zones, permit only explicitly required ports, and force administration through an approved jump host."
@@ -1434,133 +1470,181 @@ def recommended_fix_for_finding(finding: "Finding") -> str:
 # directly to the corresponding frame.
 # ----------------------------------------------------------------------
 _WIRESHARK_GUIDE: List[Tuple[Tuple[str, ...], str, List[str]]] = [
-    # (keyword tuple matched against title+tags+protocol, display_filter, steps)
-    (("mitm", "adversary-in-the-middle", "arp spoof", "arp sender mac differs",
-      "ip address claimed by multiple macs", "gratuitous arp"),
+    # (keyword tuple matched against title+tags+protocol+category, display_filter, steps)
+    # Order matters: the first matching entry wins, so specific entries come first.
+    (("adversary-in-the-middle", "arp spoof", "arp sender mac differs", "ip address claimed by multiple macs",
+      "gratuitous arp", "arp replies without matching", "single mac claims", "multiple mac addresses"),
      "arp",
      [
          "Sort by Source/Destination Hardware Address columns to see which MAC is claiming which IP, and look for the same IP appearing under two different sender MACs.",
          "Add the column 'arp.opcode' (View → Columns) and check for 'reply' opcodes that don't follow a corresponding 'request' from the same target.",
-         "Compare the Ethernet src MAC (frame frame.eth.src) against the ARP sender MAC (arp.src.hw_mac) — when they disagree, that's a MITM toolkit's signature.",
+         "Compare the Ethernet source MAC (eth.src) against the ARP sender MAC (arp.src.hw_mac) — when they disagree, that's a MITM toolkit's signature.",
          "Right-click any suspicious ARP frame → Conversation Filter → Ethernet to see all traffic that flowed through that MAC during the spoof window.",
      ]),
-    (("modbus write", "modbus unit id", "modbus replay", "identical modbus response",
-      "repetitive single-register polling", "modbus polling burst", "modbus register scanning",
-      "elevated modbus exceptions", "modbus broadcast"),
+    (("register value anomaly",),
+     "modbus",
+     [
+         "Filter to Modbus frames and add columns 'mbtcp.trans_id', 'modbus.reference_num' and 'modbus.regval_uint16' — the request carries the register address, the matching response (same transaction ID) carries the values.",
+         "Right-click a flagged register's response frame → 'Follow → TCP Stream' to see the full read sequence and spot the anomalous value in context.",
+         "Sort the Modbus stream by time and look for the specific poll interval where the value jump occurred — compare neighboring frames for injected/out-of-sequence responses.",
+         "Cross-reference the anomalous value with the known engineering range for that register (check the P&ID or HMI configuration for expected min/max).",
+     ]),
+    (("duplicate or unsolicited modbus responses",),
+     "modbus",
+     [
+         "Add the column 'mbtcp.trans_id' and sort by it: a legitimate exchange has exactly one response per request transaction ID.",
+         "Two responses carrying the same transaction ID, or a response whose ID never appeared in a request, is the signature of a replayed or injected packet.",
+         "Compare the duplicate response's TTL (ip.ttl) and Ethernet source (eth.src) with the genuine one — an injecting host usually differs in at least one.",
+         "Use the @<epoch> tags in the evidence to jump to each duplicate and check what traffic immediately preceded it.",
+     ]),
+    (("schneider umas",),
+     "modbus.func_code == 90",
+     [
+         "UMAS rides inside Modbus function code 90, which Wireshark labels 'Unity (Schneider)'; this filter isolates every UMAS frame.",
+         "Right-click a UMAS frame → 'Follow → TCP Stream' to reconstruct the engineering session from connect to disconnect.",
+         "Verify the source IP is an authorized EcoStruxure Control Expert / Unity Pro workstation — UMAS can stop/start the PLC and download logic.",
+         "Correlate the session timing with change records; UMAS traffic outside a maintenance window warrants follow-up.",
+     ]),
+    (("modbus tcp", "modbus"),
      "modbus",
      [
          "Use 'Statistics → Conversations → TCP' filtered to port 502 to see all Modbus pairs and packet counts at a glance.",
-         "Right-click a Modbus packet → 'Follow → TCP Stream' to reconstruct the full request/response sequence and read the actual register values.",
-         "Add columns for 'modbus.func_code', 'modbus.reference_num', and 'modbus.word_cnt' (Edit → Preferences → Appearance → Columns) to see register-level activity inline.",
-         "For replay/timing anomalies, sort by 'frame.time_delta_displayed' to surface anomalous gaps; identical responses with abnormal gaps = replay.",
+         "Right-click a Modbus packet → 'Follow → TCP Stream' to reconstruct the full request/response sequence.",
+         "Add columns 'modbus.func_code', 'modbus.reference_num' and 'modbus.word_cnt' (Edit → Preferences → Appearance → Columns) to see register-level activity inline.",
+         "Filter modbus.func_code in {5, 6, 15, 16, 21, 22, 23} to list every write request and confirm each comes from an authorized HMI or engineering station.",
      ]),
-    (("dnp3 direct operate", "dnp3 freeze", "dnp3 disable spontaneous",
-      "dnp3 cold restart", "dnp3 warm restart", "dnp3 secure authentication",
-      "dnp3 broadcast"),
+    (("dnp3",),
      "dnp3",
      [
          "Filter to the affected pair: dnp3 && (ip.addr == <src> || ip.addr == <dst>) and step through application-layer control fields.",
-         "Add columns 'dnp3.al.func' (application function code) and 'dnp3.al.objq.code' (object qualifier) to see exactly which control was issued.",
+         "Add columns 'dnp3.al.func' (application function code) plus 'dnp3.al.objq.prefix' and 'dnp3.al.objq.range' (object qualifiers) to see exactly which control was issued.",
          "For Disable Spontaneous / restart commands, verify whether the master IP matches an approved engineering workstation; if not, trace its origin via 'Statistics → Endpoints'.",
-         "Use 'Edit → Find Packet' with 'Display filter' set to dnp3.al.func == 0x05 (Direct Operate) or 0x0d (Cold Restart) to enumerate every instance.",
+         "Use 'Edit → Find Packet' with 'Display filter' set to dnp3.al.func == 5 (Direct Operate), 13 (Cold Restart) or 21 (Disable Unsolicited) to enumerate every instance.",
      ]),
-    (("bacnet", "bacnet writeproperty", "bbmd"),
+    (("bacnet",),
      "bacnet",
      [
          "Filter bacapp to see the application layer; expand 'BACnet Virtual Link Control' to confirm BBMD vs unicast routing.",
-         "Right-click a WriteProperty → 'Follow' to see whether the request was confirmed by the target.",
+         "Add column 'bacapp.type': Confirmed-REQ frames are requests, Simple-ACK / Complex-ACK frames are the device's answers.",
          "Add column 'bacapp.objectIdentifier' to see which BACnet object was being written.",
      ]),
-    (("iec 104", "iec 60870", "iec 61850", "goose state-number anomaly", "iec 104 control"),
-     "iec104 || iec60870_5_104 || goose || mms",
+    (("iec 60870", "iec 104", "iec 61850", "goose", "mms"),
+     "iec60870_104 || iec60870_asdu || goose || mms",
      [
-         "For IEC-104: filter to '104asdu' to see ASDU TypeID — control commands cluster around TypeID 45-51 and 100-107.",
+         "For IEC-104: filter 'iec60870_asdu' and add column 'iec60870_asdu.typeid' — control commands are TypeID 45–51 (58–64 with time tag); system commands such as interrogation, clock sync and reset process are 100–107.",
+         "Add column 'iec60870_asdu.causetx': activation (6) comes from the master, confirmation (7) and termination (10) from the outstation.",
          "For GOOSE: add 'goose.stNum' and 'goose.sqNum' as columns; legitimate GOOSE increments sqNum monotonically with stNum changing only on event.",
          "Right-click an unexpected GOOSE → Conversation → Ethernet to see if the source MAC is on an authorized merging unit.",
      ]),
-    (("opc-ua", "opcua write"),
+    (("opc-ua", "opcua"),
      "opcua",
      [
-         "Filter to opcua to see the binary protocol; expand 'Open Secure Channel' to confirm the SecurityMode (None vs SignAndEncrypt).",
-         "Add column 'opcua.servicenodeid.numeric' to see which service was invoked (Write = 671, Browse = 526).",
+         "Filter to opcua and expand 'OpenSecureChannel' to read the SecurityPolicyUri and MessageSecurityMode (None / Sign / SignAndEncrypt).",
+         "Add column 'opcua.servicenodeid.numeric' to see which service each message invokes (Read, Write and Browse requests appear as distinct IDs).",
          "Use 'Statistics → Service Response Time → OPC UA' to spot abnormal latency that could indicate injection.",
      ]),
-    (("ethernet/ip", "cip", "cip write", "cip reset"),
+    (("ethernet/ip", "cip ", "enip"),
      "enip || cip",
      [
-         "Filter to 'cip' and add column 'cip.service' to see service codes (0x52 Unconnected Send, 0x4B Execute PCCC, 0x53 Write Tag Fragmented, etc.).",
+         "Filter to 'cip' and add column 'cip.service' to see service codes (0x4C Read Tag, 0x4D Write Tag, 0x53 Write Tag Fragmented, 0x4B Execute PCCC); responses carry the 0x80 bit.",
          "Right-click a CIP packet → 'Follow → TCP Stream' to reassemble multi-fragment writes.",
          "For symbolic-name writes, expand 'Request Path' to read the ANSI Extended Symbol Segment contents.",
      ]),
-    (("s7", "s7 plc stop", "s7 plc start", "s7 write variable", "logic download"),
-     "s7comm",
-     [
-         "Filter to 's7comm' and add columns 's7comm.param.func' and 's7comm.data.returncode' to see which PLC functions were invoked.",
-         "PLC Stop = 0x29, PLC Start = 0x28, Read Var = 0x04, Write Var = 0x05 — verify the source matches an authorized engineering station.",
-         "For block download/upload (Recon→Modify), follow the TCP stream to see the full block content being transferred.",
-     ]),
-    (("profinet", "profinet dcp set"),
+    (("profinet dcp", "identify all"),
      "pn_dcp || pn_io || pn_rt",
      [
          "Filter to 'pn_dcp' for discovery/configuration frames and 'pn_io' for cyclic real-time data.",
-         "Add column 'pn_dcp.suboption' — Set commands (suboption 0x05 IP, 0x02 Name) are how an attacker reconfigures a PROFINET device.",
+         "Add columns 'pn_dcp.service_id' and 'pn_dcp.option' — Set requests (service ID 4) change a device's IP suite or NameOfStation, which is how a device is re-addressed or renamed.",
          "For unexpected DCP-Set, identify the source MAC and trace whether it was an authorized engineering tool.",
      ]),
-    (("telnet observed", "ftp observed", "rsh", "credential"),
-     "tcp.port == 23 || tcp.port == 21 || tcp.port == 512 || tcp.port == 513",
+    (("s7comm", "s7 ", "siemens s7"),
+     "s7comm",
      [
-         "Right-click any session → 'Follow → TCP Stream' to read the full plaintext including credentials, commands issued, and responses.",
-         "Use 'File → Export Objects → HTTP/IMF' for any objects transferred over those streams (FTP transfers also show in tcp.stream).",
-         "Verify the timestamps in this report's evidence (paste @<epoch> into 'frame.time_epoch == X') to land on the credential-exposure frame directly.",
+         "Filter to 's7comm' and add columns 's7comm.header.rosctr', 's7comm.param.func' and 's7comm.data.returncode' — ROSCTR 1 (Job) frames are requests, 3 (Ack_Data) are the PLC's answers.",
+         "PLC Stop = 0x29, PLC Start = 0x28, Read Var = 0x04, Write Var = 0x05 — verify the source matches an authorized engineering station.",
+         "For block download/upload, follow the TCP stream to see the full block content being transferred.",
      ]),
-    (("tls 1.0", "tls 1.1", "sslv2", "sslv3", "weak", "expired", "self-signed"),
-     "tls.handshake.type == 1 || tls.handshake.type == 2",
+    (("ja3", "offensive tool tls fingerprint"),
+     "tls.handshake.type == 1",
      [
-         "Filter to 'tls.handshake' to see ClientHello (handshake.type==1) and ServerHello (==2) — the SSL version and cipher suite are both visible there.",
-         "Add column 'tls.handshake.ciphersuite' to inventory which weak ciphers each server is willing to use.",
-         "For self-signed/expired certs, expand 'Certificate' subtree on a ServerHello frame to read Issuer/Subject/Validity.",
+         "Filter to TLS ClientHello frames (tls.handshake.type == 1) and add the column 'tls.handshake.ja3' to see JA3 hashes inline for all TLS clients.",
+         "Right-click the flagged source IP → Conversation Filter → IP to isolate all its TLS sessions and look for additional C2 callback patterns (regular intervals, unusual destinations).",
+         "Follow the TCP stream of any flagged connection to check for encrypted payload bursts consistent with C2 beaconing.",
+         "Cross-reference the source IP against the OT device inventory — an OT controller initiating outbound TLS to an unknown external host is high priority.",
      ]),
-    (("beacon", "c2", "periodic"),
+    (("obsolete tls", "weak tls", "tls certificate", "expired tls"),
+     "tls.handshake.type == 1 || tls.handshake.type == 2 || tls.alert_message",
+     [
+         "Filter tls.handshake.type == 2 (ServerHello) — the 'Version' and 'Cipher Suite' fields there are what the server actually negotiated.",
+         "Add columns 'tls.handshake.version' and 'tls.handshake.ciphersuite' to inventory which servers accept old protocol versions or weak ciphers.",
+         "For certificate problems, filter 'tls.alert_message' and expand the Certificate message on the preceding ServerHello to read Issuer, Subject and Validity.",
+     ]),
+    (("beaconing pattern",),
      "ip.addr == <src> && ip.addr == <dst>",
      [
          "Use 'Statistics → IO Graphs' with the relevant src/dst filter to visualize the periodic spikes; tight regular intervals = beaconing signature.",
          "Sort the conversation by 'frame.time_delta_displayed' — a near-constant delta is the canonical C2 callback pattern.",
          "Right-click → 'Follow → TCP Stream' (if TCP) or 'UDP Stream' to see whether the payload is identical across beacons (further C2 indicator).",
      ]),
-    (("dga", "dns tunneling", "nxdomain"),
+    (("high-entropy dns",),
+     "dns",
+     [
+         "Filter to dns frames and add column 'dns.qry.name' to see query names in full — sort by name to group similar high-entropy strings.",
+         "Look for bursts of queries with no corresponding responses (dns.flags.response == 0) — DGA malware often queries many domains before one resolves.",
+         "Use 'Statistics → DNS' to see NXDOMAIN response rates; a rate above 50% for a single source is strongly indicative of DGA.",
+         "Check if the querying host is an OT device — OT devices should not be generating DNS queries at all in air-gapped or segmented environments.",
+     ]),
+    (("mdns", "llmnr", "netbios", "ssdp", "ws-discovery"),
+     "mdns || llmnr || nbns || ssdp || udp.port == 3702",
+     [
+         "Filter to the specific protocol (mdns / llmnr / nbns / ssdp / udp.port == 3702) and group by Source IP to identify the offending hosts.",
+         "Use 'Statistics → Endpoints' to confirm whether the offending IPs sit in the OT VLAN/subnet they shouldn't be in.",
+         "Add column 'nbns.name' or 'dns.qry.name' (LLMNR and mDNS use the DNS fields) to see which names are being broadcast.",
+     ]),
+    (("dns",),
      "dns",
      [
          "Filter dns.flags.rcode == 3 to see only NXDOMAIN responses, then sort by Source to find the host with abnormally high NXDOMAIN ratio.",
          "Add column 'dns.qry.name' and look for randomly-generated subdomains (DGA) or unusually long labels (tunneling exfil).",
          "Use 'Statistics → DNS' for a per-resolver and per-query-type breakdown.",
      ]),
-    (("snmp", "snmpv1", "snmpv2", "snmp walk", "snmp set", "snmp community"),
+    (("snmp",),
      "snmp",
      [
          "Add column 'snmp.community' to read the community strings in plaintext (any v1/v2c traffic exposes them).",
-         "Filter snmp.command == 5 (GET-NEXT) to enumerate walks; snmp.command == 3 (SET) to find write operations.",
-         "Right-click a SET request → 'Follow' to see the OID and value being changed.",
+         "Filter snmp.data == 1 (get-next-request) to enumerate walks and snmp.data == 3 (set-request) to find write operations.",
+         "Right-click a set-request → 'Follow → UDP Stream' to see the OID and value being changed.",
      ]),
-    (("arp ", "rst storm", "syn ", "icmp sweep", "icmp unreachable"),
-     "(arp) || (tcp.flags.reset == 1) || (tcp.flags.syn == 1 && tcp.flags.ack == 0) || (icmp)",
+    (("http form",),
+     "http.request.method == \"POST\"",
      [
-         "Use 'Statistics → Endpoints' filtered by the relevant protocol to see top talkers — the scanner stands out by destination diversity.",
-         "For sweeps: 'Statistics → IPv4 → Destinations and Ports' shows the fan-out from a single source.",
-         "Sort by 'icmp.type' (column) to distinguish echo-request floods from unreachable bursts.",
+         "Filter to HTTP POST requests (http.request.method == \"POST\") and add column 'http.request.uri' to see which login endpoints are being hit.",
+         "Right-click → Follow → TCP Stream to view the full POST body including the username and password fields in plaintext.",
+         "Note the destination IP and port — OT devices running embedded web interfaces on non-standard ports (8000, 9000) often transmit credentials without TLS.",
+         "Check whether the same credentials appear in multiple streams or to multiple targets (credential reuse / spray pattern).",
      ]),
-    (("mdns", "llmnr", "netbios-ns", "ssdp"),
-     "mdns || llmnr || nbns || ssdp",
+    (("authentication failure burst",),
+     "ftp.response.code == 530 || http.response.code == 401 || telnet",
      [
-         "Filter to the specific protocol (mdns / llmnr / nbns / ssdp) and group by Source IP to identify the offending hosts.",
-         "Use 'Statistics → Endpoints' to confirm whether the offending IPs sit in the OT VLAN/subnet they shouldn't be in.",
-         "On Windows hosts, add column 'nbns.name' or 'llmnr.qry.name' to see which names are being broadcast.",
+         "The filter lists FTP 530 and HTTP 401 replies; for Telnet, follow each session's stream and look for 'Login incorrect'.",
+         "Use 'Statistics → Conversations' filtered to that pair to see attempt timing — bursts of <1s between attempts = automated tool.",
+         "Right-click → 'Follow → TCP Stream' to see usernames being tried (helps confirm which accounts were targeted).",
      ]),
-    (("dhcp rogue", "multiple dhcp servers"),
-     "bootp || dhcp",
+    (("mqtt",),
+     "mqtt",
      [
-         "Filter to dhcp.option.dhcp == 2 (Offer) or 5 (ACK) and add column 'eth.src' to enumerate which MACs are serving DHCP.",
-         "Cross-reference each server MAC against the OUI table to identify whether it's a sanctioned device or rogue.",
-         "Right-click a server response → Conversation → Ethernet to see all clients that received a lease from it.",
+         "Add columns 'mqtt.msgtype', 'mqtt.conflag.uname' and 'mqtt.username': a CONNECT (msgtype 1) without the username flag is an anonymous session.",
+         "Add column 'mqtt.topic' to see what each client publishes or subscribes to; control-style topics (cmd, set, write) deserve scrutiny.",
+         "Filter mqtt.retain == 1 to find retained messages, which the broker replays to every new subscriber.",
+         "Traffic on TCP/1883 is cleartext; MQTT over TLS uses TCP/8883.",
+     ]),
+    (("telnet", "ftp", "rsh", "pop3", "imap", "http basic", "http observed", "rdp observed", "vnc observed",
+      "smb observed", "netbios observed", "cleartext credentials extracted"),
+     "telnet || ftp || tftp || http || pop || imap || rdp || vnc || smb || smb2 || tcp.port in {512, 513}",
+     [
+         "Right-click any session → 'Follow → TCP Stream' to read the full plaintext including credentials, commands issued, and responses.",
+         "Use 'File → Export Objects → HTTP/FTP-DATA' for any files transferred over those sessions.",
+         "Verify the timestamps in this report's evidence (paste @<epoch> into 'frame.time_epoch == X') to land on the credential-exposure frame directly.",
      ]),
     (("suspicious tool user-agent", "outdated web-server banner"),
      "http",
@@ -1569,12 +1653,19 @@ _WIRESHARK_GUIDE: List[Tuple[Tuple[str, ...], str, List[str]]] = [
          "Right-click → 'Follow → HTTP Stream' to read the full request/response including headers, cookies, and body.",
          "Use 'File → Export Objects → HTTP' to extract any files transferred over the suspicious connection.",
      ]),
-    (("authentication failure burst", "bruteforce"),
-     "tcp.port == 21 || tcp.port == 22 || tcp.port == 23 || tcp.port == 80",
+    (("possible ot protocol scanning", "tcp reset storm", "unanswered syn", "icmp sweep", "icmp unreachable", "icmp traffic"),
+     "(tcp.flags.reset == 1) || (tcp.flags.syn == 1 && tcp.flags.ack == 0) || icmp",
      [
-         "Filter to the protocol port plus 'tcp contains \"failed\" || tcp contains \"incorrect\"' to enumerate failure responses.",
-         "Use 'Statistics → Conversations' filtered to that pair to see attempt timing — bursts of <1s between attempts = automated tool.",
-         "Right-click → 'Follow → TCP Stream' to see usernames being tried (helps confirm which accounts were targeted).",
+         "Use 'Statistics → Endpoints' filtered by the relevant protocol to see top talkers — the scanner stands out by destination diversity.",
+         "For sweeps: 'Statistics → IPv4 Statistics → Destinations and Ports' shows the fan-out from a single source.",
+         "Add column 'icmp.type' to distinguish echo-request sweeps (8) from destination-unreachable bursts (3).",
+     ]),
+    (("dhcp",),
+     "dhcp",
+     [
+         "Filter to dhcp.option.dhcp == 2 (Offer) or 5 (ACK) and add column 'eth.src' to enumerate which MACs are serving DHCP.",
+         "Cross-reference each server MAC's vendor to identify whether it's a sanctioned device or rogue.",
+         "Right-click a server response → Conversation → Ethernet to see all clients that received a lease from it.",
      ]),
     (("public ip",),
      "ip",
@@ -1583,6 +1674,14 @@ _WIRESHARK_GUIDE: List[Tuple[Tuple[str, ...], str, List[str]]] = [
          "Use 'Statistics → Resolved Addresses' or external whois to corroborate the report's PTR/RDAP enrichment.",
          "Check whether the source is genuinely an OT-classed device or a misclassified IT host that legitimately needs internet access.",
      ]),
+    (("dual-zone", "direct ot-to-it", "sharing the same vlan", "multiple vlans", "ipv6 traffic"),
+     "",
+     [
+         "Use 'Statistics → Conversations → IPv4' and filter on the host to list every peer it talks to; peers in both IT and OT subnets confirm the bridge.",
+         "Add column 'vlan.id' to see which VLAN each frame was tagged with; a host or subnet appearing in several VLANs indicates flat or trunked segmentation.",
+         "For Windows services on OT hosts, filter tcp.port in {135, 139, 445, 3389, 5985, 5986} && ip.addr == <host> to see who uses SMB/RDP/WinRM on it.",
+         "For IPv6, filter 'ipv6' and check whether the addresses are link-local (fe80::/10) chatter or routed traffic.",
+     ]),
     (("baseline",),
      "",
      [
@@ -1590,95 +1689,55 @@ _WIRESHARK_GUIDE: List[Tuple[Tuple[str, ...], str, List[str]]] = [
          "Use 'Statistics → Conversations' to see total packet count and direction — a single packet may indicate a probe rather than established communication.",
          "Right-click → 'Follow' the TCP/UDP stream to confirm what the new flow is actually carrying.",
      ]),
-    (("capture discontinuity", "no ntp"),
+    (("capture discontinuity", "no ntp", "ntp servers", "short capture"),
      "frame",
      [
          "Use 'Statistics → Capture File Properties' to see exact start/end timestamps and detect rotation boundaries.",
          "Add column 'frame.time_delta' and sort to find the largest inter-packet gaps directly.",
          "If NTP is missing entirely, check whether any UDP/123 traffic exists at all (filter udp.port == 123) — the device may simply not sync time.",
      ]),
-    (("ja3", "offensive tool tls fingerprint", "cobalt strike", "metasploit framework"),
-     "tls.handshake.type == 1",
-     [
-         "Filter to TLS ClientHello frames (tls.handshake.type == 1) and add the column 'tls.handshake.ja3' to see JA3 hashes inline for all TLS clients.",
-         "Right-click the flagged source IP → Conversation Filter → IP to isolate all its TLS sessions and look for additional C2 callback patterns (regular intervals, unusual destinations).",
-         "Follow the TCP stream of any flagged connection to check for encrypted payload bursts consistent with C2 beaconing.",
-         "Cross-reference the source IP against the OT device inventory — an OT controller initiating outbound TLS to an unknown external host is high priority.",
-     ]),
-    (("high-entropy dns", "entropy dns", "dga"),
-     "dns",
-     [
-         "Filter to dns frames and add column '_ws.col.Info' plus 'dns.qry.name' to see query names in full — sort by name to group similar high-entropy strings.",
-         "Look for bursts of queries with no corresponding responses (dns.flags.response == 0) — DGA malware often queries many domains before one resolves.",
-         "Use 'Statistics → DNS' to see NXDOMAIN response rates; a rate above 50% for a single source is strongly indicative of DGA.",
-         "Check if the querying host is an OT device — OT devices should not be generating DNS queries at all in air-gapped or segmented environments.",
-     ]),
-    (("http form", "http post credential", "cleartext credentials extracted (http form)"),
-     "http.request.method == \"POST\"",
-     [
-         "Filter to HTTP POST requests (http.request.method == \"POST\") and add column 'http.request.uri' to see which login endpoints are being hit.",
-         "Right-click → Follow → TCP Stream to view the full POST body including the username and password fields in plaintext.",
-         "Note the destination IP and port — OT devices running embedded web interfaces on non-standard ports (8000, 9000) often transmit credentials without TLS.",
-         "Check whether the same credentials appear in multiple streams or to multiple targets (credential reuse / spray pattern).",
-     ]),
-    (("omron fins", "fins write", "fins control"),
+    (("omron fins",),
      "tcp.port == 9600 || udp.port == 9600",
      [
-         "Filter to TCP/UDP port 9600 and expand the 'FINS' tree in any frame to see the Command Code (first two bytes: e.g. 0x01 0x02 = Memory Area Write).",
-         "Add columns 'fins.command_code' and 'fins.sub_address' if the FINS dissector populates them in your Wireshark build.",
-         "Right-click a FINS frame → 'Follow → TCP Stream' to see the full request/response sequence and identify the source's access pattern.",
+         "Filter to TCP/UDP port 9600; Wireshark's Omron FINS dissector decodes the command — add column 'omron.command' to see Memory Area Read/Write, Run and Stop requests.",
+         "Right-click a FINS frame → 'Follow → TCP Stream' (or UDP) to see the full request/response sequence and identify the source's access pattern.",
          "Cross-reference the source IP against the approved HMI/engineering list — FINS traffic from unexpected hosts is high priority.",
      ]),
-    (("ge srtp", "ge-srtp"),
+    (("ge srtp",),
      "tcp.port == 18245",
      [
          "Filter to TCP/18245 and right-click → 'Follow → TCP Stream' to reconstruct the full SRTP session.",
-         "GE SRTP has limited Wireshark dissection; look for consistent 4-byte or 8-byte request headers that identify service codes.",
-         "Verify the source IP is an approved GE Proficy or Machine Edition engineering station.",
-     ]),
-    (("schneider umas", "umas"),
-     "tcp.port == 1024",
-     [
-         "Filter to TCP/1024. Wireshark does not include a full UMAS dissector by default; traffic will appear as TCP data.",
-         "Right-click → 'Follow → TCP Stream' to read the raw UMAS session; look for the 0x02 / 0x03 UMAS service codes in the first bytes of each PDU.",
-         "Verify the source IP is an authorized Unity Pro / EcoStruxure Control Expert workstation.",
+         "GE SRTP has limited Wireshark dissection; look for consistent request headers that identify service codes.",
+         "Verify the source IP is an approved PACSystems engineering station (Proficy Machine Edition / PAC Machine Edition).",
      ]),
     (("mitsubishi melsec", "melsec"),
      "tcp.port == 5007",
      [
-         "Filter to TCP/5007. The MELSEC SLMP 3E frame always starts with bytes 0x50 0x00 (subheader); add a 'data.data' column and look for this prefix.",
-         "Right-click → 'Follow → TCP Stream' to see command codes: 0x1401 = Batch Write (bit), 0x1402 = Batch Write (word), 0x1001 = Remote Run.",
+         "Filter to TCP/5007. The MELSEC SLMP 3E frame starts with bytes 0x50 0x00 (subheader); add a 'data.data' column and look for this prefix.",
+         "Right-click → 'Follow → TCP Stream' to see command codes: 0x1401 = Batch Write, 0x1001 = Remote Run, 0x1002 = Remote Stop.",
          "Cross-reference the source IP against the approved GX Works or MX Component workstations.",
      ]),
-    (("osisoft pi", "pi server", "historian"),
-     "tcp.port == 9001",
+    (("osisoft pi",),
+     "tcp.port == 5450 || tcp.port == 5457",
      [
-         "Filter to TCP/9001 and right-click → 'Follow → TCP Stream' to inspect PI Interface or PI SDK session headers.",
-         "Look for PI tag read/write patterns — unusual volume from a non-engineering host may indicate historian exfiltration.",
+         "TCP/5450 is the PI Data Archive and TCP/5457 the PI AF Server; right-click → 'Follow → TCP Stream' to inspect session headers.",
          "Use 'Statistics → Conversations' to see all hosts communicating with the PI server and identify any unexpected sources.",
+         "Unusual volume from a non-engineering host may indicate historian data exfiltration or tampering.",
      ]),
     (("ignition gateway",),
-     "tcp.port == 4592",
+     "tcp.port in {62541, 8060, 8088, 8043}",
      [
-         "Filter to TCP/4592. If the Ignition OPC-UA dissector is active in your Wireshark build (opcua), it will decode the binary OPC-UA frames.",
-         "Look for 'OPN' (Open Secure Channel) requests and confirm the SecurityMode in the response — 'None' = no encryption.",
-         "Use 'Statistics → Conversations → TCP' to see which clients are actively polling the Ignition server.",
+         "TCP/62541 is the Ignition OPC UA server: use 'Decode As… → TCP port 62541 → OpcUa' to read the SecurityPolicyUri and MessageSecurityMode.",
+         "TCP/8060 is the gateway network, which uses TLS by default — cleartext on 8060 is a misconfiguration.",
+         "TCP/8088 (HTTP) and 8043 (HTTPS) serve the gateway web interface; prefer 8043 and confirm 8088 redirects to it.",
      ]),
-    (("node-red", "flow deployment"),
+    (("node-red",),
      "tcp.port == 1880",
      [
          "Filter to TCP/1880. Node-RED uses HTTP/REST — right-click any frame → 'Follow → HTTP Stream' to see the full request/response.",
          "Filter http.request.method == \"POST\" and http.request.uri contains \"/flows\" to find flow deployment events specifically.",
-         "Add column 'http.request.uri' to see which Node-RED endpoints are being accessed (editor, API, dashboard).",
+         "Add column 'http.authorization' — with adminAuth enabled, editor API calls carry a Bearer token; its absence means the editor is open.",
          "Any POST to /flows or /flow from an unexpected source IP is a critical finding requiring immediate investigation.",
-     ]),
-    (("modbus register value anomaly", "value anomaly"),
-     "modbus",
-     [
-         "Filter to Modbus frames and add columns 'modbus.reference_num' and 'modbus.regval_uint16' to see register addresses and values inline.",
-         "Right-click a flagged register's response frame → 'Follow → TCP Stream' to see the full read sequence and spot the anomalous value in context.",
-         "Sort the Modbus stream by time and look for the specific poll interval where the value jump occurred — compare neighboring frames for injected/out-of-sequence responses.",
-         "Cross-reference the anomalous value with the known engineering range for that register (check the P&ID or HMI configuration for expected min/max).",
      ]),
     (("zigbee", "zbee", "ieee 802.15.4", "wpan"),
      "zbee_nwk || zbee_aps || zbee_zcl || wpan",
@@ -1686,14 +1745,14 @@ _WIRESHARK_GUIDE: List[Tuple[Tuple[str, ...], str, List[str]]] = [
          "Filter to 'zbee_nwk || zbee_aps' to see all Zigbee network and application layer frames. Check the 'zbee_nwk.security' field — value 0 means no network-layer encryption.",
          "Expand the ZigBee NWK tree in any frame to see source/destination short addresses, frame type (Data / Command / Beacon), and the security sub-field.",
          "Use 'zbee_zcl' to filter for ZigBee Cluster Library frames. The 'zbee_zcl.cmd.id' field identifies the command (0x02 = Write Attributes, 0x00 = Read Attributes).",
-         "Cross-reference source MAC/extended addresses (wpan.src64) against your known device inventory. Unknown extended addresses indicate rogue or unregistered Zigbee devices.",
+         "Cross-reference source extended addresses (wpan.src64) against your known device inventory. Unknown extended addresses indicate rogue or unregistered Zigbee devices.",
      ]),
     (("coap", "constrained application protocol"),
      "coap || udp.port == 5683 || udp.port == 5684",
      [
          "Filter to 'coap' to see all CoAP frames. The 'coap.code' column shows the method (0.01=GET, 0.02=POST, 0.03=PUT, 0.04=DELETE) — PUT and POST are write operations.",
          "Traffic on UDP/5683 is cleartext CoAP; UDP/5684 should be DTLS-protected. Presence of 5683 traffic means content is readable by any observer on the network.",
-         "Expand the CoAP tree and check 'coap.uri_path' to see which resource is being accessed. Control or configuration paths (e.g. /actuator, /config, /cmd) are high-priority.",
+         "Add column 'coap.opt.uri_path' to see which resource is being accessed. Control or configuration paths (e.g. /actuator, /config, /cmd) are high-priority.",
          "Use Statistics → Endpoints to identify which devices are sending CoAP write operations (POST/PUT). Confirm each is an authorized controller.",
      ]),
     (("z-wave", "zwave"),
@@ -1704,23 +1763,27 @@ _WIRESHARK_GUIDE: List[Tuple[Tuple[str, ...], str, List[str]]] = [
          "Identify the Z-Wave Home ID in the frame header — each Z-Wave network has a unique Home ID. Multiple Home IDs in a single capture may indicate overlapping or rogue networks.",
          "Z-Wave S2 security uses AES-128. If you see unencrypted command frames (no security encapsulation), the network is using S0 or no security — a significant risk for door locks and access control.",
      ]),
-    (("av_media", "rtsp", "onvif", "sip (voip)", "rtp media", "mpeg-ts", "rtmp"),
+    (("av_media", "rtsp", "sip (voip)", "rtp media", "mpeg-ts", "rtmp"),
      "sip || rtp || rtsp || mp2t || rtmpt",
      [
          "Use 'Telephony → RTP → RTP Streams' to list every detected stream with source, destination, payload type, packet count, and jitter — this is the fastest inventory of who is streaming to whom.",
          "For SIP calls, use 'Telephony → VoIP Calls' to see call setup, parties, and duration; select a call and press 'Flow Sequence' for the full signaling ladder.",
-         "For camera traffic, filter 'rtsp' and Follow → TCP Stream on a SETUP/PLAY exchange — the stream URI reveals the camera channel, and the Transport header shows the ports the video will use.",
+         "For camera traffic, filter 'rtsp' and Follow → TCP Stream on a SETUP/PLAY exchange — the stream URI reveals the camera channel, and a 401 reply (rtsp.status == 401) shows the camera demanded credentials.",
          "For unclassified UDP streams, right-click a packet → 'Decode As → RTP' to test whether it is unsignaled RTP; then check 'Statistics → Conversations → UDP' sorted by bytes to gauge bandwidth.",
          "For multicast video, filter 'ip.dst >= 224.0.0.0' and check IGMP membership reports to see which hosts subscribed to the stream.",
      ]),
 ]
 
+_WIRESHARK_FALLBACK: Tuple[str, List[str]] = ("", [
+    "Open the listed source pcap(s) in Wireshark.",
+    "Each evidence line in this report ends with `@<epoch>` — paste that into the display filter as `frame.time_epoch == <value>` to jump to the exact frame.",
+    "Right-click the highlighted frame → 'Follow → TCP/UDP Stream' to see the full conversation and confirm intent.",
+    "Use 'Statistics → Conversations' to enumerate every flow involving the source and destination IPs.",
+])
 
-def wireshark_steps_for_finding(finding: "Finding") -> Tuple[str, List[str]]:
-    """Return (display_filter, steps[]) for how to investigate this
-    finding further in Wireshark.  Falls back to a generic guide when
-    no specific entry matches.
-    """
+
+def wireshark_guide_for(finding: "Finding") -> Optional[Tuple[str, List[str]]]:
+    """Return the specific (display_filter, steps) guide for a finding, or None."""
     haystack = " ".join([
         finding.title.lower(),
         " ".join(finding.tags).lower(),
@@ -1730,13 +1793,14 @@ def wireshark_steps_for_finding(finding: "Finding") -> Tuple[str, List[str]]:
     for keys, dfilter, steps in _WIRESHARK_GUIDE:
         if any(k in haystack for k in keys):
             return dfilter, steps
-    # Fallback generic guidance
-    return ("", [
-        "Open the listed source pcap(s) in Wireshark.",
-        "Each evidence line in this report ends with `@<epoch>` — paste that into the display filter as `frame.time_epoch == <value>` to jump to the exact frame.",
-        "Right-click the highlighted frame → 'Follow → TCP/UDP Stream' to see the full conversation and confirm intent.",
-        "Use 'Statistics → Conversations' to enumerate every flow involving the source and destination IPs.",
-    ])
+    return None
+
+
+def wireshark_steps_for_finding(finding: "Finding") -> Tuple[str, List[str]]:
+    """Return (display_filter, steps[]) for investigating this finding in
+    Wireshark, falling back to generic guidance when no entry matches.
+    """
+    return wireshark_guide_for(finding) or _WIRESHARK_FALLBACK
 
 
 def related_findings_for_finding(session: "SessionState", finding: "Finding", limit: int = 3) -> List[str]:
@@ -1865,14 +1929,49 @@ class TSharkError(RuntimeError):
     """Raised when a tshark subprocess call fails."""
 
 
+# Captures that ended mid-packet (or hit a corrupt record).  tshark still
+# yields every complete packet before the damage, so these are analyzed
+# normally and only flagged — truncation is routine for field captures.
+_PARTIAL_READ_MARKERS = ("cut short in the middle of a packet", "appears to be damaged or corrupt")
+_PARTIAL_CAPTURES: Dict[str, str] = {}
+
+
 def run_tshark(display_filter: str, fields: Sequence[str], pcap_file: Path) -> List[Dict[str, str]]:
     """Run tshark and return structured rows for one pcap file."""
     rows = list(iter_tshark_rows(display_filter, fields, pcap_file))
     return rows
 
 
+_TSHARK_FIELD_NAMES: Optional[set] = None
+
+
+def _tshark_field_names() -> set:
+    """Field and protocol names this tshark build knows (empty set if unknown).
+
+    tshark rejects an entire command when any -e field is missing from the
+    build, so fields are filtered against this list first and missing ones
+    simply read as empty.
+    """
+    global _TSHARK_FIELD_NAMES
+    if _TSHARK_FIELD_NAMES is None:
+        names: set = set()
+        try:
+            result = subprocess.run(["tshark", "-G", "fields"], capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=120)
+            for line in result.stdout.splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 3 and parts[0] in ("F", "P"):
+                    names.add(parts[2])
+        except (OSError, subprocess.SubprocessError):
+            names = set()
+        _TSHARK_FIELD_NAMES = names
+    return _TSHARK_FIELD_NAMES
+
+
 def iter_tshark_rows(display_filter: str, fields: Sequence[str], pcap_file: Path) -> Iterable[Dict[str, str]]:
-    """Stream tshark field output as dictionaries."""
+    """Stream tshark field output as dictionaries (every requested key present)."""
+    known_fields = _tshark_field_names()
+    requested = [name for name in fields if not known_fields or name in known_fields or name.startswith("_ws.")]
     command = [
         "tshark",
         # -n disables ALL name resolution (MAC/network/transport). Without
@@ -1894,8 +1993,9 @@ def iter_tshark_rows(display_filter: str, fields: Sequence[str], pcap_file: Path
     ]
     if display_filter:
         command.extend(["-Y", display_filter])
-    for field_name in fields:
+    for field_name in requested:
         command.extend(["-e", field_name])
+    missing = [name for name in fields if name not in requested]
     # Redirect stderr to a spooled temp file (in-memory up to 1 MB,
     # disk-backed beyond) instead of subprocess.PIPE.  This avoids the
     # pipe-fills-and-tshark-blocks deadlock that occurs on noisy captures
@@ -1917,11 +2017,14 @@ def iter_tshark_rows(display_filter: str, fields: Sequence[str], pcap_file: Path
         for line in process.stdout:
             line = line.rstrip("\n")
             values = line.split("\t")
-            if len(values) < len(fields):
-                values.extend([""] * (len(fields) - len(values)))
-            elif len(values) > len(fields):
-                values = values[: len(fields)]
-            yield {fields[index]: values[index].strip() for index in range(len(fields))}
+            if len(values) < len(requested):
+                values.extend([""] * (len(requested) - len(values)))
+            elif len(values) > len(requested):
+                values = values[: len(requested)]
+            row = {requested[index]: values[index].strip() for index in range(len(requested))}
+            for name in missing:
+                row[name] = ""
+            yield row
         completed_normally = True
     finally:
         # Always tear down the subprocess — even if the caller broke out
@@ -1960,7 +2063,14 @@ def iter_tshark_rows(display_filter: str, fields: Sequence[str], pcap_file: Path
             except Exception:
                 pass
         if completed_normally and process.returncode not in (0, None):
-            raise TSharkError(stderr_text or f"tshark failed for {pcap_file}")
+            if any(marker in stderr_text for marker in _PARTIAL_READ_MARKERS):
+                if str(pcap_file) not in _PARTIAL_CAPTURES:
+                    _PARTIAL_CAPTURES[str(pcap_file)] = stderr_text.splitlines()[-1] if stderr_text else ""
+                    print(colorize(
+                        f"[!] {pcap_file.name}: capture ends with a truncated or damaged record — "
+                        "every complete packet before it is analyzed.", SEVERITY_MEDIUM))
+            else:
+                raise TSharkError(stderr_text or f"tshark failed for {pcap_file}")
 
 
 BASE_PACKET_FIELDS = [
@@ -2002,6 +2112,41 @@ BASE_PACKET_FIELDS = [
     # Audio/Video streaming — RTP payload type (empty on non-RTP frames).
     # 0-23 audio, 24-34 video (33 = MPEG-TS mux), >=96 dynamic (H.264/Opus/...).
     "rtp.p_type",
+    # Structured protocol fields.  Detectors read these instead of parsing the
+    # Info column, which never carries credentials, cipher suites, community
+    # strings, or transaction IDs.  All are empty on unrelated frames.
+    "ip.id",
+    "mbtcp.trans_id",
+    "mbtcp.unit_id",
+    "modbus.func_code",
+    "modbus.exception_code",
+    "dnp3.dst",
+    "dnp3.al.func",
+    "bacapp.type",
+    "iec60870_asdu.typeid",
+    "iec60870_asdu.causetx",
+    "s7comm.header.rosctr",
+    "tcp.seq",
+    "tcp.len",
+    "mqtt.msgtype",
+    "mqtt.clientid",
+    "mqtt.conflag.uname",
+    "mqtt.topic",
+    "mqtt.retain",
+    "snmp.version",
+    "snmp.community",
+    "snmp.data",
+    "tls.handshake.type",
+    "tls.handshake.version",
+    "tls.handshake.ciphersuite",
+    "tls.handshake.extensions.supported_version",
+    "tls.alert_message.desc",
+    "opcua.MessageSecurityMode",
+    "opcua.security.spu",
+    "rtsp.method",
+    "rtsp.status",
+    "http.response.code",
+    "http.authorization",
 ]
 
 # Superset used only for checks that need payload content (legacy, artifact extraction).
@@ -2014,7 +2159,70 @@ PAYLOAD_PACKET_FIELDS = BASE_PACKET_FIELDS + [
     "http.server",
     "http.request.method",
     "http.host",
+    "mqtt.username",
+    "mqtt.passwd",
 ]
+
+
+def _tcp_flag_bits(row: Dict[str, str]) -> int:
+    """Return the TCP flags of a row as an int (0 for non-TCP rows)."""
+    try:
+        return int(row.get("tcp.flags") or "0", 16)
+    except ValueError:
+        return 0
+
+
+def _int_field(row: Dict[str, str], name: str, default: int = -1) -> int:
+    """Parse a numeric tshark field (decimal or 0x-hex); `default` when absent.
+
+    Fields that occur more than once in a frame arrive comma-separated; the
+    first occurrence is used.
+    """
+    text = (row.get(name) or "").split(",")[0].strip()
+    if not text:
+        return default
+    try:
+        return int(text, 0)
+    except ValueError:
+        return default
+
+
+_CIPHER_NAMES: Optional[Dict[int, str]] = None
+
+
+def tls_cipher_name(code: int) -> str:
+    """Return the IANA name of a TLS cipher suite from tshark's value table (offline)."""
+    global _CIPHER_NAMES
+    if _CIPHER_NAMES is None:
+        names: Dict[int, str] = {}
+        try:
+            result = subprocess.run(["tshark", "-G", "values"], capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=120)
+            for line in result.stdout.splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 4 and parts[0] == "V" and parts[1] == "tls.handshake.ciphersuite":
+                    try:
+                        names[int(parts[2], 0)] = parts[3]
+                    except ValueError:
+                        continue
+        except (OSError, subprocess.SubprocessError):
+            names = {}
+        _CIPHER_NAMES = names
+    return _CIPHER_NAMES.get(code, f"0x{code:04x}")
+
+
+def weak_cipher_label(name: str) -> str:
+    """Classify a cipher-suite name as weak; '' when it is acceptable."""
+    upper = name.upper()
+    for marker, label in (("_NULL_", "NULL"), ("_ANON_", "anonymous"), ("EXPORT", "EXPORT"), ("RC4", "RC4"),
+                          ("3DES", "3DES"), ("DES_CBC", "DES"), ("_MD5", "MD5")):
+        if marker in upper or upper.endswith(marker.rstrip("_")):
+            return label
+    return ""
+
+
+_TLS_VERSION_NAMES = {0x0002: "SSLv2", 0x0300: "SSLv3", 0x0301: "TLS 1.0", 0x0302: "TLS 1.1",
+                      0x0303: "TLS 1.2", 0x0304: "TLS 1.3"}
 
 
 def row_source_ip(row: Dict[str, str]) -> str:
@@ -2141,12 +2349,7 @@ def select_pcaps_from_folder(folder: Path, exclude_filenames: Optional[Sequence[
     """List pcap files recursively and prompt the user to select some."""
     exclude = set(exclude_filenames or [])
     pcaps = sorted(
-        [
-            path for path in folder.rglob("*")
-            if path.is_file()
-            and path.suffix.lower() in {".pcap", ".pcapng"}
-            and path.name not in exclude
-        ],
+        [path for path in folder.rglob("*") if is_capture_file(path) and path.name not in exclude],
         key=lambda item: (str(item.parent), item.name.lower()),
     )
     if not pcaps:
@@ -2192,18 +2395,18 @@ def select_pcaps_from_folder(folder: Path, exclude_filenames: Optional[Sequence[
 
 
 def collect_pcaps_from_path(path: Path) -> List[Path]:
-    """Return all pcap/pcapng files under *path* without prompting.
+    """Return all capture files under *path* without prompting.
 
-    Accepts either a single pcap file or a directory (searched recursively).
+    Accepts either a single capture file or a directory (searched recursively).
     """
     if path.is_file():
-        if path.suffix.lower() not in {".pcap", ".pcapng"}:
-            raise SystemExit(f"Not a pcap file: {path}")
+        if not is_capture_file(path):
+            raise SystemExit(f"Not a capture file ({', '.join(CAPTURE_SUFFIXES)}): {path}")
         return [path]
     if not path.is_dir():
         raise SystemExit(f"Path not found: {path}")
     pcaps = sorted(
-        [p for p in path.rglob("*") if p.is_file() and p.suffix.lower() in {".pcap", ".pcapng"}],
+        [p for p in path.rglob("*") if is_capture_file(p)],
         key=lambda p: (str(p.parent), p.name.lower()),
     )
     if not pcaps:
@@ -2282,19 +2485,25 @@ _CATEGORY_PREFIX_MAP: Dict[str, str] = {
     "Absence of Expected Traffic":       "ABSENCE",
     "Baseline Deviation":                "BASELINE",
     "Protection Guidance":               "PROTECT",
+    "Assessor Notes":                    "NOTE",
 }
+
+# Categories rendered in their own report sections instead of Priority Findings,
+# and excluded from the risk score (they are advice / annotations, not observations).
+NON_SCORING_CATEGORIES = {"Protection Guidance", "Assessor Notes"}
 
 # MITRE ATT&CK for ICS technique names (for display in the coverage table)
 _MITRE_ICS_NAMES: Dict[str, str] = {
     "T0812": "Default Credentials",
     "T0814": "Denial of Service",
     "T0816": "Device Restart/Shutdown",
-    "T0828": "Loss of Productivity",
+    "T0828": "Loss of Productivity and Revenue",
     "T0830": "Adversary-in-the-Middle",
     "T0831": "Manipulation of Control",
+    "T0832": "Manipulation of View",
+    "T0835": "Manipulate I/O Image",
     "T0836": "Modify Parameter",
     "T0840": "Network Connection Enumeration",
-    "T0841": "Network Service Scanning",
     "T0842": "Network Sniffing",
     "T0843": "Program Download",
     "T0845": "Program Upload",
@@ -2302,11 +2511,13 @@ _MITRE_ICS_NAMES: Dict[str, str] = {
     "T0855": "Unauthorized Command Message",
     "T0856": "Spoof Reporting Message",
     "T0857": "System Firmware",
-    "T0858": "Manipulate I/O Image",
+    "T0858": "Change Operating Mode",
     "T0859": "Valid Accounts",
     "T0866": "Exploitation of Remote Services",
+    "T0869": "Standard Application Layer Protocol",
     "T0878": "Alarm Suppression",
     "T0882": "Theft of Operational Information",
+    "T0883": "Internet Accessible Device",
     "T0884": "Connection Proxy",
     "T0885": "Commonly Used Port",
     "T0886": "Remote Services",
@@ -2331,7 +2542,7 @@ def detection_confidence_for_finding(finding: "Finding") -> str:
                                 "dnp3 cold restart", "dnp3 warm restart", "plc stop",
                                 "s7 write", "authentication failure")):
         return "High"
-    if any(t in text for t in ("replay", "identical modbus response", "possible",
+    if any(t in text for t in ("replay", "duplicate or unsolicited modbus", "possible",
                                 "may indicate")):
         return "Medium"
     if any(t in text for t in ("unknown", "unclassified", "absence")):
@@ -2347,7 +2558,7 @@ def maliciousness_confidence_for_finding(finding: "Finding") -> str:
     if any(t in text for t in ("adversary-in-the-middle attack pattern", "mitm attack",
                                 "suspicious tool", "mimikatz", "cobalt strike", "metasploit")):
         return "High"
-    if any(t in text for t in ("replay", "identical modbus response", "arp spoof",
+    if any(t in text for t in ("replay", "duplicate or unsolicited modbus", "arp spoof",
                                 "gratuitous arp burst")):
         return "Medium"
     if any(t in text for t in ("modbus register scanning", "register scanning",
@@ -2369,11 +2580,12 @@ def ot_significance_for_finding(finding: "Finding") -> str:
     ]).lower()
     if any(t in text for t in ("register scanning",)):
         return (
-            "Sequential register reads across a wide address space are consistent with "
-            "reconnaissance of a controller's internal state — mapping which registers hold "
-            "process values, setpoints, or status bits.  While an engineer may perform this "
-            "during commissioning, the same pattern from an unknown host is a common precursor "
-            "to targeted manipulation."
+            "Reads that sweep many different register addresses, each only once or twice, are "
+            "consistent with reconnaissance of a controller's internal state — mapping which "
+            "registers hold process values, setpoints, or status bits.  An HMI instead re-reads "
+            "the same short scan list every cycle.  An engineer may sweep a map during "
+            "commissioning, but the same pattern from an unknown host is a common precursor to "
+            "targeted manipulation."
         )
     if any(t in text for t in ("polling burst", "polling anomaly")):
         return (
@@ -2383,12 +2595,14 @@ def ot_significance_for_finding(finding: "Finding") -> str:
             "against the controller.  Sustained abnormal polling can exhaust controller "
             "resources and disrupt process control."
         )
-    if any(t in text for t in ("replay", "identical modbus response")):
+    if any(t in text for t in ("replay", "duplicate or unsolicited modbus")):
         return (
-            "Replay behavior — receiving identical responses at anomalous timing intervals — "
-            "is a known OT attack pattern where an attacker feeds a controller pre-recorded "
-            "legitimate data to mask real-world sensor values.  This is particularly serious "
-            "in safety-critical processes where operators rely on controller feedback."
+            "A Modbus server answers each request exactly once.  A second answer to the same "
+            "transaction, or an answer to a request that was never sent, is how injected or "
+            "replayed responses appear on the wire — the technique an attacker uses to show "
+            "operators false process values while the real process changes.  This is "
+            "particularly serious in safety-critical processes where operators rely on "
+            "controller feedback."
         )
     if any(t in text for t in ("arp spoof", "adversary-in-the-middle", "mitm")):
         return (
@@ -2479,10 +2693,10 @@ def auditor_guidance_for_finding(finding: "Finding") -> List[str]:
             "Check whether the controller's CPU utilization was affected during the burst period.",
             "If unexplained, check for rogue HMI software, misconfigured historian, or unauthorized device.",
         ]
-    if any(t in text for t in ("replay", "identical modbus response")):
+    if any(t in text for t in ("replay", "duplicate or unsolicited modbus")):
         return [
             "Validate whether the affected device was in a normal operating state during the capture.",
-            "Ask site staff whether any network taps, traffic mirrors, or test equipment were active.",
+            "Ask site staff whether any protocol gateways, redundant servers, or test equipment answer for this device.",
             "Compare the captured Modbus responses against known-good process values for the same period.",
             "If no legitimate explanation exists, treat as potential replay injection and investigate the network path.",
         ]
@@ -2529,8 +2743,8 @@ def benign_explanation_for_finding(finding: "Finding") -> str:
         return "This finding would be benign if the source is a licensed engineering workstation performing routine commissioning, maintenance, or diagnostic reads with site approval."
     if any(t in text for t in ("polling burst",)):
         return "This finding would be benign if the increased polling rate was a deliberate configuration change or occurred during a scheduled data-collection or commissioning activity."
-    if any(t in text for t in ("replay", "identical modbus response")):
-        return "This finding would be benign if a network mirror, protocol gateway, or retransmission mechanism was active during the capture period."
+    if any(t in text for t in ("replay", "duplicate or unsolicited modbus")):
+        return "This finding would be benign if a protocol gateway or redundant server pair legitimately answers for the device, or if the capture merged two mirror sources that duplicated frames (TCP retransmissions are already excluded)."
     if any(t in text for t in ("arp spoof", "adversary-in-the-middle", "mitm")):
         return "This finding would be benign if a network monitoring appliance, IDS sensor, or traffic mirror was installed on the subnet using promiscuous mode or transparent bridging."
     if any(t in text for t in ("write", "direct operate", "control operation")):
@@ -2553,7 +2767,7 @@ def build_network_interpretation_summary(session: "SessionState") -> List[str]:
 
     ot_initiators: List["DeviceRecord"] = []
     ot_responders: List["DeviceRecord"] = []
-    it_noise_on_ot = False
+    it_noise_on_ot = any("it-on-ot" in finding.tags for finding in session.findings)
 
     for dev in devices.values():
         role = (dev.inferred_role or "").lower()
@@ -2561,10 +2775,6 @@ def build_network_interpretation_summary(session: "SessionState") -> List[str]:
             ot_initiators.append(dev)
         elif any(r in role for r in ("plc", "rtu", "controller", "field device", "server")):
             ot_responders.append(dev)
-        it_noise_protocols = {"mdns", "llmnr", "nbns", "ssdp"}
-        if (any(p.lower() in it_noise_protocols for p in dev.protocols)
-                and "OT" in (dev.inferred_zone or "")):
-            it_noise_on_ot = True
 
     ot_initiators.sort(key=lambda d: d.outgoing_count + d.incoming_count, reverse=True)
     ot_responders.sort(key=lambda d: d.outgoing_count + d.incoming_count, reverse=True)
@@ -2593,10 +2803,10 @@ def build_network_interpretation_summary(session: "SessionState") -> List[str]:
 
     if it_noise_on_ot:
         paragraphs.append(
-            "IT-style broadcast protocols (mDNS, LLMNR, NBNS, SSDP) were observed on what "
-            "appear to be OT network segments.  These originate from Windows-based HMIs or "
-            "engineering workstations but may also indicate insufficient segmentation between "
-            "IT and OT zones or the presence of unauthorized IT devices on OT subnets."
+            "IT-style discovery protocols (mDNS, LLMNR, NetBIOS, SSDP, WS-Discovery) were observed "
+            "on subnets that hold OT devices.  Windows-based HMIs and engineering workstations emit "
+            "these by default, but they can also indicate insufficient segmentation between IT and "
+            "OT zones or unauthorized IT devices on OT subnets."
         )
 
     ephemeral_count = sum(
@@ -2605,9 +2815,11 @@ def build_network_interpretation_summary(session: "SessionState") -> List[str]:
     )
     if ephemeral_count > 10:
         paragraphs.append(
-            f"{ephemeral_count:,} flows use high ephemeral destination ports (>49151).  "
-            "These are typically response-side ports on the initiating host — not "
-            "independently meaningful services — and do not require individual firewall rules."
+            f"{ephemeral_count:,} flows reach services on dynamic-range ports (above 49151).  "
+            "Flow direction is taken from the TCP handshake or the well-known service port, so "
+            "these are real listeners on high ports — typically Windows RPC/DCOM endpoints (for "
+            "example OPC DA), RTP media, or vendor protocols.  Fixed-port firewall rules cannot "
+            "describe them; review with the site which of them are expected."
         )
 
     paragraphs.append(
@@ -2637,6 +2849,44 @@ class OTPcapAnalyzer:
         self.packet_fingerprint_set: set[str] = set()
         self.finding_index: Dict[str, Finding] = {}
         self.public_ip_cache: Dict[str, Dict[str, str]] = {}
+        # TCP connections whose SYN was seen: endpoint pair -> server endpoint.
+        self._tcp_servers: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Tuple[str, int]] = {}
+
+    TCP_ORIENTATION_CAP = 500_000
+    EVIDENCE_CAP = 50
+    MERGED_IP_CAP = 1000
+
+    def _orient(self, row: Dict[str, str]) -> Tuple[str, str, int, str, bool]:
+        """Return (client_ip, server_ip, service_port, transport, to_server) for a row.
+
+        The server side comes from the TCP handshake when it was captured,
+        otherwise from well-known service ports.  `to_server` is True when
+        this packet travels from the client toward the service.
+        """
+        src, dst = row_source_ip(row), row_destination_ip(row)
+        sport, dport = row_source_port(row), row_destination_port(row)
+        if row.get("tcp.srcport"):
+            transport = "TCP"
+        elif row.get("udp.srcport"):
+            transport = "UDP"
+        else:
+            return src, dst, 0, "", True
+        pair = ((src, sport), (dst, dport)) if (src, sport) <= (dst, dport) else ((dst, dport), (src, sport))
+        server = self._tcp_servers.get(pair) if transport == "TCP" else None
+        if server is None and transport == "TCP":
+            syn_ack = _tcp_flag_bits(row) & 0x12
+            if syn_ack == 0x02:
+                server = (dst, dport)
+            elif syn_ack == 0x12:
+                server = (src, sport)
+            if server is not None and len(self._tcp_servers) < self.TCP_ORIENTATION_CAP:
+                self._tcp_servers[pair] = server
+        if server is None:
+            service = service_port_for(sport, dport)
+            server = (dst, dport) if service == dport else (src, sport)
+        if server == (dst, dport):
+            return src, dst, dport, transport, True
+        return dst, src, sport, transport, False
 
     def set_session(self, session: SessionState) -> None:
         """Attach a session and refresh runtime indexes."""
@@ -2746,9 +2996,14 @@ class OTPcapAnalyzer:
         finding.score_weight = SCORE_WEIGHTS.get(finding.severity, 0)
         if finding.dedupe_key and finding.dedupe_key in self.finding_index:
             existing = self.finding_index[finding.dedupe_key]
-            existing.evidence = sorted(set(existing.evidence + finding.evidence))
-            existing.source_ips = sorted(set(existing.source_ips + finding.source_ips))
-            existing.destination_ips = sorted(set(existing.destination_ips + finding.destination_ips))
+            existing.occurrences += finding.occurrences
+            # Bounded merges: per-packet detectors can hit the same key
+            # millions of times, so evidence and host lists stop growing at
+            # a cap instead of being re-sorted without limit.
+            existing.evidence = self._bounded_union(existing.evidence, finding.evidence, self.EVIDENCE_CAP)
+            existing.source_ips = self._bounded_union(existing.source_ips, finding.source_ips, self.MERGED_IP_CAP)
+            existing.destination_ips = self._bounded_union(existing.destination_ips, finding.destination_ips,
+                                                           self.MERGED_IP_CAP)
             existing.source_pcaps = sorted(set(existing.source_pcaps + finding.source_pcaps))
             existing.tags = sorted(set(existing.tags + finding.tags))
             existing.mitre_ids = sorted(set(existing.mitre_ids + finding.mitre_ids))
@@ -2761,6 +3016,18 @@ class OTPcapAnalyzer:
         self.session.findings.append(finding)
         if finding.dedupe_key:
             self.finding_index[finding.dedupe_key] = finding
+
+    @staticmethod
+    def _bounded_union(existing: List[str], new: Sequence[str], cap: int) -> List[str]:
+        """Sorted union of two lists that stops adding items once `cap` is reached."""
+        if len(existing) >= cap:
+            return existing
+        merged = set(existing)
+        for item in new:
+            if len(merged) >= cap:
+                break
+            merged.add(item)
+        return sorted(merged)
 
     def add_finding(
         self,
@@ -2899,26 +3166,42 @@ class OTPcapAnalyzer:
         if value not in items:
             items.append(value)
 
-    def _connection_key(self, source_ip: str, destination_ip: str, protocol: str, destination_port: int) -> str:
-        """Build a stable key for a connection summary."""
-        return f"{source_ip}|{destination_ip}|{protocol}|{destination_port}"
+    _GENERIC_PROTOCOL_LABELS = {"", "TCP", "UDP", "Unknown", "DATA"}
 
-    def _register_connection(self, source_ip: str, destination_ip: str, protocol: str, destination_port: int, pcap_name: str, timestamp: Optional[str]) -> None:
-        """Update the connection registry."""
+    def _connection_key(self, client_ip: str, server_ip: str, transport: str, service_port: int) -> str:
+        """Build a stable key for a connection summary."""
+        return f"{client_ip}|{server_ip}|{transport}|{service_port}"
+
+    def _register_connection(self, client_ip: str, server_ip: str, label: str, transport: str, service_port: int,
+                             pcap_name: str, timestamp: Optional[str], symmetric: bool = False) -> None:
+        """Count a packet against its client -> server:service_port flow.
+
+        Both directions of a conversation land on one record, labeled with
+        the most specific protocol seen (e.g. 'DNP3' rather than 'TCP').
+        `symmetric` flows (same port both ways, or port-less like ICMP) keep
+        the orientation of whichever direction was seen first.
+        """
         assert self.session is not None
-        key = self._connection_key(source_ip, destination_ip, protocol, destination_port)
+        transport_key = transport or label or "IP"
+        key = self._connection_key(client_ip, server_ip, transport_key, service_port)
         if key not in self.session.connections:
-            self.session.connections[key] = ConnectionSummary(
-                source_ip=source_ip,
-                destination_ip=destination_ip,
-                protocol=protocol,
-                destination_port=destination_port,
-                packet_count=0,
-                first_seen=timestamp,
-                last_seen=timestamp,
-                source_pcaps=[pcap_name],
-            )
+            reverse = self._connection_key(server_ip, client_ip, transport_key, service_port)
+            if symmetric and reverse in self.session.connections:
+                key = reverse
+            else:
+                self.session.connections[key] = ConnectionSummary(
+                    source_ip=client_ip,
+                    destination_ip=server_ip,
+                    protocol=label or transport_key,
+                    destination_port=service_port,
+                    packet_count=0,
+                    first_seen=timestamp,
+                    last_seen=timestamp,
+                    source_pcaps=[pcap_name],
+                )
         connection = self.session.connections[key]
+        if connection.protocol in self._GENERIC_PROTOCOL_LABELS and label not in self._GENERIC_PROTOCOL_LABELS:
+            connection.protocol = label
         connection.packet_count += 1
         if timestamp and (connection.first_seen is None or timestamp < connection.first_seen):
             connection.first_seen = timestamp
@@ -2929,19 +3212,22 @@ class OTPcapAnalyzer:
     def _packet_fingerprint(self, row: Dict[str, str]) -> str:
         """Build the cross-file deduplication fingerprint for a packet.
 
-        Uses millisecond precision so sub-second high-frequency polling packets
-        are not incorrectly collapsed as duplicates.  frame.len replaces payload
-        hashing since payload fields are no longer in BASE_PACKET_FIELDS.
+        Millisecond timestamp plus addressing (MACs, IPs, ports, IP ID) and
+        frame length: the same frame captured into two overlapping pcaps
+        matches, while distinct frames sent in the same millisecond — ARP
+        bursts, cyclic PROFINET/GOOSE — stay distinct.
         """
-        source_ip = row_source_ip(row)
-        destination_ip = row_destination_ip(row)
-        protocol = protocol_family_from_row(row)
-        frame_len = row.get("frame.len") or "0"
         try:
             timestamp_ms = int(float(row.get("frame.time_epoch") or "0") * 1000)
         except ValueError:
             timestamp_ms = 0
-        fingerprint_base = f"{source_ip}|{destination_ip}|{protocol}|{timestamp_ms}|{frame_len}"
+        fingerprint_base = "|".join([
+            row_source_ip(row), row_destination_ip(row),
+            row.get("eth.src") or "", row.get("eth.dst") or "",
+            str(row_source_port(row)), str(row_destination_port(row)),
+            row.get("ip.id") or "", protocol_family_from_row(row),
+            str(timestamp_ms), row.get("frame.len") or "0",
+        ])
         return hashlib.sha1(fingerprint_base.encode("utf-8")).hexdigest()
 
     def _register_packet_row(self, row: Dict[str, str], pcap_name: str) -> bool:
@@ -2953,6 +3239,7 @@ class OTPcapAnalyzer:
         protocol = protocol_family_from_row(row)
         destination_port = row_destination_port(row)
         source_port = row_source_port(row)
+        client_ip, server_ip, service_port, transport, to_server = self._orient(row)
         fingerprint = self._packet_fingerprint(row)
         if fingerprint in self.packet_fingerprint_set:
             self.session.duplicate_packets.setdefault(fingerprint, [])
@@ -2989,18 +3276,28 @@ class OTPcapAnalyzer:
                 self._remember_unique(device.vlans, vlan_id)
             if protocol:
                 self._remember_unique(device.protocols, protocol)
-            if source_port and direction == "out":
-                self._remember_unique(device.ports, source_port)
-            if destination_port and direction == "in":
-                self._remember_unique(device.ports, destination_port)
             if direction == "out":
                 device.outgoing_count += 1
                 if os_guess and not device.os_fingerprint:
                     device.os_fingerprint = os_guess
             else:
                 device.incoming_count += 1
+        # Service ports: a device "serves" a port only once it answers on it
+        # (a refused or unanswered probe proves nothing); same-port protocols
+        # such as BACnet or NTP are peers, so both ends get the port.
+        symmetric = not service_port or source_port == destination_port
+        if service_port and source_ip and destination_ip:
+            if source_port == destination_port:
+                for ip_text in (source_ip, destination_ip):
+                    self._remember_unique(self._device(ip_text).ports, service_port)
+                    self._remember_unique(self._device(ip_text).client_ports, service_port)
+            elif to_server:
+                self._remember_unique(self._device(client_ip).client_ports, service_port)
+            elif not _tcp_flag_bits(row) & 0x04:
+                self._remember_unique(self._device(server_ip).ports, service_port)
         if source_ip and destination_ip:
-            self._register_connection(source_ip, destination_ip, protocol, destination_port, pcap_name, timestamp)
+            self._register_connection(client_ip, server_ip, protocol, transport, service_port, pcap_name,
+                                      timestamp, symmetric=symmetric)
         return True
 
     # ------------------------------------------------------------------
@@ -3326,7 +3623,7 @@ class OTPcapAnalyzer:
         ot_protocol_markers = ("modbus", "bacnet", "dnp3", "opc", "ethernet/ip", "cip", "s7", "iec 61850", "profinet")
         if any(marker in " ".join(device.protocols).lower() for marker in ot_protocol_markers):
             return True
-        return any(port in KNOWN_OT_PORTS for port in device.ports)
+        return any(port in KNOWN_OT_PORTS for port in list(device.ports) + list(device.client_ports))
 
     def run_capture_inventory(self, pcaps: Sequence[Path]) -> int:
         """Always-run baseline inventory and deduplication stage."""
@@ -3385,7 +3682,7 @@ class OTPcapAnalyzer:
                     source_ip = row_source_ip(row)
                     destination_ip = row_destination_ip(row)
                     protocol = protocol_family_from_row(row)
-                    destination_port = row_destination_port(row)
+                    service_port = self._orient(row)[2]
                     if source_ip:
                         unique_ips_seen.add(source_ip)
                         subnet_counts[subnet_from_ip(source_ip)] += 1
@@ -3400,8 +3697,8 @@ class OTPcapAnalyzer:
                         unique_pairs[(source_ip, destination_ip)] += 1
                     if protocol:
                         protocol_counts[protocol] += 1
-                    if destination_port:
-                        port_counts[destination_port] += 1
+                    if service_port:
+                        port_counts[service_port] += 1
                 self.session.processed_pcaps[pcap.name] = ProcessedPcap(
                     path=str(pcap),
                     filename=pcap.name,
@@ -3411,6 +3708,7 @@ class OTPcapAnalyzer:
                     packet_count=raw_packet_count,
                     start_time=local_first,
                     end_time=local_last,
+                    truncated=str(pcap) in _PARTIAL_CAPTURES,
                 )
             except TSharkError as exc:
                 print(colorize(f"[!] Failed to inventory {pcap.name}: {exc}", SEVERITY_HIGH))
@@ -3477,302 +3775,233 @@ class OTPcapAnalyzer:
             print(colorize("[!] Capture appears biased toward a single host vantage point. Absence findings may be less reliable.", SEVERITY_MEDIUM))
         return 0
 
+    # Cleartext / legacy services, keyed by the service (server) port.
+    LEGACY_SERVICES: Dict[int, Tuple[str, str]] = {
+        23: (SEVERITY_CRITICAL, "Telnet observed"),
+        21: (SEVERITY_HIGH, "FTP observed"),
+        69: (SEVERITY_HIGH, "TFTP observed"),
+        80: (SEVERITY_HIGH, "HTTP observed on OT-adjacent device"),
+        161: (SEVERITY_HIGH, "SNMPv1/v2 observed"),
+        3389: (SEVERITY_HIGH, "RDP observed"),
+        5900: (SEVERITY_HIGH, "VNC observed"),
+        445: (SEVERITY_HIGH, "SMB observed"),
+        139: (SEVERITY_HIGH, "NetBIOS observed"),
+        512: (SEVERITY_CRITICAL, "rsh/rexec observed"),
+        513: (SEVERITY_CRITICAL, "rsh/rexec observed"),
+        110: (SEVERITY_HIGH, "POP3 observed"),
+        143: (SEVERITY_HIGH, "IMAP observed"),
+    }
+    _HTTP_CRED_PORTS = (80, 443, 8080, 8000, 8443, 8444, 9000, 4040)
+    _TELNET_FAILURE = re.compile(r"login incorrect|login failed|authentication fail|access denied|invalid login", re.I)
+    _TELNET_IAC = re.compile(rb"\xff[\xfb-\xfe].|\xff\xfa.*?\xff\xf0|\xff[\xf0-\xfa]", re.S)
+
     def check_legacy(self, pcaps: Sequence[Path]) -> int:
         """Analyze cleartext and legacy protocols (plus credential extraction)."""
-        # Port list includes POP3 (110), IMAP (143), MQTT (1883) so CONNECT credentials
-        # and mail auth strings fall through this payload pass too.
+        assert self.session is not None
         rows = self._filtered_rows(
             pcaps,
-            "tcp.port == 21 || tcp.port == 22 || tcp.port == 23 || udp.port == 69 "
-            "|| tcp.port == 80 || udp.port == 161 || tcp.port == 3389 || tcp.port == 5900 "
-            "|| tcp.port == 445 || tcp.port == 139 || udp.port == 123 "
-            "|| tcp.port == 512 || tcp.port == 513 "
-            "|| tcp.port == 110 || tcp.port == 143 || tcp.port == 1883",
+            "tcp.port in {21, 22, 23, 80, 110, 139, 143, 445, 512, 513, 1883, 3389, 5900} || udp.port in {69, 161} || http",
             fields=PAYLOAD_PACKET_FIELDS,
         )
         if not rows:
             return 0
-        severity_by_port = {
-            23: SEVERITY_CRITICAL,
-            21: SEVERITY_HIGH,
-            69: SEVERITY_HIGH,
-            80: SEVERITY_HIGH,
-            161: SEVERITY_HIGH,
-            3389: SEVERITY_HIGH,
-            5900: SEVERITY_HIGH,
-            445: SEVERITY_HIGH,
-            139: SEVERITY_HIGH,
-            123: SEVERITY_MEDIUM,
-            512: SEVERITY_CRITICAL,
-            513: SEVERITY_CRITICAL,
-        }
-        title_by_port = {
-            23: "Telnet observed",
-            21: "FTP observed",
-            69: "TFTP observed",
-            80: "HTTP observed on OT-adjacent device",
-            161: "SNMPv1/v2 observed",
-            3389: "RDP observed",
-            5900: "VNC observed",
-            445: "SMB observed",
-            139: "NetBIOS observed",
-            123: "NTP observed",
-            512: "rsh/rexec observed",
-            513: "rsh/rexec observed",
-        }
         grouped_links: Dict[int, set[str]] = defaultdict(set)
         grouped_pcaps: Dict[int, set[str]] = defaultdict(set)
-        grouped_ips: Dict[int, set[str]] = defaultdict(set)
+        grouped_clients: Dict[int, set[str]] = defaultdict(set)
+        grouped_servers: Dict[int, set[str]] = defaultdict(set)
         grouped_samples: Dict[int, List[str]] = defaultdict(list)
-        basic_auth_links: set[str] = set()
-        basic_auth_pcaps: set[str] = set()
-        basic_auth_ips: set[str] = set()
-        basic_auth_samples: List[str] = []
         # Suspicious User-Agent / Server-banner accumulators.  Dedup by
-        # (keyword, source_ip) so one scanner hitting 40 hosts becomes a
-        # single finding with a host list, not 40 findings.  Auth-failure
-        # bursts indexed by (proto, src, dst) for the same reason.
+        # (keyword, host) so one scanner hitting 40 hosts becomes a single
+        # finding with a host list, not 40 findings.  Auth-failure bursts
+        # are indexed by (proto, client, server) for the same reason.
         ua_hits: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         server_hits: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         auth_fail: Dict[Tuple[str, str, str], Dict[str, Any]] = defaultdict(
             lambda: {"count": 0, "samples": [], "pcaps": set()}
         )
-        # Credential extraction accumulator: proto -> list of evidence strings.
-        # Per explicit assessor request, passwords are stored and rendered
-        # IN THE CLEAR in the report — the assessment deliverable is the
-        # recovered credential, and the report is handled under the same
+        # Credential extraction accumulator: proto -> entries.  Per explicit
+        # assessor request, passwords are stored and rendered IN THE CLEAR in
+        # the report — the assessment deliverable is the recovered
+        # credential, and the report is handled under the same
         # confidentiality controls as the source pcap.
-        creds: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
-            "entries": [],          # list of (pcap, src->dst, user, pwd, raw_sample)
-            "ips": set(),
-            "pcaps": set(),
-        })
+        creds: Dict[str, Dict[str, Any]] = defaultdict(
+            lambda: {"entries": [], "clients": set(), "servers": set(), "pcaps": set()})
+        # Telnet login reassembly: (client, client_port, server) -> state.
+        telnet_state: Dict[Tuple[str, int, str], Dict[str, str]] = defaultdict(
+            lambda: {"expect": "", "buffer": "", "user": ""}
+        )
+
+        def add_cred(proto: str, pcap_name: str, link: str, ips: Sequence[str], user: str, secret: str, sample: str) -> None:
+            creds[proto]["entries"].append({
+                "pcap": pcap_name, "link": link,
+                "user": user, "secret": secret or "",
+                "secret_len": len(secret or ""), "sample": sample[:200],
+            })
+            if ips[0]:
+                creds[proto]["clients"].add(ips[0])
+            if ips[1]:
+                creds[proto]["servers"].add(ips[1])
+            creds[proto]["pcaps"].add(pcap_name)
+
         for pcap, row in rows:
-            source_ip = row_source_ip(row)
-            destination_ip = row_destination_ip(row)
-            destination_port = row_destination_port(row)
-            touched_ips = [ip for ip in (source_ip, destination_ip) if ip and ip in self.session.devices and self._likely_ot_device(self.session.devices[ip])]
-            if not touched_ips and destination_port != 123:
+            client, server, service_port, _transport, to_server = self._orient(row)
+            touched_ips = [ip for ip in (client, server)
+                           if ip and ip in self.session.devices and self._likely_ot_device(self.session.devices[ip])]
+            if not touched_ips:
                 continue
             info = row.get("_ws.col.Info", "")
-            link = f"{source_ip} -> {destination_ip}"
-            grouped_links[destination_port].add(f"{link} in {pcap.name}")
-            grouped_pcaps[destination_port].add(pcap.name)
-            grouped_ips[destination_port].update(ip for ip in (source_ip, destination_ip) if ip)
-            for sample in condensed_string_samples(payload_bytes_from_row(row), minimum_length=3, limit=3):
-                sample_line = f"{link} sample: {sample}"
-                if sample_line not in grouped_samples[destination_port]:
-                    grouped_samples[destination_port].append(sample_line)
+            link = f"{client} -> {server}"
+            payload = payload_bytes_from_row(row)
+            payload_text = payload.decode("latin-1", errors="replace")
+            pcap_name = pcap.name
+
+            # ---- Legacy service inventory (by service port) ------------
+            legacy_service = service_port in self.LEGACY_SERVICES and (
+                service_port != 161 or (row.get("snmp.version") or "") in ("0", "1"))
+            if legacy_service:
+                grouped_links[service_port].add(f"{link} in {pcap_name}")
+                grouped_pcaps[service_port].add(pcap_name)
+                if client:
+                    grouped_clients[service_port].add(client)
+                if server:
+                    grouped_servers[service_port].add(server)
+                if len(grouped_samples[service_port]) < 6:
+                    for sample in condensed_string_samples(payload, minimum_length=3, limit=3):
+                        sample_line = f"{link} sample: {sample}"
+                        if sample_line not in grouped_samples[service_port]:
+                            grouped_samples[service_port].append(sample_line)
+
             # ---- Suspicious User-Agent / Server banner -----------------
             ua_text = (row.get("http.user_agent") or "").lower()
             sv_text = (row.get("http.server") or "").lower()
             if ua_text:
                 for kw, (sev, label) in SUSPICIOUS_UA_KEYWORDS.items():
                     if kw in ua_text:
-                        key = (kw, source_ip or "", destination_ip or "")
-                        slot = ua_hits.setdefault(key, {
-                            "severity": sev, "label": label,
-                            "samples": [], "pcaps": set(),
-                            "src_ip": source_ip, "dst_ips": set(),
+                        slot = ua_hits.setdefault((kw, client or "", server or ""), {
+                            "severity": sev, "label": label, "samples": [], "pcaps": set(),
+                            "src_ip": client, "dst_ips": set(),
                         })
-                        slot["pcaps"].add(pcap.name)
-                        if destination_ip:
-                            slot["dst_ips"].add(destination_ip)
+                        slot["pcaps"].add(pcap_name)
+                        if server:
+                            slot["dst_ips"].add(server)
                         if len(slot["samples"]) < 5:
-                            slot["samples"].append(
-                                f"{pcap.name}: {link} UA='{ua_text[:120]}'"
-                            )
+                            slot["samples"].append(f"{pcap_name}: {link} UA='{ua_text[:120]}'")
                         break
             if sv_text:
                 for kw, (sev, label) in SUSPICIOUS_SERVER_KEYWORDS.items():
                     if kw in sv_text:
-                        key = (kw, destination_ip or "", source_ip or "")
-                        slot = server_hits.setdefault(key, {
-                            "severity": sev, "label": label,
-                            "samples": [], "pcaps": set(),
-                            "host_ip": destination_ip, "client_ips": set(),
+                        slot = server_hits.setdefault((kw, server or "", client or ""), {
+                            "severity": sev, "label": label, "samples": [], "pcaps": set(),
+                            "host_ip": server, "client_ips": set(),
                         })
-                        slot["pcaps"].add(pcap.name)
-                        if source_ip:
-                            slot["client_ips"].add(source_ip)
+                        slot["pcaps"].add(pcap_name)
+                        if client:
+                            slot["client_ips"].add(client)
                         if len(slot["samples"]) < 5:
-                            slot["samples"].append(
-                                f"{pcap.name}: {link} Server='{sv_text[:120]}'"
-                            )
+                            slot["samples"].append(f"{pcap_name}: {link} Server='{sv_text[:120]}'")
                         break
 
-            # ---- Auth-failure bursts -----------------------------------
-            il_low = info.lower()
-            af_proto = None
-            if destination_port == 21 and ("530 " in info or "login incorrect" in il_low):
-                af_proto = "FTP"
-            elif destination_port == 23 and ("login incorrect" in il_low or "authentication failed" in il_low):
-                af_proto = "Telnet"
-            elif destination_port == 22 and ("authentication failure" in il_low or "failed password" in il_low):
-                af_proto = "SSH"
-            elif destination_port == 80 and ("401 unauthorized" in il_low or "403 forbidden" in il_low):
-                af_proto = "HTTP"
-            if af_proto and source_ip and destination_ip:
-                # Note: for FTP/HTTP, the failure response goes server->client,
-                # so the "attacker" is the destination_ip of THIS row.  Flip
-                # the key so the source key represents the attacker IP.
-                attacker = destination_ip if af_proto in ("FTP", "HTTP") else source_ip
-                target   = source_ip      if af_proto in ("FTP", "HTTP") else destination_ip
-                k = (af_proto, attacker, target)
-                auth_fail[k]["count"] += 1
-                auth_fail[k]["pcaps"].add(pcap.name)
-                if len(auth_fail[k]["samples"]) < 5:
-                    auth_fail[k]["samples"].append(f"{pcap.name}: {link} {info[:120]}")
-
-            if destination_port == 80 and "authorization: basic" in info.lower():
-                basic_auth_links.add(f"{link} in {pcap.name}")
-                basic_auth_pcaps.add(pcap.name)
-                basic_auth_ips.update(ip for ip in (source_ip, destination_ip) if ip)
-                for sample in condensed_string_samples(payload_bytes_from_row(row), minimum_length=3, limit=2):
-                    sample_line = f"{link} sample: {sample}"
-                    if sample_line not in basic_auth_samples:
-                        basic_auth_samples.append(sample_line)
+            # ---- Authentication failures (server -> client replies) ----
+            if not to_server and client and server:
+                af_proto = ""
+                if service_port == 21 and re.match(r"\s*530[ -]", payload_text):
+                    af_proto = "FTP"
+                elif (row.get("http.response.code") or "") == "401":
+                    af_proto = "HTTP"
+                elif service_port == 23 and self._TELNET_FAILURE.search(payload_text):
+                    af_proto = "Telnet"
+                if af_proto:
+                    slot = auth_fail[(af_proto, client, server)]
+                    slot["count"] += 1
+                    slot["pcaps"].add(pcap_name)
+                    if len(slot["samples"]) < 5:
+                        slot["samples"].append(f"{pcap_name}: {server} -> {client} {info[:120]}")
 
             # -------- CREDENTIAL EXTRACTION ----------------------------
-            payload = payload_bytes_from_row(row)
-            try:
-                payload_text = payload.decode("latin-1", errors="replace")
-            except Exception:
-                payload_text = ""
-
-            def _add_cred(proto: str, user: str, secret: str, sample: str) -> None:
-                creds[proto]["entries"].append({
-                    "pcap": pcap.name, "link": link,
-                    "user": user, "secret": secret or "",
-                    "secret_len": len(secret or ""), "sample": sample[:200],
-                })
-                creds[proto]["ips"].update(ip for ip in (source_ip, destination_ip) if ip)
-                creds[proto]["pcaps"].add(pcap.name)
-
-            # FTP: "USER foo\r\n", "PASS bar\r\n"
-            if destination_port == 21:
+            ips = (client, server)
+            if service_port == 21 and to_server:
                 m_user = re.search(r"(?im)^\s*USER\s+(\S{1,64})\s*$", payload_text)
                 m_pass = re.search(r"(?im)^\s*PASS\s+(\S{1,128})\s*$", payload_text)
                 if m_user:
-                    _add_cred("FTP", m_user.group(1), "", f"USER {m_user.group(1)}")
+                    add_cred("FTP", pcap_name, link, ips, m_user.group(1), "", f"USER {m_user.group(1)}")
                 if m_pass:
-                    _add_cred("FTP", "", m_pass.group(1), "PASS <captured>")
+                    add_cred("FTP", pcap_name, link, ips, "", m_pass.group(1), "PASS <captured>")
 
-            # Telnet: look for "login:"/"password:" prompts and replies — hard
-            # to pair perfectly in one-shot parsing, so extract any line
-            # containing "password" + a secret-looking string, plus any
-            # username reply line.  This is coarse but useful.
-            if destination_port == 23 and len(payload_text) < 2048:
-                m_user = re.search(r"(?im)(?:login|user(?:name)?)\s*[:=]\s*(\S{2,64})", payload_text)
-                if m_user and m_user.group(1).lower() not in ("password", "passwd"):
-                    _add_cred("Telnet", m_user.group(1), "", f"login prompt: {m_user.group(0)}")
+            if service_port == 23 and payload:
+                client_port = row_source_port(row) if to_server else row_destination_port(row)
+                state = telnet_state[(client, client_port, server)]
+                if not to_server:
+                    prompt = payload_text.strip().lower()
+                    if re.search(r"(login|username|user name)\s*:\s*$", prompt):
+                        state.update(expect="user", buffer="")
+                    elif re.search(r"password\s*:\s*$", prompt):
+                        state.update(expect="pass", buffer="")
+                elif state["expect"]:
+                    state["buffer"] += self._TELNET_IAC.sub(b"", payload).decode("latin-1", errors="replace")
+                    if "\r" in state["buffer"] or "\n" in state["buffer"]:
+                        value = re.split(r"[\r\n]", state["buffer"], maxsplit=1)[0].strip()
+                        if state["expect"] == "user":
+                            state["user"] = value
+                        elif value:
+                            add_cred("Telnet", pcap_name, link, ips, state["user"], value, "Telnet login exchange")
+                        state.update(expect="", buffer="")
 
-            # HTTP Basic Authentication and form POST credential detection.
-            # Covers standard ports plus common OT web interface ports (8000, 8443,
-            # 9000, 4040) and any frame where tshark already flagged an HTTP method.
-            _is_http = (
-                destination_port in (80, 443, 8080, 8000, 8443, 8444, 9000, 4040)
-                or (row.get("http.request.method") or "") != ""
-            )
-            if _is_http:
-                m_ba = re.search(r"(?i)Authorization:\s*Basic\s+([A-Za-z0-9+/=]{4,200})", payload_text)
+            if to_server and (service_port in self._HTTP_CRED_PORTS or row.get("http.request.method")):
+                auth_header = row.get("http.authorization") or ""
+                m_ba = re.match(r"(?i)\s*Basic\s+([A-Za-z0-9+/=]{4,200})", auth_header) or \
+                    re.search(r"(?i)Authorization:\s*Basic\s+([A-Za-z0-9+/=]{4,200})", payload_text)
                 if m_ba:
                     try:
                         decoded = base64.b64decode(m_ba.group(1)).decode("latin-1", errors="replace")
-                        if ":" in decoded:
-                            u, p = decoded.split(":", 1)
-                            _add_cred("HTTP Basic", u, p, "Authorization: Basic <captured>")
-                    except Exception:
-                        pass
-                # Form POSTs with password= field — broad pattern covering common OT
-                # web UIs (j_password for Java EE, credential/secret for REST APIs).
-                m_form = re.search(
-                    r"(?i)(?:^|&|\?)(?:user|username|uname|login|email|j_username)=([^&\s]{1,80})",
-                    payload_text,
-                )
+                    except (ValueError, TypeError):
+                        decoded = ""
+                    if ":" in decoded:
+                        user, secret = decoded.split(":", 1)
+                        add_cred("HTTP Basic", pcap_name, link, ips, user, secret, "Authorization: Basic <captured>")
                 m_form_p = re.search(
                     r"(?i)(?:^|&|\?)(?:password|passwd|pwd|pass|j_password|secret|credential|new_password|currentPassword)=([^&\s]{1,128})",
                     payload_text,
                 )
                 if m_form_p:
-                    _add_cred(
-                        "HTTP Form",
-                        m_form.group(1) if m_form else "",
-                        m_form_p.group(1),
-                        f"HTTP form POST password field on port {destination_port}",
-                    )
+                    m_form = re.search(r"(?i)(?:^|&|\?)(?:user|username|uname|login|email|j_username)=([^&\s]{1,80})", payload_text)
+                    add_cred("HTTP Form", pcap_name, link, ips, m_form.group(1) if m_form else "", m_form_p.group(1),
+                             f"HTTP form POST password field on port {service_port}")
 
-            # SNMP v1/v2c community string
-            # In tshark output the community often appears in _ws.col.Info as
-            # "community=public" or in payload starting with 04 06 "public".
-            if destination_port == 161 or "snmp" in info.lower():
-                m_comm = re.search(r"(?i)community\s*(?:string)?\s*[:=]\s*([A-Za-z0-9_\-]{1,64})", info)
-                if not m_comm:
-                    m_comm = re.search(r"community=([A-Za-z0-9_\-]{1,64})", info)
-                if m_comm:
-                    community = m_comm.group(1)
-                    _add_cred("SNMPv1/v2c", "", community,
-                              f"community string: {community}")
+            community = row.get("snmp.community") or ""
+            if community and to_server and (row.get("snmp.version") or "") in ("0", "1"):
+                add_cred("SNMPv1/v2c", pcap_name, link, ips, "", community, f"community string: {community}")
 
-            # MQTT CONNECT — username/password flags are in the CONNECT packet.
-            # tshark surfaces mqtt.username / mqtt.passwd if dissected; we fall
-            # back to scanning the payload.
-            if destination_port == 1883 and "connect" in info.lower():
-                m_u = re.search(rb"\x00([\x01-\x7f]{1,64})", payload)
-                if m_u:
-                    try:
-                        maybe_user = m_u.group(1).decode("latin-1", errors="replace")
-                        if maybe_user.isprintable() and len(maybe_user) >= 3:
-                            _add_cred("MQTT", maybe_user, "", f"MQTT CONNECT client-id/username: {maybe_user}")
-                    except Exception:
-                        pass
+            if (row.get("mqtt.msgtype") or "") == "1" and to_server:
+                mqtt_user = row.get("mqtt.username") or ""
+                mqtt_pass = row.get("mqtt.passwd") or ""
+                if mqtt_user or mqtt_pass:
+                    add_cred("MQTT", pcap_name, link, ips, mqtt_user, mqtt_pass, "MQTT CONNECT credentials")
 
-            # POP3 / IMAP
-            if destination_port in (110, 143):
+            if service_port in (110, 143) and to_server:
                 m_u = re.search(r"(?im)^\s*(?:USER|LOGIN)\s+(\S{1,64})", payload_text)
                 m_p = re.search(r"(?im)^\s*PASS\s+(\S{1,128})", payload_text)
                 if m_u:
-                    _add_cred("POP3/IMAP", m_u.group(1), "", f"USER {m_u.group(1)}")
+                    add_cred("POP3/IMAP", pcap_name, link, ips, m_u.group(1), "", f"USER {m_u.group(1)}")
                 if m_p:
-                    _add_cred("POP3/IMAP", "", m_p.group(1), "PASS <captured>")
-        for destination_port, links in grouped_links.items():
-            description = f"Legacy or cleartext service traffic was observed on port {destination_port} across one or more communication links."
-            evidence = [f"Communication links: {', '.join(sorted(links)[:12])}"]
-            if grouped_samples[destination_port]:
-                evidence.extend(grouped_samples[destination_port][:6])
+                    add_cred("POP3/IMAP", pcap_name, link, ips, "", m_p.group(1), "PASS <captured>")
+
+        for service_port, links in grouped_links.items():
+            severity, title = self.LEGACY_SERVICES[service_port]
+            evidence = [f"Communication links: {', '.join(sorted(links)[:12])}"] + grouped_samples[service_port][:6]
             self.add_finding(
-                severity_by_port.get(destination_port, SEVERITY_MEDIUM),
+                severity,
                 "Cleartext and Legacy Protocols",
-                title_by_port.get(destination_port, "Legacy service observed"),
-                description,
+                title,
+                f"Legacy or cleartext service traffic was observed on port {service_port} across one or more communication links.",
                 evidence,
-                sorted(grouped_ips[destination_port]),
-                [],
-                f"Port {destination_port}",
-                sorted(grouped_pcaps[destination_port]),
-                f"legacy::{destination_port}",
-                tags=["legacy", f"port_{destination_port}"],
-            )
-        if basic_auth_links:
-            evidence = [f"Communication links: {', '.join(sorted(basic_auth_links)[:12])}"]
-            if basic_auth_samples:
-                evidence.extend(basic_auth_samples[:6])
-            self.add_finding(
-                SEVERITY_CRITICAL,
-                "Cleartext and Legacy Protocols",
-                "HTTP Basic Authentication exposed",
-                "HTTP Basic Authentication indicators were observed in cleartext management traffic. This means credentials may be recoverable from the capture.",
-                evidence,
-                sorted(basic_auth_ips),
-                [],
-                "HTTP",
-                sorted(basic_auth_pcaps),
-                "legacy::http-basic",
-                tags=["legacy", "credential_exposure", "http_basic"],
+                sorted(grouped_clients[service_port]),
+                sorted(grouped_servers[service_port]),
+                f"Port {service_port}",
+                sorted(grouped_pcaps[service_port]),
+                f"legacy::{service_port}",
+                tags=["legacy", f"port_{service_port}"],
             )
         # --- emit one finding per protocol for extracted credentials ---
-        # Passwords are masked; evidence still lists the count and where so the
-        # analyst can go back to the pcap to confirm / extract the full secret.
         for proto, bucket in creds.items():
             entries = bucket["entries"]
             if not entries:
@@ -3783,16 +4012,10 @@ class OTPcapAnalyzer:
             combined = [e for e in entries if e["user"] and e["secret_len"]]
             evidence_lines: List[str] = []
             for e in combined[:20]:
-                evidence_lines.append(
-                    f"{e['pcap']}: {e['link']} user='{e['user']}' pwd='{e['secret']}'"
-                )
-            # Heuristic pair-up of sequential USER/PASS
+                evidence_lines.append(f"{e['pcap']}: {e['link']} user='{e['user']}' pwd='{e['secret']}'")
             for u, p in zip(users[:20], passwords[:20]):
                 if u["pcap"] == p["pcap"] and u["link"] == p["link"]:
-                    evidence_lines.append(
-                        f"{u['pcap']}: {u['link']} user='{u['user']}' pwd='{p['secret']}'"
-                    )
-            # Any unpaired user/pass we still mention
+                    evidence_lines.append(f"{u['pcap']}: {u['link']} user='{u['user']}' pwd='{p['secret']}'")
             for e in users[:10]:
                 evidence_lines.append(f"{e['pcap']}: {e['link']} user='{e['user']}' (no paired pwd captured)")
             for e in passwords[:10]:
@@ -3805,11 +4028,9 @@ class OTPcapAnalyzer:
                 f"{proto} traffic carried recoverable authentication material in plaintext. "
                 "The full captured credentials are included below. Treat this report as sensitive — "
                 "these passwords are exposed and should be rotated immediately.",
-                evidence_lines + [
-                    f"Total credential events captured: {len(entries)}",
-                ],
-                sorted(bucket["ips"]),
-                [],
+                evidence_lines + [f"Total credential events captured: {len(entries)}"],
+                sorted(bucket["clients"]),
+                sorted(bucket["servers"]),
                 proto,
                 sorted(bucket["pcaps"]),
                 f"legacy::creds::{proto}",
@@ -3817,7 +4038,7 @@ class OTPcapAnalyzer:
             )
 
         # ---- Suspicious User-Agent emission ----------------------------
-        for (kw, src, dst), slot in ua_hits.items():
+        for (kw, src, _dst), slot in ua_hits.items():
             evidence = list(slot["samples"])
             if slot["dst_ips"]:
                 evidence.append(f"Targets contacted: {', '.join(sorted(slot['dst_ips'])[:12])}")
@@ -3871,24 +4092,34 @@ class OTPcapAnalyzer:
             )
         return 0
 
+    # A credential *assignment* (key = value) — not merely the word "password",
+    # which also appears in login prompts and protocol banners.
+    _CREDENTIAL_ASSIGNMENT = re.compile(
+        r"(?i)\b(pass(?:word|wd)?|pwd|secret|api[_-]?key|auth[_-]?token|token)\s*[:=]\s*[\"']?([^\s\"'&;,<>]{3,64})")
+    _ENGINEERING_FILE = re.compile(r"\b[\w./-]+\.(?:acd|apx|prj|proj|rss|stu|xef|mer|l5k|l5x|bin|img|hex|fw|rom|upd)\b",
+                                   re.IGNORECASE)
+
     def check_artifact_extraction(self, pcaps: Sequence[Path]) -> int:
-        """Extract useful OT artifacts and produce generalized protection guidance."""
+        """Extract engineering artifacts from OT-adjacent payloads: device identity
+        strings, PLC project and firmware file names, and embedded credentials."""
+        assert self.session is not None
         model_candidates: Dict[str, set[str]] = defaultdict(set)
-        project_candidates: List[Tuple[str, str, str, str, str]] = []
-        firmware_candidates: List[Tuple[str, str, str, str, str]] = []
-        password_candidates: List[Tuple[str, str, str, str, str]] = []
-        flag_candidates: List[Tuple[str, str, str, str, str]] = []
-        modbus_read_pairs: Counter[Tuple[str, str]] = Counter()
-        modbus_register_hits: Dict[Tuple[str, str], List[int]] = defaultdict(list)
+        file_hits: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+        credential_hits: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+        def ot_adjacent(*ips: str) -> bool:
+            return any(ip and ip in self.session.devices and self._likely_ot_device(self.session.devices[ip])
+                       for ip in ips)
 
         for pcap in pcaps:
             try:
-                for row in iter_tshark_rows("tcp || udp", PAYLOAD_PACKET_FIELDS, pcap):
-                    source_ip = row_source_ip(row)
-                    destination_ip = row_destination_ip(row)
+                for row in iter_tshark_rows("(tcp.len > 0) || udp", PAYLOAD_PACKET_FIELDS, pcap):
+                    client, server, _service, _transport, to_server = self._orient(row)
+                    source_ip, destination_ip = row_source_ip(row), row_destination_ip(row)
+                    if not ot_adjacent(source_ip, destination_ip):
+                        continue
                     protocol = protocol_family_from_row(row)
                     info = row.get("_ws.col.Info", "")
-                    info_lower = info.lower()
                     payload_strings = printable_strings_from_bytes(payload_bytes_from_row(row), minimum_length=4)
                     combined_strings = payload_strings + ([info] if info else [])
 
@@ -3899,147 +4130,94 @@ class OTPcapAnalyzer:
                                 if candidate and len(candidate) >= 3 and "property" not in candidate.lower():
                                     model_candidates[source_ip or destination_ip or "unknown"].add(candidate)
 
-                    if "modbus" in protocol.lower():
-                        if "read" in info_lower:
-                            modbus_read_pairs[(source_ip, destination_ip)] += 1
-                        for match in re.finditer(r"\b(4\d{5}|3\d{5}|4000\d{2,}|400\d{3,})\b", info):
-                            try:
-                                modbus_register_hits[(source_ip, destination_ip)].append(int(match.group(1)))
-                            except ValueError:
-                                pass
+                    for text in payload_strings:
+                        for file_name in self._ENGINEERING_FILE.findall(text):
+                            kind = "project" if file_name.lower().endswith(PROJECT_FILE_EXTENSIONS) else "firmware"
+                            key = (kind, source_ip, destination_ip, file_name)
+                            if key not in file_hits and len(file_hits) < 40:
+                                file_hits[key] = {"pcap": pcap.name, "protocol": protocol}
 
-                    for text in combined_strings:
-                        md5_matches = re.findall(r"\b[a-fA-F0-9]{32}\b", text)
-                        if md5_matches:
-                            for md5_value in md5_matches:
-                                flag_candidates.append((pcap.name, source_ip, destination_ip, protocol, f"Possible MD5 artifact: {md5_value}"))
-
-                        lowered = text.lower()
-                        file_matches = re.findall(r"\b[\w./-]+\.(?:acd|apx|prj|proj|rss|stu|xef|mer|l5k|l5x|bin|img|hex|fw|rom|upd)\b", text, re.IGNORECASE)
-                        for file_name in file_matches:
-                            if file_name.lower().endswith(PROJECT_FILE_EXTENSIONS):
-                                project_candidates.append((pcap.name, source_ip, destination_ip, protocol, file_name))
-                            elif file_name.lower().endswith(FIRMWARE_FILE_EXTENSIONS):
-                                firmware_candidates.append((pcap.name, source_ip, destination_ip, protocol, file_name))
-
-                        if any(keyword in lowered for keyword in ("password", "passwd", "pwd", "admin:", "authorization", "web user")):
-                            cleaned = text.strip()
-                            if len(cleaned) <= 140:
-                                password_candidates.append((pcap.name, source_ip, destination_ip, protocol, cleaned))
-
-                        if any(keyword in lowered for keyword in ("flag", "team", "project name", "ladder", "logic", "firmware")):
-                            cleaned = text.strip()
-                            if 3 <= len(cleaned) <= 200:
-                                flag_candidates.append((pcap.name, source_ip, destination_ip, protocol, cleaned))
+                    if to_server and not row.get("http.request.method"):
+                        for text in payload_strings:
+                            match = self._CREDENTIAL_ASSIGNMENT.search(text)
+                            if not match:
+                                continue
+                            slot = credential_hits.setdefault((client, server), {"samples": [], "pcaps": set(), "protocol": protocol})
+                            slot["pcaps"].add(pcap.name)
+                            sample = f"{pcap.name}: {client} -> {server} | {text.strip()[:140]}"
+                            if len(slot["samples"]) < 5 and sample not in slot["samples"]:
+                                slot["samples"].append(sample)
             except TSharkError as exc:
                 print(colorize(f"[!] artifact extraction error on {pcap.name}: {exc}", SEVERITY_HIGH))
 
         for ip_text, candidates in model_candidates.items():
-            candidate_list = sorted(candidates)[:5]
             self.add_finding(
-                SEVERITY_MEDIUM,
+                SEVERITY_INFO,
                 "Artifact Extraction",
-                "BACnet model/vendor candidate extracted",
-                f"Possible BACnet device identity strings were extracted for {ip_text}. This helps answer device-model reconnaissance questions and improves asset identification.",
-                [f"Candidates: {', '.join(candidate_list)}"],
+                "BACnet model/vendor identity extracted",
+                f"BACnet device identity strings were visible for {ip_text}. Recorded for asset identification; "
+                "the same visibility lets anyone on the segment fingerprint the device.",
+                [f"Candidates: {', '.join(sorted(candidates)[:5])}"],
                 [ip_text] if ip_text and ip_text != "unknown" else [],
                 [],
                 "BACnet/IP",
                 [pcap.name for pcap in pcaps],
                 f"artifact::bacnet-model::{ip_text}",
-                tags=["recon", "artifact", "bacnet"],
+                tags=["artifact", "bacnet", "discovery"],
             )
 
-        for pcap_name, source_ip, destination_ip, protocol, file_name in project_candidates[:20]:
+        for (kind, source_ip, destination_ip, file_name), slot in file_hits.items():
+            if kind == "project":
+                title = "Possible PLC project or ladder-logic file transfer"
+                description = ("A file name consistent with PLC project or ladder-logic content was observed in traffic. "
+                               "This can indicate program retrieval, upload, or distribution; confirm it was an authorized "
+                               "engineering activity.")
+                tags = ["artifact", "project_file"]
+            else:
+                title = "Possible firmware file transfer or firmware reference"
+                description = ("A firmware-like file name was observed in traffic to or from an OT-adjacent device. Confirm "
+                               "whether a firmware update was scheduled and that the image came from an approved source.")
+                tags = ["artifact", "firmware"]
             self.add_finding(
                 SEVERITY_HIGH,
                 "Artifact Extraction",
-                "Possible PLC project or ladder-logic file transfer",
-                "A file name consistent with PLC project or ladder logic content was observed in traffic. This can indicate program retrieval, upload, or distribution activity.",
-                [f"{pcap_name}: {file_name}", f"{source_ip} -> {destination_ip} via {protocol}"],
+                title,
+                description,
+                [f"{slot['pcap']}: {file_name}", f"{source_ip} -> {destination_ip} via {slot['protocol']}"],
                 [source_ip],
                 [destination_ip],
-                protocol or "File Transfer",
-                [pcap_name],
-                f"artifact::project-file::{file_name}::{source_ip}::{destination_ip}",
-                tags=["artifact", "project_file", "recon"],
+                slot["protocol"] or "File Transfer",
+                [slot["pcap"]],
+                f"artifact::{kind}-file::{file_name}::{source_ip}::{destination_ip}",
+                tags=tags,
             )
 
-        for pcap_name, source_ip, destination_ip, protocol, file_name in firmware_candidates[:20]:
+        for (client, server), slot in credential_hits.items():
             self.add_finding(
                 SEVERITY_HIGH,
                 "Artifact Extraction",
-                "Possible firmware file transfer or firmware reference",
-                "A firmware-like file name was observed in traffic. This may support forensics workflows or indicate software distribution from a corporate or staging system.",
-                [f"{pcap_name}: {file_name}", f"{source_ip} -> {destination_ip} via {protocol}"],
-                [source_ip],
-                [destination_ip],
-                protocol or "File Transfer",
-                [pcap_name],
-                f"artifact::firmware-file::{file_name}::{source_ip}::{destination_ip}",
-                tags=["artifact", "firmware"],
-            )
-
-        for pcap_name, source_ip, destination_ip, protocol, text in password_candidates[:20]:
-            self.add_finding(
-                SEVERITY_CRITICAL,
-                "Artifact Extraction",
-                "Credential or password-like content observed in traffic",
-                "Traffic contained a string that looks like credential material or an authentication hint. This is directly relevant to password-recovery style scenarios and real-world credential exposure risk.",
-                [f"{pcap_name}: {text}"],
-                [source_ip],
-                [destination_ip],
-                protocol or "Credential Exposure",
-                [pcap_name],
-                f"artifact::password::{hashlib.sha1(text.encode('utf-8')).hexdigest()}",
+                "Embedded credential string observed in traffic",
+                f"Traffic from {client} to {server} carried a credential-style assignment (password, secret, key, or "
+                "token followed by a value) in cleartext. Confirm whether these are live credentials and rotate any that are.",
+                slot["samples"],
+                [client],
+                [server],
+                slot["protocol"] or "Credential Exposure",
+                sorted(slot["pcaps"]),
+                f"artifact::credential::{client}::{server}",
                 tags=["artifact", "credential_exposure"],
             )
 
-        for pcap_name, source_ip, destination_ip, protocol, text in flag_candidates[:25]:
+        if credential_hits:
             self.add_finding(
-                SEVERITY_MEDIUM,
-                "Artifact Extraction",
-                "Interesting plaintext artifact candidate observed",
-                "A plaintext string of investigative interest was extracted from protocol metadata or payload content. This can help surface flags, project names, firmware names, or other challenge-style artifacts without hardcoding the exact dataset.",
-                [f"{pcap_name}: {text}"],
-                [source_ip],
-                [destination_ip],
-                protocol or "Payload",
-                [pcap_name],
-                f"artifact::plaintext::{hashlib.sha1(text.encode('utf-8')).hexdigest()}",
-                tags=["artifact"],
-            )
-
-        for (source_ip, destination_ip), count in modbus_read_pairs.items():
-            registers = modbus_register_hits.get((source_ip, destination_ip), [])
-            if count >= 10 and registers:
-                self.add_finding(
-                    SEVERITY_MEDIUM,
-                    "Protection Guidance",
-                    "Suggested control for Modbus read harvesting",
-                    "Repeated Modbus reads were observed against one target. If these reads are not required from this source, restrict them to approved polling or engineering hosts and block opportunistic read access.",
-                    [
-                        f"Observed read count: {count}",
-                        f"Register references: {', '.join(str(item) for item in sorted(set(registers))[:10])}",
-                        f"Suggested firewall concept: allow tcp/502 from approved HMI/EWS only; deny {source_ip} -> {destination_ip}",
-                    ],
-                    [source_ip],
-                    [destination_ip],
-                    "Modbus TCP",
-                    [pcap.name for pcap in pcaps],
-                    f"protection::modbus-read::{source_ip}::{destination_ip}",
-                    tags=["protection", "modbus"],
-                )
-
-        if password_candidates:
-            self.add_finding(
-                SEVERITY_MEDIUM,
+                SEVERITY_INFO,
                 "Protection Guidance",
-                "Suggested IDS signature opportunity for credential-recovery traffic",
-                "The session contains credential-relevant material that could be used to craft a targeted IDS or IPS rule. Focus on the specific source, destination, protocol, and application strings seen in the evidence.",
+                "Detection opportunity: cleartext credential material to OT devices",
+                "Credential material crossed the network in cleartext toward OT-adjacent hosts. An IDS rule keyed on the "
+                "observed protocol, host pair, and credential keywords would alert on recurrences.",
                 [
-                    "Suggested signature concept: alert on credential keywords or known recovery patterns over legacy management protocols touching PLC IPs.",
-                    "Recommended implementation: build a Snort/Suricata content match using the observed strings and IP pair from the evidence.",
+                    "Suggested rule concept: alert on credential keywords or authentication commands over legacy management protocols that target PLC or HMI addresses.",
+                    "Implementation: a Snort/Suricata content match scoped to the host pairs listed in the related findings.",
                 ],
                 [],
                 [],
@@ -4048,62 +4226,60 @@ class OTPcapAnalyzer:
                 "protection::ids-credential-recovery",
                 tags=["protection", "detection"],
             )
-
-        if model_candidates:
-            self.add_finding(
-                SEVERITY_LOW,
-                "Protection Guidance",
-                "Suggested BACnet enumeration fingerprinting opportunity",
-                "BACnet identity information was visible enough that it could support a vendor/model fingerprinting script or NSE workflow.",
-                [
-                    "Suggested NSE logic: send BACnet Who-Is, parse I-Am responses, and query visible identity properties such as vendor or model where exposed.",
-                    "Use the extracted candidate model/vendor names as validation targets when building the fingerprint.",
-                ],
-                [],
-                [],
-                "BACnet/IP",
-                [pcap.name for pcap in pcaps],
-                "protection::bacnet-fingerprint",
-                tags=["protection", "bacnet"],
-            )
         return 0
 
     def _infer_roles_and_zones(self) -> None:
-        """Infer device roles and Purdue-style zones from observed behavior."""
+        """Infer device roles and Purdue-style zones from the services each device
+        answers on (`ports`) and connects to (`client_ports`)."""
         assert self.session is not None
-        known_hmis = self.session.environment_answers.get("known_hmis", "").lower()
+        known_hmis = {
+            item.strip().lower()
+            for item in re.split(r"[,;\s]+", self.session.environment_answers.get("known_hmis", ""))
+            if item.strip()
+        }
+        ot_port_set = set(KNOWN_OT_PORTS)
         for device in self.session.devices.values():
-            protocols = " ".join(device.protocols).lower()
-            port_set = set(device.ports)
+            served = set(device.ports)
+            used = set(device.client_ports)
+            ot_served = served & ot_port_set
+            ot_used = used & ot_port_set
             if device.ip.lower() in known_hmis:
-                device.inferred_role = "HMI / Engineering Workstation"
-            elif any(marker in protocols for marker in ("rtsp", "onvif", "osdp")):
-                device.inferred_role = "Physical Security Device"
-            elif any(marker in protocols for marker in ("modbus", "dnp3", "ethernet/ip", "s7", "iec 61850")) and device.incoming_count >= device.outgoing_count:
-                device.inferred_role = "Controller / PLC / RTU"
-            elif any(marker in protocols for marker in ("modbus", "bacnet", "opc", "ethernet/ip", "mqtt", "s7")) and device.outgoing_count > device.incoming_count:
-                device.inferred_role = "HMI / Engineering Workstation"
-            elif any(port in IT_PORTS for port in port_set) and not self._likely_ot_device(device):
-                device.inferred_role = "IT Device"
+                role = "HMI / Engineering Workstation"
+            elif served & {554, 8554}:
+                role = "Physical Security Device"
+            elif 3956 in served:
+                role = "Machine-Vision Camera"
+            elif ot_served and ot_served <= used:
+                # Peer protocols (same port in both directions, e.g. BACnet):
+                # ports cannot tell client from server, so use traffic direction.
+                role = ("Controller / PLC / RTU" if device.incoming_count >= device.outgoing_count
+                        else "HMI / Engineering Workstation")
+            elif ot_served & CONTROLLER_PORTS:
+                role = "Controller / PLC / RTU"
+            elif ot_served:
+                role = "OT Server / Gateway"
+            elif ot_used:
+                role = "HMI / Engineering Workstation"
             elif self._likely_ot_device(device):
-                device.inferred_role = "OT Device"
+                role = "OT Device"
+            elif served & (IT_PORTS | IT_INDICATOR_PORTS):
+                role = "IT Device"
             else:
-                device.inferred_role = "Unknown"
-            talks_it = any(port in IT_PORTS for port in port_set)
-            talks_ot = any(port in KNOWN_OT_PORTS for port in port_set) or self._likely_ot_device(device)
-            if talks_it and talks_ot and device.inferred_role != "Physical Security Device":
-                device.inferred_role = "Dual-Zone Workstation / Server"
+                role = "Unknown"
+            if role not in ("IT Device", "Unknown", "Physical Security Device") and served & IT_INDICATOR_PORTS:
+                role = "Dual-Zone Workstation / Server"
+            device.inferred_role = role
             if is_public_ip(device.ip):
                 device.inferred_zone = "External / Public"
-            elif "IT Device" in device.inferred_role:
+            elif role == "IT Device":
                 device.inferred_zone = "Purdue L4/L5"
-            elif "Dual-Zone" in device.inferred_role:
+            elif role.startswith("Dual-Zone"):
                 device.inferred_zone = "Purdue L3/L3.5 Boundary"
-            elif "HMI" in device.inferred_role:
+            elif role.startswith(("HMI", "OT Server")):
                 device.inferred_zone = "Purdue L2/L3"
-            elif "Controller" in device.inferred_role or device.inferred_role == "OT Device":
+            elif role.startswith(("Controller", "Machine-Vision")) or role == "OT Device":
                 device.inferred_zone = "Purdue L1/L2"
-            elif "Physical Security" in device.inferred_role:
+            elif role == "Physical Security Device":
                 device.inferred_zone = "Physical Security / OT Edge"
             else:
                 device.inferred_zone = "Unknown"
@@ -4158,29 +4334,41 @@ class OTPcapAnalyzer:
 
         self._log_ts("      [hygiene 1/5] inferring roles and zones …")
         self._infer_roles_and_zones()
-        self._log_ts(f"      [hygiene 2/5] per-device subnet/MAC drift "
+        self._log_ts(f"      [hygiene 2/5] per-device MAC drift "
                      f"({n_devices:,} devices) …")
+        # MACs fronting many IPs are routers / firewalls / L3 switches: every
+        # remote host is seen behind them, so they say nothing about spoofing.
+        mac_ip_counts: Counter[str] = Counter()
+        for device in self.session.devices.values():
+            for mac in device.macs:
+                mac_ip_counts[mac.lower()] += 1
+        gateway_macs = {mac for mac, count in mac_ip_counts.items() if count >= 10}
         device_iter = 0
         device_log_every = max(50000, n_devices // 10) if n_devices else 0
         for device in self.session.devices.values():
             device_iter += 1
             if device_log_every and device_iter % device_log_every == 0:
                 self._log_ts(f"          … {device_iter:,}/{n_devices:,} devices")
-            if len(device.subnets) > 1 and ":" not in device.ip:
-                _capped_add("multi_subnet", SEVERITY_HIGH, "Device appears in multiple subnets",
-                    f"{device.ip} was observed in multiple subnets across the session, which may indicate a dual-homed bridging device.",
-                    [f"Subnets: {', '.join(sorted(device.subnets))}"], [device.ip], [], "IP",
-                    device.source_pcaps, f"net::multi-subnet::{device.ip}", ["boundary"])
-            if len(device.macs) > 1:
+            station_macs = sorted(
+                mac for mac in device.macs
+                if mac.lower() not in gateway_macs and not mac.lower().startswith(("ff:ff:ff", "01:00:5e", "33:33"))
+            )
+            if len(station_macs) > 1:
                 _capped_add("multi_mac", SEVERITY_HIGH, "Multiple MAC addresses observed for one IP",
                     f"{device.ip} appeared with multiple MAC addresses, which can indicate ARP instability or spoofing.",
-                    [f"MACs: {', '.join(sorted(device.macs))}"], [device.ip], [], "ARP",
+                    [f"MACs: {', '.join(station_macs)}"], [device.ip], [], "ARP",
                     device.source_pcaps, f"net::multi-mac::{device.ip}", [])
 
         self._log_ts(f"      [hygiene 3/5] OT/IT crossings, DNS/ICMP, IPv6 "
                      f"({n_connections:,} connections) …")
         conn_iter = 0
         conn_log_every = max(50000, n_connections // 10) if n_connections else 0
+        icmp_pairs: List[str] = []
+        icmp_ips: set = set()
+        icmp_pcaps: set = set()
+        ipv6_pairs: List[str] = []
+        ipv6_ips: set = set()
+        ipv6_pcaps: set = set()
         for connection in self.session.connections.values():
             conn_iter += 1
             if conn_log_every and conn_iter % conn_log_every == 0:
@@ -4189,18 +4377,20 @@ class OTPcapAnalyzer:
             destination_device = self.session.devices.get(connection.destination_ip)
             if not source_device or not destination_device:
                 continue
-            if self._likely_ot_device(source_device) and connection.protocol == "DNS":
+            if self._likely_ot_device(source_device) and connection.destination_port == 53:
                 _capped_add("ot_dns", SEVERITY_MEDIUM, "DNS query from OT device",
-                    f"OT-adjacent device {connection.source_ip} generated DNS traffic toward {connection.destination_ip}.",
-                    [f"Packets: {connection.packet_count}"], [connection.source_ip], [connection.destination_ip],
+                    f"OT-adjacent device {connection.source_ip} sent DNS queries. Controllers and field devices "
+                    "should not normally need name resolution.",
+                    [f"{connection.source_ip} -> {connection.destination_ip}:53 | packets: {connection.packet_count}"],
+                    [connection.source_ip], [connection.destination_ip],
                     "DNS", connection.source_pcaps,
-                    f"net::dns::{connection.source_ip}::{connection.destination_ip}", [])
-            if self._likely_ot_device(source_device) and connection.protocol == "ICMP":
-                _capped_add("ot_icmp", SEVERITY_MEDIUM, "ICMP involving OT device",
-                    f"ICMP traffic touched OT-adjacent device {connection.source_ip} or {connection.destination_ip}.",
-                    [f"Packets: {connection.packet_count}"], [connection.source_ip], [connection.destination_ip],
-                    "ICMP", connection.source_pcaps,
-                    f"net::icmp::{connection.source_ip}::{connection.destination_ip}", [])
+                    f"net::dns::{connection.source_ip}", [])
+            if connection.protocol == "ICMP" and (self._likely_ot_device(source_device)
+                                                 or self._likely_ot_device(destination_device)):
+                if len(icmp_pairs) < 40:
+                    icmp_pairs.append(f"{connection.source_ip} <-> {connection.destination_ip} | packets: {connection.packet_count}")
+                icmp_ips.update((connection.source_ip, connection.destination_ip))
+                icmp_pcaps.update(connection.source_pcaps)
             if source_device.inferred_role.startswith("Controller") and destination_device.inferred_role == "IT Device":
                 _capped_add("ot_to_it", SEVERITY_HIGH, "Direct OT-to-IT communication observed",
                     f"Controller-class device {connection.source_ip} communicated directly with IT device {connection.destination_ip}.",
@@ -4208,20 +4398,40 @@ class OTPcapAnalyzer:
                     [connection.source_ip], [connection.destination_ip], connection.protocol,
                     connection.source_pcaps,
                     f"net::ot-it::{connection.source_ip}::{connection.destination_ip}", ["boundary"])
-            if source_device.inferred_role == "Dual-Zone Workstation / Server" or destination_device.inferred_role == "Dual-Zone Workstation / Server":
-                bridge_ip = source_device.ip if source_device.inferred_role == "Dual-Zone Workstation / Server" else destination_device.ip
-                _capped_add("dual_zone", SEVERITY_HIGH, "Dual-zone boundary device inferred",
-                    f"{bridge_ip} appears to bridge OT and IT communications based on observed protocol mix.",
-                    [f"Connection: {connection.source_ip} -> {connection.destination_ip} via {connection.protocol}"],
-                    [bridge_ip], [connection.destination_ip], connection.protocol,
-                    connection.source_pcaps, f"net::dual-zone::{bridge_ip}", ["boundary"])
             if ":" in connection.source_ip or ":" in connection.destination_ip:
-                _capped_add("ipv6", SEVERITY_MEDIUM, "IPv6 traffic observed",
-                    "IPv6 traffic was observed in an OT-adjacent dataset. Many OT environments do not expect IPv6, so this should be validated.",
-                    [f"{connection.source_ip} -> {connection.destination_ip}"],
-                    [connection.source_ip], [connection.destination_ip], connection.protocol,
-                    connection.source_pcaps,
-                    f"net::ipv6::{connection.source_ip}::{connection.destination_ip}", [])
+                if len(ipv6_pairs) < 40:
+                    ipv6_pairs.append(f"{connection.source_ip} -> {connection.destination_ip} ({connection.protocol})")
+                ipv6_ips.update((connection.source_ip, connection.destination_ip))
+                ipv6_pcaps.update(connection.source_pcaps)
+        if icmp_pairs:
+            self.add_finding(
+                SEVERITY_LOW, "Network Hygiene and Segmentation", "ICMP traffic involving OT devices",
+                f"ICMP was exchanged with {len(icmp_ips)} OT-adjacent host(s). Ping-based monitoring is common, but "
+                "ICMP reachability also lets anyone on the segment map live controllers.",
+                icmp_pairs, sorted(icmp_ips)[:30], [], "ICMP", sorted(icmp_pcaps),
+                "net::icmp-ot", tags=["icmp"],
+            )
+        if ipv6_pairs:
+            self.add_finding(
+                SEVERITY_MEDIUM, "Network Hygiene and Segmentation", "IPv6 traffic observed",
+                "IPv6 traffic was observed in an OT-adjacent dataset. Many OT environments do not expect IPv6, "
+                "so confirm whether it is intentional or unmanaged link-local chatter.",
+                ipv6_pairs, sorted(ipv6_ips)[:30], [], "IPv6", sorted(ipv6_pcaps),
+                "net::ipv6", tags=["ipv6"],
+            )
+        for device in self.session.devices.values():
+            if device.inferred_role != "Dual-Zone Workstation / Server":
+                continue
+            windows_ports = sorted(set(device.ports) & IT_INDICATOR_PORTS)
+            ot_ports = sorted((set(device.ports) | set(device.client_ports)) & set(KNOWN_OT_PORTS))
+            _capped_add("dual_zone", SEVERITY_HIGH, "Dual-zone boundary device inferred",
+                f"{device.ip} participates in OT protocols and also serves Windows / IT services "
+                f"(ports {', '.join(str(p) for p in windows_ports)}). Hosts like this — typically Windows HMIs or "
+                "engineering stations exposing SMB/RDP — are a classic bridge between IT and OT zones.",
+                [f"IT services answered: {', '.join(str(p) for p in windows_ports)}",
+                 f"OT protocol ports: {', '.join(str(p) for p in ot_ports) or '(protocol markers only)'}"],
+                [device.ip], [], "Multi-Protocol",
+                device.source_pcaps, f"net::dual-zone::{device.ip}", ["boundary"])
         self._log_ts("      [hygiene 4/5] public-IP enrichment …")
         public_links: Dict[str, List[str]] = defaultdict(list)
         public_pcaps: Dict[str, set[str]] = defaultdict(set)
@@ -4285,22 +4495,24 @@ class OTPcapAnalyzer:
         if _hyg:
             rst_counts: Counter[Tuple[str, str]] = _hyg.get("rst_counts", Counter())
             syn_counts: Counter[Tuple[str, str]] = _hyg.get("syn_counts", Counter())
+            synack_counts: Counter[Tuple[str, str]] = _hyg.get("synack_counts", Counter())
             hygiene_pcap_names: List[str] = sorted(_hyg.get("pcap_names", set()))
         else:
             # Fallback: direct tshark pass (only reached outside normal run_optional_checks flow)
             rst_counts = Counter()
             syn_counts = Counter()
+            synack_counts = Counter()
             seen_pcap_names: set[str] = set()
-            for pcap_file, row in self._filtered_rows(
-                pcaps, "tcp.flags.reset==1 || (tcp.flags.syn==1 && tcp.flags.ack==0)"
-            ):
+            for pcap_file, row in self._filtered_rows(pcaps, "tcp.flags.reset==1 || tcp.flags.syn==1"):
                 seen_pcap_names.add(pcap_file.name)
-                il = (row.get("_ws.col.Info") or "").lower()
+                flags = _tcp_flag_bits(row)
                 pair = (row_source_ip(row), row_destination_ip(row))
-                if "rst" in il:
+                if flags & 0x04:
                     rst_counts[pair] += 1
-                if "syn" in il and "ack" not in il:
+                if flags & 0x12 == 0x02:
                     syn_counts[pair] += 1
+                elif flags & 0x12 == 0x12:
+                    synack_counts[pair] += 1
             hygiene_pcap_names = sorted(seen_pcap_names)
         self._log_ts(f"      [hygiene 5/5] TCP RST/SYN anomalies + ARP spoof checks "
                      f"({len(rst_counts):,} RST pairs, {len(syn_counts):,} SYN pairs) …")
@@ -4311,10 +4523,12 @@ class OTPcapAnalyzer:
                     [f"RST count: {count}"], [pair[0]], [pair[1]], "TCP",
                     hygiene_pcap_names, f"net::rst::{pair[0]}::{pair[1]}", [])
         for pair, count in syn_counts.items():
-            if count >= 20:
-                _capped_add("syn_storm", SEVERITY_HIGH, "Repeated SYNs without handshake observed",
-                    "Repeated SYN traffic without visible completion can indicate scanning or service reachability issues.",
-                    [f"SYN count: {count}"], [pair[0]], [pair[1]], "TCP",
+            unanswered = count - synack_counts.get((pair[1], pair[0]), 0)
+            if unanswered >= 20:
+                _capped_add("syn_storm", SEVERITY_HIGH, "Repeated unanswered SYNs observed",
+                    f"{pair[0]} sent {count} connection attempts to {pair[1]}, {unanswered} of which got no SYN-ACK. "
+                    "Unanswered connection attempts indicate scanning, a blocked path, or a service that is down.",
+                    [f"SYN count: {count}", f"Unanswered: {unanswered}"], [pair[0]], [pair[1]], "TCP",
                     hygiene_pcap_names, f"net::syn::{pair[0]}::{pair[1]}", [])
 
         # ---- ARP spoof / MAC-IP drift findings -------------------------
@@ -4632,63 +4846,100 @@ class OTPcapAnalyzer:
     def check_intrusion(self, pcaps: Sequence[Path]) -> int:
         """Analyze cross-protocol intrusion indicators."""
         assert self.session is not None
-        ot_ports_by_source: Dict[str, set[int]] = defaultdict(set)
-        ot_connections_by_source: Dict[str, List[ConnectionSummary]] = defaultdict(list)
+        pcap_names = [pcap.name for pcap in pcaps]
+        known_hmis = {
+            item.strip().lower()
+            for item in re.split(r"[,;\s]+", self.session.environment_answers.get("known_hmis", ""))
+            if item.strip()
+        }
+        # Scanning is broad and shallow: many OT endpoints, most of them touched
+        # with only a handful of packets.  A SCADA master polling several
+        # protocols holds a few long-lived sessions instead.
+        ot_endpoints_by_source: Dict[str, Dict[Tuple[str, int], int]] = defaultdict(dict)
         for connection in self.session.connections.values():
             if connection.destination_port in KNOWN_OT_PORTS:
-                ot_ports_by_source[connection.source_ip].add(connection.destination_port)
-                ot_connections_by_source[connection.source_ip].append(connection)
-        for source_ip, ports in ot_ports_by_source.items():
-            if len(ports) >= 3:
-                self.add_finding(SEVERITY_INTRUSION, "Intrusion Indicators", "Possible OT protocol scanning", f"{source_ip} contacted multiple OT protocol ports in the same session, which is consistent with active reconnaissance.", [f"Ports: {', '.join(str(port) for port in sorted(ports))}"], [source_ip], [], "Multi-Protocol", [pcap.name for pcap in pcaps], f"intrusion::scan::{source_ip}", tags=["intrusion", "recon"])
+                ot_endpoints_by_source[connection.source_ip][(connection.destination_ip, connection.destination_port)] = \
+                    connection.packet_count
+        for source_ip, endpoints in ot_endpoints_by_source.items():
+            ports = {port for _, port in endpoints}
+            shallow = [endpoint for endpoint, packets in endpoints.items() if packets <= 4]
+            if len(ports) >= 3 and len(endpoints) >= 5 and len(shallow) >= len(endpoints) / 2:
+                hosts = sorted({host for host, _ in endpoints})
+                self.add_finding(
+                    SEVERITY_INTRUSION, "Intrusion Indicators", "Possible OT protocol scanning",
+                    f"{source_ip} probed {len(endpoints)} OT service endpoints across {len(ports)} protocols, and "
+                    f"{len(shallow)} of them saw only a handful of packets — the broad, shallow pattern of a port scan "
+                    "rather than of a master polling its devices.",
+                    [f"OT ports probed: {', '.join(str(port) for port in sorted(ports))}",
+                     f"Hosts probed ({len(hosts)}): {', '.join(hosts[:20])}",
+                     f"Shallow (<=4 packet) endpoints: {len(shallow)} of {len(endpoints)}"],
+                    [source_ip], hosts[:20], "Multi-Protocol", pcap_names,
+                    f"intrusion::scan::{source_ip}", tags=["intrusion", "recon"],
+                )
+        # Correlations by source.  Only strong reconnaissance (tag "recon":
+        # scans, sweeps, walks, scanner tooling) counts — routine discovery
+        # such as IEC-104 general interrogation or CIP List Identity is
+        # tagged "discovery" so ordinary engineering work does not correlate.
         tags_by_source: Dict[str, Counter[str]] = defaultdict(Counter)
+        write_targets_by_source: Dict[str, set] = defaultdict(set)
         for finding in self.session.findings:
             for source_ip in finding.source_ips:
                 for tag in finding.tags:
                     tags_by_source[source_ip][tag] += 1
+                if "write" in finding.tags:
+                    write_targets_by_source[source_ip].update(finding.destination_ips)
         for source_ip, tag_counts in tags_by_source.items():
             if tag_counts["recon"] and tag_counts["write"]:
-                self.add_finding(SEVERITY_CORRELATION, "Intrusion Indicators", "Recon-then-write pattern observed", f"{source_ip} is associated with both reconnaissance-style and write/control-style activity in the same session.", [f"Recon tags: {tag_counts['recon']} | Write tags: {tag_counts['write']}"], [source_ip], [], "Correlation", [pcap.name for pcap in pcaps], f"correlation::recon-write::{source_ip}", tags=["correlation"])
+                self.add_finding(SEVERITY_CORRELATION, "Intrusion Indicators", "Recon-then-write pattern observed",
+                    f"{source_ip} performed reconnaissance (scanning, sweeping, or enumeration tooling) and also issued "
+                    "write/control commands in the same session.",
+                    [f"Recon findings: {tag_counts['recon']} | Write/control findings: {tag_counts['write']}"],
+                    [source_ip], [], "Correlation", pcap_names, f"correlation::recon-write::{source_ip}",
+                    tags=["correlation"])
             if tag_counts["anonymous_mqtt"] and tag_counts["control_topic"]:
-                self.add_finding(SEVERITY_CRITICAL, "Intrusion Indicators", "Anonymous MQTT plus control topics", f"{source_ip} showed both anonymous MQTT access indicators and control-topic activity, which materially raises risk.", [f"Anonymous MQTT indicators: {tag_counts['anonymous_mqtt']} | Control-topic indicators: {tag_counts['control_topic']}"], [source_ip], [], "MQTT", [pcap.name for pcap in pcaps], f"intrusion::mqtt-anon-control::{source_ip}", tags=["intrusion"])
-        write_counts_by_source: Counter[str] = Counter()
-        for finding in self.session.findings:
-            if "write" in finding.tags:
-                for source_ip in finding.source_ips:
-                    write_counts_by_source[source_ip] += 1
-        for source_ip, count in write_counts_by_source.items():
-            if count >= self.config.get("write_burst_count", DEFAULT_WRITE_BURST_COUNT):
-                self.add_finding(SEVERITY_INTRUSION, "Intrusion Indicators", "High volume of write/control findings", f"{source_ip} triggered {count} write-style findings during the session, exceeding the configured threshold.", [f"Configured threshold: {self.config.get('write_burst_count', DEFAULT_WRITE_BURST_COUNT)}"], [source_ip], [], "Correlation", [pcap.name for pcap in pcaps], f"intrusion::write-burst::{source_ip}", tags=["intrusion"])
-        for source_ip, connections in ot_connections_by_source.items():
-            source_device = self.session.devices.get(source_ip)
-            if source_device and source_device.inferred_role == "IT Device":
-                self.add_finding(SEVERITY_INTRUSION, "Intrusion Indicators", "Possible IT-to-OT lateral movement", f"{source_ip} appears IT-classified but initiated OT protocol connections in the session.", [f"OT ports contacted: {', '.join(str(item.destination_port) for item in connections[:10])}"], [source_ip], [], "Multi-Protocol", [pcap.name for pcap in pcaps], f"intrusion::lateral::{source_ip}", tags=["intrusion", "boundary"])
+                self.add_finding(SEVERITY_CRITICAL, "Intrusion Indicators", "Anonymous MQTT plus control topics",
+                    f"{source_ip} connected to MQTT without credentials and used control-oriented topics, which materially raises risk.",
+                    [f"Anonymous MQTT indicators: {tag_counts['anonymous_mqtt']} | Control-topic indicators: {tag_counts['control_topic']}"],
+                    [source_ip], [], "MQTT", pcap_names, f"intrusion::mqtt-anon-control::{source_ip}", tags=["intrusion"])
+        threshold = self.config.get("write_burst_count", DEFAULT_WRITE_BURST_COUNT)
+        for source_ip, targets in write_targets_by_source.items():
+            if len(targets) >= threshold and source_ip.lower() not in known_hmis:
+                self.add_finding(SEVERITY_HIGH, "Intrusion Indicators", "Write/control commands sent to many devices",
+                    f"{source_ip} issued write or control commands to {len(targets)} different devices. Engineering "
+                    "workstations do this during commissioning; any other host doing so warrants investigation.",
+                    [f"Targets ({len(targets)}): {', '.join(sorted(targets)[:20])}",
+                     f"Threshold: {threshold} devices (write_burst_count)"],
+                    [source_ip], sorted(targets)[:20], "Correlation", pcap_names,
+                    f"intrusion::write-burst::{source_ip}", tags=["write_volume"])
         return 0
 
     def check_unknown(self, pcaps: Sequence[Path]) -> int:
-        """Flag unexplained traffic involving OT-adjacent devices."""
+        """Flag OT-adjacent traffic to service ports with no known protocol."""
         assert self.session is not None
-        known_ports = set(KNOWN_OT_PORTS) | IT_PORTS
+        known_ports = set(KNOWN_OT_PORTS) | IT_PORTS | IT_INDICATOR_PORTS | _SERVICE_PORT_HINTS
         grouped_links: Dict[int, List[str]] = defaultdict(list)
         grouped_pcaps: Dict[int, set[str]] = defaultdict(set)
         grouped_ips: Dict[int, set[str]] = defaultdict(set)
         for connection in self.session.connections.values():
-            if connection.destination_port in known_ports or connection.destination_port == 0:
+            port = connection.destination_port
+            # Dynamic-range ports (>= 49152) are never registered services.
+            if port in known_ports or port == 0 or port >= 49152:
                 continue
             source_device = self.session.devices.get(connection.source_ip)
             destination_device = self.session.devices.get(connection.destination_ip)
             if (source_device and self._likely_ot_device(source_device)) or (destination_device and self._likely_ot_device(destination_device)):
-                grouped_links[connection.destination_port].append(
-                    f"{connection.source_ip} -> {connection.destination_ip} | port {connection.destination_port} | packets {connection.packet_count}"
+                grouped_links[port].append(
+                    f"{connection.source_ip} -> {connection.destination_ip} | port {port} | packets {connection.packet_count}"
                 )
-                grouped_pcaps[connection.destination_port].update(connection.source_pcaps)
-                grouped_ips[connection.destination_port].update([connection.source_ip, connection.destination_ip])
+                grouped_pcaps[port].update(connection.source_pcaps)
+                grouped_ips[port].update([connection.source_ip, connection.destination_ip])
         for port, links in grouped_links.items():
             self.add_finding(
                 SEVERITY_MEDIUM,
                 "Unknown and Unclassified Traffic",
                 "Unknown OT-adjacent traffic observed",
-                f"Traffic involving likely OT-adjacent devices used unclassified port {port}. This may be vendor-specific, undocumented, or malicious and should be reviewed manually.",
+                f"Traffic involving likely OT-adjacent devices used unclassified service port {port}. This may be "
+                "vendor-specific, undocumented, or malicious and should be reviewed manually.",
                 links[:12],
                 sorted(grouped_ips[port]),
                 [],
@@ -4739,7 +4990,7 @@ class OTPcapAnalyzer:
         "21,23,80,3389,5900,445,139,512,513,"
         # Vendor-specific OT ports: Omron FINS, GE-SRTP, Schneider UMAS,
         # Mitsubishi MELSEC, OSIsoft PI, Ignition Gateway, Node-RED
-        "9600,18245,1024,5007,9001,4592,1880,"
+        "9600,18245,5007,5450,5457,62541,8060,1880,"
         # A/V streaming ports: SIP (5060/5061), RTMP (1935),
         # Hikvision DVR/NVR (8000), Dahua DVR/NVR (37777)
         "5060,5061,1935,8000,37777} || "
@@ -4770,7 +5021,7 @@ class OTPcapAnalyzer:
         # classification happens Python-side in the AV dispatch block).
         "(udp && ip.dst == 224.0.0.0/4) || "
         "(udp.srcport >= 16384 && udp.dstport >= 16384 && frame.len >= 200) || "
-        "tcp.flags.reset==1 || (tcp.flags.syn==1 && tcp.flags.ack==0)"
+        "tcp.flags.reset==1 || tcp.flags.syn==1"
     )
 
     def _run_streaming_protocol_checks(self, pcaps: Sequence[Path]) -> None:
@@ -4785,26 +5036,34 @@ class OTPcapAnalyzer:
         pcap_name_list = [p.name for p in pcaps]
 
         # ---- per-protocol accumulators --------------------------------
+        # Modbus state is keyed by (client, server) and built from structured
+        # fields: function code, transaction ID, and start address.
         mb: Dict[str, Any] = {
             "rows_seen": False, "pcap_names": set(),
             "read_masters": set(),
             "write_sources": Counter(),
             "exception_counts": Counter(),
-            "address_ranges": defaultdict(list),
+            # Request timestamps per pair (polling-burst detection).
             "timestamps": defaultdict(list),
-            # Per-(src,dst) per-register read counter — distinguishes
-            # repetitive single-register hammering (HMI baseline OR DoS)
-            # from wide-range scanning (recon).
-            "register_read_counts": defaultdict(Counter),
-            # Response-content fingerprint timing: per-(src,dst,fingerprint)
-            # list of timestamps so we can detect identical responses
-            # appearing with anomalous gaps (replay-attack signal).
-            "response_fp_times": defaultdict(list),
-            # Per-(src,dst,register_num) value history for anomalous-jump
-            # detection.  Populated from modbus.regval_uint16 tshark field
-            # on read responses.  Bounded to 500 readings per register.
+            # Read requests per pair per start address, plus first/last time
+            # per (pair, address): scanning sweeps many addresses once each,
+            # hammering hits one address at a high rate.
+            "read_starts": defaultdict(Counter),
+            "read_span": {},
+            # Outstanding requests: (pair, client port, transaction id) ->
+            # [func, ref, TCP sequence of the first response or None].
+            "pending": {},
+            "first_seen": {},
+            "responses": Counter(),
+            "duplicate_responses": Counter(),
+            "unsolicited_responses": Counter(),
+            "response_samples": defaultdict(list),
+            # Per-(server, client, register) value history for anomalous-jump
+            # detection (first register of each read response).  Bounded to
+            # 500 readings per register.
             "register_values": defaultdict(list),
         }
+        umas: Dict[str, Any] = {"rows_seen": False, "pcap_names": set(), "samples": [], "pairs": set()}
         bn: Dict[str, Any] = {
             "rows_seen": False, "pcap_names": set(),
             "who_is": 0, "i_am": 0,
@@ -4825,9 +5084,12 @@ class OTPcapAnalyzer:
             "rows_seen": False, "pcap_names": set(),
             "cleartext_pairs": set(),
         }
+        opc_sessions: Dict[Tuple[str, str], Dict[str, Any]] = defaultdict(
+            lambda: {"policy_none": False, "mode": "", "pcaps": set(), "sample": ""})
         mq: Dict[str, Any] = {
             "rows_seen": False, "pcap_names": set(),
             "reconnect_tracker": defaultdict(list),
+            "brokers": defaultdict(lambda: {"clients": set(), "pcaps": set(), "samples": []}),
         }
         opc: Dict[str, Any] = {
             "rows_seen": False, "pcap_names": set(),
@@ -4835,7 +5097,12 @@ class OTPcapAnalyzer:
         }
         enip: Dict[str, Any] = {"rows_seen": False, "pcap_names": set()}
         sie: Dict[str, Any]  = {"rows_seen": False, "pcap_names": set()}
-        phys: Dict[str, Any] = {"rows_seen": False, "pcap_names": set()}
+        phys: Dict[str, Any] = {
+            "rows_seen": False, "pcap_names": set(),
+            # (client, camera) -> whether the camera ever demanded credentials (RTSP 401)
+            # and whether a stream was requested (DESCRIBE/SETUP/PLAY).
+            "rtsp_pairs": defaultdict(lambda: {"challenged": False, "streamed": False, "pcaps": set(), "sample": ""}),
+        }
         # Beaconing: per (src_ip, dst_ip, dst_port) track timestamps.  Beacon
         # detection looks at inter-arrival times — low jitter + regular interval
         # to the same destination is a C2 signature.  Bound per-pair sample
@@ -4899,14 +5166,14 @@ class OTPcapAnalyzer:
             "rows_seen": False, "pcap_names": set(),
             "weak_ciphers":    [],    # [(pcap, src, dst, cipher)]
             "old_versions":    [],    # [(pcap, src, dst, version)]
-            "self_signed":     [],    # [(pcap, src, dst, subject)]
-            "expired_certs":   [],    # [(pcap, src, dst, notAfter)]
+            "rejected_certs":  [],    # [(pcap, client, server, alert)] bad_certificate / unknown_ca
+            "expired_certs":   [],    # [(pcap, client, server, alert)] certificate_expired
             "ja3_hits":        [],    # [(pcap, src, dst, ja3_hash, label)]
             "per_server_info": defaultdict(dict),  # dst -> {sni, version, cipher}
         }
         # network_hygiene TCP state (RST / SYN anomalies) + ARP anomalies
         hyg: Dict[str, Any] = {
-            "rst_counts": Counter(), "syn_counts": Counter(), "pcap_names": set(),
+            "rst_counts": Counter(), "syn_counts": Counter(), "synack_counts": Counter(), "pcap_names": set(),
             # ARP spoof detection state
             "gratuitous_arp_by_src": Counter(),       # count per sender MAC
             "mac_to_ips":  defaultdict(set),          # MAC -> {IPs it claimed}
@@ -4927,11 +5194,13 @@ class OTPcapAnalyzer:
         # Each holds rows_seen flag, pcap set, and a sample list for evidence.
         fins:     Dict[str, Any] = {"rows_seen": False, "pcap_names": set(), "samples": []}
         gertp:    Dict[str, Any] = {"rows_seen": False, "pcap_names": set(), "samples": []}
-        umas:     Dict[str, Any] = {"rows_seen": False, "pcap_names": set(), "samples": []}
         melsec:   Dict[str, Any] = {"rows_seen": False, "pcap_names": set(), "samples": []}
         pi_srv:   Dict[str, Any] = {"rows_seen": False, "pcap_names": set(), "samples": []}
         ignition: Dict[str, Any] = {"rows_seen": False, "pcap_names": set(), "samples": []}
-        nodered:  Dict[str, Any] = {"rows_seen": False, "pcap_names": set(), "samples": []}
+        nodered:  Dict[str, Any] = {
+            "rows_seen": False, "pcap_names": set(), "samples": [],
+            "pairs": defaultdict(lambda: {"requests": 0, "authorized": 0, "denied": 0, "pcaps": set(), "sample": ""}),
+        }
         # IoT wireless / constrained-device protocol accumulators
         zigbee:   Dict[str, Any] = {
             "rows_seen": False, "pcap_names": set(), "samples": [],
@@ -4994,109 +5263,101 @@ class OTPcapAnalyzer:
                     _ts_tag = f" @{_ts_e}" if _ts_e else ""
                     ev     = f"{pcap.name}: {src} -> {dst} | {info}{_ts_tag}"
                     pn     = pcap.name
+                    client, server, service_port, _transport, to_server = self._orient(row)
+                    fp_layers = fp.split(":")
+                    # Port-based protocol checks need application data: a refused
+                    # SYN, a bare ACK, or an ICMP error quoting a probe is not the protocol.
+                    _l7 = (not any(layer.startswith("icmp") for layer in fp_layers)
+                           and (_transport != "TCP" or _int_field(row, "tcp.len", 0) > 0))
 
                     # ---- MODBUS ------------------------------------------
-                    if dport == 502 or sport == 502:
+                    if _l7 and (dport == 502 or sport == 502):
                         mb["rows_seen"] = True
                         mb["pcap_names"].add(pn)
-                        if "read" in il:
-                            mb["read_masters"].add(src)
-                        if "write" in il or re.search(r"\bfc(?:=|:)?\s*(5|6|15|16)\b", il):
-                            mb["write_sources"][(src, dst)] += 1
-                            self.add_finding(
-                                SEVERITY_HIGH, "Modbus TCP", "Modbus write operation observed",
-                                f"Modbus write activity was observed from {src} to {dst}. Write-capable function codes should be validated as intentional.",
-                                [ev], [src], [dst], "Modbus TCP", [pn],
-                                f"modbus::write::{src}::{dst}", tags=["write", "modbus"],
-                                first_seen=row.get("frame.time_epoch"), last_seen=row.get("frame.time_epoch"),
-                            )
-                        if "exception" in il:
-                            mb["exception_counts"][dst] += 1
-                        if "unit id: 0" in il or "unit identifier: 0" in il:
-                            self.add_finding(
-                                SEVERITY_HIGH, "Modbus TCP", "Modbus Unit ID 0 observed",
-                                "Modbus traffic referenced Unit ID 0, which can be indicative of broadcast-style behavior or access control bypass attempts.",
-                                [ev], [src], [dst], "Modbus TCP", [pn],
-                                f"modbus::unit0::{src}::{dst}",
-                            )
-                        try:
-                            mb["timestamps"][(src, dst)].append(float(row.get("frame.time_epoch") or "0"))
-                        except ValueError:
-                            pass
-                        for m in re.finditer(r"(\d{1,5})", info):
-                            mb["address_ranges"][(src, dst)].append(int(m.group(1)))
-
-                        # Per-register read counter for repetitive-polling
-                        # detection.  Match Wireshark Info patterns like
-                        # "Reference Number: 0" or "Read Holding Registers ... start=N".
-                        if "read" in il:
-                            ref_match = re.search(
-                                r"reference\s*number[:\s]+(\d+)|\bstart[:\s=]+(\d+)|\baddress[:\s=]+(\d+)",
-                                il)
-                            if ref_match:
-                                reg = int(next(g for g in ref_match.groups() if g))
-                                mb["register_read_counts"][(src, dst)][reg] += 1
-
-                        # Identical-response replay detector: build a coarse
-                        # content fingerprint from the response Info string
-                        # (registers/values/byte-count) and stamp the time.
-                        # If the SAME fingerprint reappears later with a gap
-                        # that doesn't match the surrounding polling cadence,
-                        # that's a replay signal.
-                        if "response" in il:
-                            payload_sig = re.sub(r"trans:\s*\d+", "trans:X", il)
-                            payload_sig = re.sub(r"\s+", " ", payload_sig)[:160]
+                        func = _int_field(row, "modbus.func_code")
+                        if "modbus" in fp and func >= 0:
+                            pair_mb = (client, server)
                             try:
-                                ts_resp = float(row.get("frame.time_epoch") or "0")
+                                ts_mb = float(_ts_e or "0")
                             except ValueError:
-                                ts_resp = 0.0
-                            if ts_resp > 0:
-                                bucket = mb["response_fp_times"][(src, dst, payload_sig)]
-                                if len(bucket) < 200:
-                                    bucket.append(ts_resp)
-
-                        # Per-register value tracking.  Extract the starting
-                        # register address (modbus.reference_num) and each
-                        # register value (modbus.regval_uint16, comma-separated
-                        # when multiple registers are returned) from response rows.
-                        # Values are stored as (timestamp, value) tuples, bounded
-                        # to 500 per register, for anomalous-jump detection in the
-                        # finalization pass.
-                        if "response" in il:
-                            ref_raw = (row.get("modbus.reference_num") or "").strip()
-                            val_raw = (row.get("modbus.regval_uint16") or "").strip()
-                            if ref_raw and val_raw:
-                                try:
-                                    start_reg = int(ref_raw)
-                                    try:
-                                        ts_rv = float(row.get("frame.time_epoch") or "0")
-                                    except ValueError:
-                                        ts_rv = 0.0
-                                    for i, vs in enumerate(val_raw.split(",")):
-                                        vs = vs.strip()
-                                        if not vs:
-                                            continue
-                                        try:
-                                            rval = int(vs)
-                                        except ValueError:
-                                            continue
-                                        key = (src, dst, start_reg + i)
-                                        bucket_rv = mb["register_values"][key]
-                                        if len(bucket_rv) < 500:
-                                            bucket_rv.append((ts_rv, rval))
-                                except (ValueError, TypeError):
-                                    pass
+                                ts_mb = 0.0
+                            mb["first_seen"].setdefault(pair_mb, ts_mb)
+                            tid = _int_field(row, "mbtcp.trans_id")
+                            if func == 90:
+                                umas["rows_seen"] = True
+                                umas["pcap_names"].add(pn)
+                                umas["pairs"].add(pair_mb)
+                                if len(umas["samples"]) < 5:
+                                    umas["samples"].append(ev)
+                            if to_server:
+                                if len(mb["timestamps"][pair_mb]) < 20000:
+                                    mb["timestamps"][pair_mb].append(ts_mb)
+                                ref = _int_field(row, "modbus.reference_num")
+                                if func in MODBUS_READ_FUNCTIONS:
+                                    mb["read_masters"].add(client)
+                                    if ref >= 0:
+                                        mb["read_starts"][pair_mb][ref] += 1
+                                        span = mb["read_span"].setdefault((pair_mb, ref), [ts_mb, ts_mb])
+                                        span[1] = ts_mb
+                                if func in MODBUS_WRITE_FUNCTIONS:
+                                    mb["write_sources"][pair_mb] += 1
+                                    self.add_finding(
+                                        SEVERITY_HIGH, "Modbus TCP", "Modbus write operation observed",
+                                        f"Modbus write requests were sent from {client} to {server}. Write-capable function codes should be validated as intentional.",
+                                        [ev], [client], [server], "Modbus TCP", [pn],
+                                        f"modbus::write::{client}::{server}", tags=["write", "modbus"],
+                                        first_seen=_ts_e or None, last_seen=_ts_e or None,
+                                    )
+                                    if _int_field(row, "mbtcp.unit_id") == 0:
+                                        self.add_finding(
+                                            SEVERITY_HIGH, "Modbus TCP", "Modbus write to Unit ID 0 (broadcast) observed",
+                                            f"{client} sent a Modbus write to Unit ID 0. Through a serial gateway, unit 0 is a broadcast "
+                                            "that every downstream slave executes without replying.",
+                                            [ev], [client], [server], "Modbus TCP", [pn],
+                                            f"modbus::unit0::{client}::{server}", tags=["write", "modbus"],
+                                        )
+                                if tid >= 0:
+                                    if len(mb["pending"]) >= 50_000:
+                                        # Answers arrive within milliseconds; drop the oldest requests.
+                                        for stale in list(mb["pending"])[:10_000]:
+                                            del mb["pending"][stale]
+                                    mb["pending"][(pair_mb, sport, tid)] = [func, ref, None]
+                            else:
+                                mb["responses"][pair_mb] += 1
+                                if row.get("modbus.exception_code"):
+                                    mb["exception_counts"][server] += 1
+                                if tid >= 0:
+                                    entry = mb["pending"].get((pair_mb, dport, tid))
+                                    seq_mb = row.get("tcp.seq") or ""
+                                    if entry is None:
+                                        # Ignore replies to requests sent before the capture began.
+                                        if ts_mb - mb["first_seen"][pair_mb] > 2.0:
+                                            mb["unsolicited_responses"][pair_mb] += 1
+                                            if len(mb["response_samples"][pair_mb]) < 5:
+                                                mb["response_samples"][pair_mb].append(f"{ev} (no matching request)")
+                                    elif entry[2] is None:
+                                        entry[2] = seq_mb
+                                        value = _int_field(row, "modbus.regval_uint16")
+                                        if entry[0] in (3, 4) and entry[1] >= 0 and value >= 0:
+                                            bucket_rv = mb["register_values"][(server, client, entry[1])]
+                                            if len(bucket_rv) < 500:
+                                                bucket_rv.append((ts_mb, value))
+                                    elif not seq_mb or seq_mb != entry[2]:
+                                        # Same sequence number = TCP retransmission, not a second answer.
+                                        mb["duplicate_responses"][pair_mb] += 1
+                                        if len(mb["response_samples"][pair_mb]) < 5:
+                                            mb["response_samples"][pair_mb].append(f"{ev} (duplicate response, transaction {tid})")
 
                     # ---- BACNET ------------------------------------------
-                    if dport == 47808 or sport == 47808:
+                    if _l7 and (dport == 47808 or sport == 47808):
                         bn["rows_seen"] = True
                         bn["pcap_names"].add(pn)
                         if "who-is" in il: bn["who_is"] += 1
                         if "i-am"   in il: bn["i_am"]   += 1
-                        if "writeproperty" in il or "write property" in il:
+                        if ("writeproperty" in il or "write property" in il) and (row.get("bacapp.type") or "") in ("0", "1"):
                             self.add_finding(
                                 SEVERITY_HIGH, "BACnet/IP", "BACnet WriteProperty observed",
-                                f"BACnet WriteProperty traffic was seen from {src} to {dst}. BACnet writes should be validated as intentional.",
+                                f"BACnet WriteProperty requests were sent from {src} to {dst}. BACnet writes should be validated as intentional.",
                                 [ev], [src], [dst], "BACnet/IP", [pn],
                                 f"bacnet::write::{src}::{dst}", tags=["write", "bacnet"],
                             )
@@ -5109,10 +5370,10 @@ class OTPcapAnalyzer:
                             )
 
                     # ---- DNP3 --------------------------------------------
-                    if dport == 20000 or sport == 20000 or "dnp3" in fp:
+                    if _l7 and (dport == 20000 or sport == 20000 or "dnp3" in fp):
                         d3["rows_seen"] = True
                         d3["pcap_names"].add(pn)
-                        if "secure authentication" in il or " sa " in il:
+                        if _int_field(row, "dnp3.al.func") in (32, 33, 131) or "authentication" in il:
                             d3["secure_auth_seen"] = True
                         if "direct operate" in il:
                             self.add_finding(
@@ -5149,16 +5410,16 @@ class OTPcapAnalyzer:
                         if "warm restart" in il:
                             if len(d3["warm_restart"]) < 50:
                                 d3["warm_restart"].append((pn, src, dst, info[:160]))
-                        if "broadcast" in il or "ffff" in il:
+                        if _int_field(row, "dnp3.dst") in (65533, 65534, 65535):
                             self.add_finding(
                                 SEVERITY_HIGH, "DNP3", "DNP3 broadcast observed",
-                                "A DNP3 broadcast-style message was observed.",
+                                f"{src} sent a DNP3 message to a broadcast address, which every outstation on the link executes.",
                                 [ev], [src], [dst], "DNP3", [pn],
                                 f"dnp3::broadcast::{src}::{dst}", tags=["dnp3"],
                             )
 
                     # ---- IEC 61850 / GOOSE / MMS -------------------------
-                    if "mms" in fp or "goose" in fp or "sv" in fp or dport == 102 or sport == 102:
+                    if "mms" in fp_layers or "goose" in fp_layers or "sv" in fp_layers:
                         i61["rows_seen"] = True
                         i61["pcap_names"].add(pn)
                         proto_fam = protocol_family_from_row(row).lower()
@@ -5167,48 +5428,49 @@ class OTPcapAnalyzer:
                             m = re.search(r"stnum[=: ]+(\d+)", il)
                             if m:
                                 i61["goose_by_mac"][src_mac].append(int(m.group(1)))
-                        if any(t in il for t in ("operate", "cancel", "commandtermination")):
+                        if to_server and any(t in il for t in ("operate", "cancel", "commandtermination")):
                             self.add_finding(
                                 SEVERITY_HIGH, "IEC 61850", "IEC 61850 control operation observed",
                                 f"IEC 61850 control-oriented traffic was observed from {src or row.get('eth.src','')} to {dst or row.get('eth.dst','')}.",
                                 [ev], [src], [dst], "IEC 61850", [pn],
                                 f"iec61850::control::{src or row.get('eth.src','')}::{dst or row.get('eth.dst','')}", tags=["write", "iec61850"],
                             )
-                        if dport == 102 and "tls" not in fp:
+                        if "mms" in fp_layers and "tls" not in fp_layers and server:
                             self.add_finding(
                                 SEVERITY_HIGH, "IEC 61850", "IEC 61850 MMS without TLS",
-                                "MMS traffic on TCP/102 was observed without TLS indicators. This suggests cleartext substation communications.",
-                                [ev], [src], [dst], "IEC 61850 MMS", [pn],
-                                f"iec61850::cleartext::{src}::{dst}",
+                                "MMS sessions were observed without TLS. This suggests cleartext substation communications.",
+                                [f"{client} -> {server}:{service_port} | {info}{_ts_tag}"], [client], [server], "IEC 61850 MMS", [pn],
+                                f"iec61850::cleartext::{server}",
                             )
 
                     # ---- IEC 60870-5-104 ---------------------------------
-                    if dport == 2404 or sport == 2404:
+                    if _l7 and (dport == 2404 or sport == 2404):
                         i104["rows_seen"] = True
                         i104["pcap_names"].add(pn)
-                        pair = (src, dst)
-                        if dport == 2404 and pair not in i104["cleartext_pairs"]:
+                        pair = (client, server)
+                        if to_server and pair not in i104["cleartext_pairs"]:
                             i104["cleartext_pairs"].add(pair)
                             self.add_finding(
                                 SEVERITY_HIGH, "IEC 60870-5-104", "IEC 60870-5-104 without TLS observed",
                                 "IEC 104 on TCP/2404 carries no native authentication or encryption. "
                                 "Implement IEC 62351-3 TLS wrapping or restrict to approved sources at the firewall.",
-                                [ev], [src], [dst], "IEC 60870-5-104", [pn],
-                                f"iec104::cleartext::{src}::{dst}", tags=["cleartext", "iec104"],
+                                [f"{client} -> {server}:2404{_ts_tag}"], [client], [server], "IEC 60870-5-104", [pn],
+                                f"iec104::cleartext::{server}", tags=["cleartext", "iec104"],
                             )
-                        if any(t in il for t in ("c_sc", "c_dc", "c_rc", "c_se", "c_bo", "direct execute", "select-and-execute")):
+                        if to_server and any(t in il for t in ("c_sc", "c_dc", "c_rc", "c_se", "c_bo", "direct execute", "select-and-execute")):
                             self.add_finding(
                                 SEVERITY_CRITICAL, "IEC 60870-5-104", "IEC 104 control ASDU observed",
-                                f"IEC 104 control ASDU traffic was observed from {src} to {dst}.",
-                                [ev], [src], [dst], "IEC 60870-5-104", [pn],
-                                f"iec104::control::{src}::{dst}", tags=["write", "iec104"],
+                                f"IEC 104 control commands were sent from {client} to {server}.",
+                                [ev], [client], [server], "IEC 60870-5-104", [pn],
+                                f"iec104::control::{client}::{server}", tags=["write", "iec104"],
                             )
-                        if "general interrogation" in il or "c_ic" in il or "interrogation" in il:
+                        if to_server and ("c_ic" in il or "interrogation" in il):
                             self.add_finding(
-                                SEVERITY_MEDIUM, "IEC 60870-5-104", "IEC 104 general interrogation observed",
-                                f"IEC 104 general interrogation observed from {src}.",
-                                [ev], [src], [dst], "IEC 60870-5-104", [pn],
-                                f"iec104::interrogation::{src}::{dst}", tags=["recon", "iec104"],
+                                SEVERITY_INFO, "IEC 60870-5-104", "IEC 104 general interrogation observed",
+                                f"{client} issued general interrogation to {server} — routine when a master (re)connects; "
+                                "recorded so unexpected masters stand out.",
+                                [ev], [client], [server], "IEC 60870-5-104", [pn],
+                                f"iec104::interrogation::{client}::{server}", tags=["discovery", "iec104"],
                             )
                         if dst and (dst.endswith(".255") or dst.startswith("224.")):
                             self.add_finding(
@@ -5219,128 +5481,124 @@ class OTPcapAnalyzer:
                             )
 
                     # ---- MQTT --------------------------------------------
-                    if dport in (1883, 8883) or sport in (1883, 8883):
+                    if _l7 and (dport in (1883, 8883) or sport in (1883, 8883)):
                         mq["rows_seen"] = True
                         mq["pcap_names"].add(pn)
-                        if dport == 1883 or sport == 1883:
+                        msgtype = _int_field(row, "mqtt.msgtype")
+                        if service_port == 8883 and msgtype >= 0 and server:
                             self.add_finding(
-                                SEVERITY_HIGH, "MQTT", "Cleartext MQTT observed",
-                                "MQTT traffic was observed on port 1883. Cleartext broker communications expose command and telemetry data.",
-                                [ev], [src], [dst], "MQTT", [pn],
-                                f"mqtt::cleartext::{src}::{dst}",
+                                SEVERITY_HIGH, "MQTT", "MQTT on 8883 without TLS",
+                                f"Readable MQTT messages were seen on {server}:8883, the MQTT-over-TLS port — the broker "
+                                "is accepting cleartext sessions there.",
+                                [ev], [client], [server], "MQTT", [pn],
+                                f"mqtt::8883-no-tls::{server}", tags=["cleartext", "mqtt"],
                             )
-                        if "connect" in il and not any(t in il for t in ("user", "username", "password", "auth")):
-                            self.add_finding(
-                                SEVERITY_CRITICAL, "MQTT", "MQTT connection with no authentication evidence",
-                                f"MQTT CONNECT traffic from {src} did not show authentication indicators.",
-                                [ev], [src], [dst], "MQTT", [pn],
-                                f"mqtt::anonymous::{src}::{dst}", tags=["anonymous_mqtt"],
-                            )
-                        tm = re.search(r"(topic|publish|subscribe)[^A-Za-z0-9/_-]*([A-Za-z0-9/_#.-]+)", info, re.IGNORECASE)
-                        if tm:
-                            topic = tm.group(2)
+                        if service_port == 1883 and server and to_server:
+                            broker = mq["brokers"][server]
+                            broker["clients"].add(client)
+                            broker["pcaps"].add(pn)
+                            if len(broker["samples"]) < 5 and msgtype >= 0:
+                                broker["samples"].append(ev)
+                        if msgtype == 1 and to_server:
+                            if (row.get("mqtt.conflag.uname") or "").lower() not in ("true", "1"):
+                                self.add_finding(
+                                    SEVERITY_CRITICAL, "MQTT", "MQTT connection without credentials",
+                                    f"{client} connected to the MQTT broker {server} without a username — the broker accepts "
+                                    "anonymous clients.",
+                                    [ev], [client], [server], "MQTT", [pn],
+                                    f"mqtt::anonymous::{client}::{server}", tags=["anonymous_mqtt"],
+                                )
+                            try:
+                                mq["reconnect_tracker"][(client, row.get("mqtt.clientid") or "")].append(float(_ts_e or "0"))
+                            except ValueError:
+                                pass
+                        topic = row.get("mqtt.topic") or ""
+                        if topic and to_server:
                             if any(kw in topic.lower() for kw in CONTROL_KEYWORDS):
                                 self.add_finding(
                                     SEVERITY_HIGH, "MQTT", "MQTT control topic observed",
                                     f"MQTT topic '{topic}' appears control-oriented.",
-                                    [ev], [src], [dst], "MQTT", [pn],
+                                    [ev], [client], [server], "MQTT", [pn],
                                     f"mqtt::control-topic::{topic}", tags=["control_topic", "mqtt"],
                                 )
+                                if (row.get("mqtt.retain") or "").lower() in ("true", "1"):
+                                    self.add_finding(
+                                        SEVERITY_HIGH, "MQTT", "Retained MQTT control message observed",
+                                        "A retained control-oriented MQTT message was observed. Persistent commands are replayed to every new subscriber.",
+                                        [ev], [client], [server], "MQTT", [pn],
+                                        f"mqtt::retained::{client}::{server}", tags=["control_topic", "mqtt"],
+                                    )
                             if any(kw in topic.lower() for kw in SECRET_KEYWORDS):
                                 self.add_finding(
                                     SEVERITY_CRITICAL, "MQTT", "MQTT topic suggests credential exposure",
                                     f"MQTT topic '{topic}' contains credential-related keywords.",
-                                    [ev], [src], [dst], "MQTT", [pn],
+                                    [ev], [client], [server], "MQTT", [pn],
                                     f"mqtt::secret-topic::{topic}", tags=["credential_exposure", "mqtt"],
                                 )
-                        if "subscribe" in il and "#" in info:
-                            self.add_finding(
-                                SEVERITY_HIGH, "MQTT", "MQTT wildcard subscription observed",
-                                "A subscription to wildcard topic '#' was observed.",
-                                [ev], [src], [dst], "MQTT", [pn],
-                                f"mqtt::wildcard::{src}::{dst}", tags=["mqtt"],
-                            )
-                        if "retain" in il and any(kw in il for kw in CONTROL_KEYWORDS):
-                            self.add_finding(
-                                SEVERITY_HIGH, "MQTT", "Retained MQTT control message observed",
-                                "A retained control-oriented MQTT message was observed. Persistent commands can survive broker restarts.",
-                                [ev], [src], [dst], "MQTT", [pn],
-                                f"mqtt::retained::{src}::{dst}", tags=["control_topic", "mqtt"],
-                            )
-                        if dport == 8883 and "tls" not in fp:
-                            self.add_finding(
-                                SEVERITY_HIGH, "MQTT", "MQTT on 8883 without visible TLS handshake",
-                                "Traffic used the typical MQTT-over-TLS port but TLS was not visible in the capture summary.",
-                                [ev], [src], [dst], "MQTT", [pn],
-                                f"mqtt::8883-no-tls::{src}::{dst}",
-                            )
-                        if "disconnect" in il or "connect" in il:
-                            try:
-                                mq["reconnect_tracker"][src].append(float(row.get("frame.time_epoch") or "0"))
-                            except ValueError:
-                                pass
+                            if msgtype == 8 and "#" in topic:
+                                self.add_finding(
+                                    SEVERITY_HIGH, "MQTT", "MQTT wildcard subscription observed",
+                                    f"{client} subscribed to the wildcard topic '{topic}', receiving every message under it.",
+                                    [ev], [client], [server], "MQTT", [pn],
+                                    f"mqtt::wildcard::{client}::{server}", tags=["mqtt"],
+                                )
 
                     # ---- OPC-UA ------------------------------------------
-                    if dport in (4840, 4843) or sport in (4840, 4843) or "opcua" in fp:
+                    if _l7 and (dport in (4840, 4843) or sport in (4840, 4843) or "opcua" in fp):
                         opc["rows_seen"] = True
                         opc["pcap_names"].add(pn)
-                        if "tls" not in fp:
-                            self.add_finding(
-                                SEVERITY_HIGH, "OPC-UA", "OPC-UA without TLS",
-                                "OPC-UA traffic was observed without TLS indicators.",
-                                [ev], [src], [dst], "OPC-UA", [pn],
-                                f"opcua::cleartext::{src}::{dst}",
-                            )
-                        if "securitymode" in il and "none" in il:
-                            self.add_finding(
-                                SEVERITY_CRITICAL, "OPC-UA", "OPC-UA SecurityMode None",
-                                "The capture indicates OPC-UA SecurityMode=None, which explicitly disables session protection.",
-                                [ev], [src], [dst], "OPC-UA", [pn],
-                                f"opcua::security-none::{src}::{dst}",
-                            )
-                        if "securitymode" in il and "sign" in il and "encrypt" not in il:
-                            self.add_finding(
-                                SEVERITY_MEDIUM, "OPC-UA", "OPC-UA Sign without Encrypt",
-                                "OPC-UA traffic appears to use Sign without Encrypt.",
-                                [ev], [src], [dst], "OPC-UA", [pn],
-                                f"opcua::sign-only::{src}::{dst}",
-                            )
-                        if "browse" in il: opc["browse_counts"][src] += 1
-                        if "read"   in il: opc["read_counts"][src]   += 1
-                        if "write"  in il:
+                        policy = (row.get("opcua.security.spu") or "").strip()
+                        mode = _int_field(row, "opcua.MessageSecurityMode")
+                        if server and (policy or mode >= 0):
+                            session_state = opc_sessions[(client, server)]
+                            session_state["pcaps"].add(pn)
+                            if policy.endswith("#None"):
+                                session_state["policy_none"] = True
+                            if mode == 1 or (policy.endswith("#None") and not session_state["mode"]):
+                                session_state["mode"] = "None"
+                            elif mode == 2 and session_state["mode"] != "None":
+                                session_state["mode"] = "Sign"
+                            if not session_state["sample"]:
+                                session_state["sample"] = ev
+                        if to_server and "browse" in il:
+                            opc["browse_counts"][client] += 1
+                        if to_server and "read" in il:
+                            opc["read_counts"][client] += 1
+                        if to_server and "writerequest" in il.replace(" ", ""):
                             self.add_finding(
                                 SEVERITY_HIGH, "OPC-UA", "OPC-UA Write observed",
-                                f"OPC-UA Write traffic was observed from {src} to {dst}.",
-                                [ev], [src], [dst], "OPC-UA", [pn],
-                                f"opcua::write::{src}::{dst}", tags=["write", "opcua"],
+                                f"OPC-UA Write requests were sent from {client} to {server}.",
+                                [ev], [client], [server], "OPC-UA", [pn],
+                                f"opcua::write::{client}::{server}", tags=["write", "opcua"],
                             )
 
                     # ---- EtherNet/IP / CIP --------------------------------
-                    if dport in (44818, 2222) or sport in (44818, 2222) or "enip" in fp or "cip" in fp:
+                    if _l7 and (dport in (44818, 2222) or sport in (44818, 2222) or "enip" in fp or "cip" in fp):
                         enip["rows_seen"] = True
                         enip["pcap_names"].add(pn)
-                        if "list identity" in il:
+                        if to_server and "list identity" in il:
                             self.add_finding(
-                                SEVERITY_HIGH, "EtherNet/IP", "CIP List Identity observed",
-                                "CIP List Identity traffic can indicate device enumeration or reconnaissance.",
-                                [ev], [src], [dst], "EtherNet/IP", [pn],
-                                f"enip::list-identity::{src}::{dst}", tags=["recon", "enip"],
+                                SEVERITY_LOW, "EtherNet/IP", "CIP List Identity (device discovery) observed",
+                                f"{client} queried EtherNet/IP devices with List Identity. Engineering tools such as RSLinx "
+                                "do this routinely; from any other host it is device enumeration.",
+                                [ev], [client], [server], "EtherNet/IP", [pn],
+                                f"enip::list-identity::{client}", tags=["discovery", "enip"],
                             )
-                        if "forward open" in il:
+                        if to_server and ("forward open" in il):
                             self.add_finding(
                                 SEVERITY_MEDIUM, "EtherNet/IP", "CIP Forward Open observed",
                                 "A CIP Forward Open request was observed. Validate that the initiating IP is expected.",
                                 [ev], [src], [dst], "EtherNet/IP", [pn],
                                 f"enip::forward-open::{src}::{dst}",
                             )
-                        if "write" in il or "service: 0x53" in il or "service: 0x4d" in il:
+                        if to_server and ("write" in il or "service: 0x53" in il or "service: 0x4d" in il):
                             self.add_finding(
                                 SEVERITY_HIGH, "EtherNet/IP", "CIP write activity observed",
                                 f"CIP write-style traffic was observed from {src} to {dst}.",
                                 [ev], [src], [dst], "EtherNet/IP", [pn],
                                 f"enip::write::{src}::{dst}", tags=["write", "enip"],
                             )
-                        if "reset" in il or "set attribute" in il:
+                        if to_server and ("reset" in il or "set attribute" in il):
                             self.add_finding(
                                 SEVERITY_CRITICAL, "EtherNet/IP", "CIP reset or set-attribute observed",
                                 "A CIP Reset or Set Attribute style request was observed. This can have direct control impact.",
@@ -5356,7 +5614,7 @@ class OTPcapAnalyzer:
                             "service: 0x53", "file transfer", "file object",
                             "firmware", "flash", "download", "controller program",
                         )
-                        if any(t in il for t in cip_logic_patterns):
+                        if to_server and (any(t in il for t in cip_logic_patterns)):
                             self.add_finding(
                                 SEVERITY_CRITICAL, "EtherNet/IP",
                                 "CIP logic/firmware transfer observed",
@@ -5368,7 +5626,7 @@ class OTPcapAnalyzer:
                                 f"enip::logic-transfer::{src}::{dst}",
                                 tags=["write", "logic_download", "critical_control", "enip"],
                             )
-                        if "slot 0" in il:
+                        if to_server and ("slot 0" in il):
                             self.add_finding(
                                 SEVERITY_HIGH, "EtherNet/IP", "Explicit messaging to slot 0 observed",
                                 "Explicit messaging to controller backplane slot 0 was observed.",
@@ -5383,17 +5641,17 @@ class OTPcapAnalyzer:
                         or dport in (34962, 34963, 34964) or sport in (34962, 34963, 34964)
                         or any(m in f"{proto_text} {il}" for m in ("s7", "profinet", "dcp"))
                     )
-                    if is_siemens:
+                    if _l7 and is_siemens:
                         sie["rows_seen"] = True
                         sie["pcap_names"].add(pn)
-                        if "write var" in il or "write variable" in il or "function 0x05" in il:
+                        if to_server and ("write var" in il or "write variable" in il or "function 0x05" in il):
                             self.add_finding(
                                 SEVERITY_CRITICAL, "Siemens S7 / PROFINET", "S7 Write Variable observed",
                                 "A Siemens S7 Write Variable operation was observed. This is a direct control action against a PLC.",
                                 [ev], [src], [dst], "S7comm", [pn],
                                 f"siemens::write::{src}::{dst}", tags=["write", "siemens"],
                             )
-                        if "s7comm" in fp and any(t in il for t in ("plc stop", "plc start", "function 0x29", "function 0x28", "cpu stop", "cpu start")):
+                        if to_server and "s7comm" in fp and any(t in il for t in ("plc stop", "plc start", "function 0x29", "function 0x28", "cpu stop", "cpu start")):
                             self.add_finding(
                                 SEVERITY_CRITICAL, "Siemens S7 / PROFINET", "S7 PLC stop/start activity observed",
                                 "A Siemens PLC stop/start style operation was observed in the capture.",
@@ -5414,7 +5672,7 @@ class OTPcapAnalyzer:
                             "start upload", "end upload", "upload block",
                             "function 0x1d", "function 0x1e", "function 0x1f",
                         )
-                        if "s7comm" in fp and any(t in il for t in s7_dl_patterns):
+                        if to_server and "s7comm" in fp and any(t in il for t in s7_dl_patterns):
                             self.add_finding(
                                 SEVERITY_CRITICAL, "Siemens S7 / PROFINET",
                                 "S7 logic/firmware download observed",
@@ -5425,7 +5683,7 @@ class OTPcapAnalyzer:
                                 f"siemens::logic-download::{src}::{dst}",
                                 tags=["write", "siemens", "logic_download", "critical_control"],
                             )
-                        if "s7comm" in fp and any(t in il for t in s7_ul_patterns):
+                        if to_server and "s7comm" in fp and any(t in il for t in s7_ul_patterns):
                             self.add_finding(
                                 SEVERITY_HIGH, "Siemens S7 / PROFINET",
                                 "S7 program upload (read) observed",
@@ -5434,14 +5692,15 @@ class OTPcapAnalyzer:
                                 "to steal proprietary control logic prior to manipulation.",
                                 [ev], [src], [dst], "S7comm", [pn],
                                 f"siemens::program-upload::{src}::{dst}",
-                                tags=["recon", "siemens", "program_upload"],
+                                tags=["discovery", "siemens", "program_upload"],
                             )
-                        if "read szl" in il:
+                        if to_server and "read szl" in il:
                             self.add_finding(
-                                SEVERITY_HIGH, "Siemens S7 / PROFINET", "S7 Read SZL observed",
-                                "S7 Read SZL traffic was observed. This can indicate PLC reconnaissance or system inventory activity.",
-                                [ev], [src], [dst], "S7comm", [pn],
-                                f"siemens::szl::{src}::{dst}", tags=["recon", "siemens"],
+                                SEVERITY_MEDIUM, "Siemens S7 / PROFINET", "S7 Read SZL observed",
+                                f"{client} read the PLC's system status lists (SZL). TIA Portal does this when going online; "
+                                "from any other host it is PLC inventory reconnaissance.",
+                                [ev], [client], [server], "S7comm", [pn],
+                                f"siemens::szl::{client}::{server}", tags=["discovery", "siemens"],
                             )
                         if "dcp set" in il or ("set " in il and "dcp" in il):
                             self.add_finding(
@@ -5452,14 +5711,14 @@ class OTPcapAnalyzer:
                             )
                         if "identify all" in il:
                             self.add_finding(
-                                SEVERITY_HIGH, "Siemens S7 / PROFINET", "PROFINET Identify All broadcast observed",
+                                SEVERITY_MEDIUM, "Siemens S7 / PROFINET", "PROFINET Identify All broadcast observed",
                                 "A PROFINET DCP Identify All broadcast was observed, which can indicate active discovery of OT devices.",
                                 [ev], [src], [dst], "PROFINET DCP", [pn],
-                                f"siemens::identify-all::{src}::{dst}", tags=["recon", "siemens"],
+                                f"siemens::identify-all::{src}::{dst}", tags=["discovery", "siemens"],
                             )
 
                     # ---- TFTP (firmware delivery / config exfil) ---------
-                    if dport == 69 or sport == 69 or "tftp" in fp:
+                    if _l7 and (dport == 69 or sport == 69 or "tftp" in fp):
                         if "read request" in il or "rrq" in il or "write request" in il or "wrq" in il:
                             # Extract filename hint from Info string
                             m = re.search(r'(?:read request|rrq|write request|wrq)[^"]*"([^"]{1,120})"', info, re.IGNORECASE)
@@ -5490,7 +5749,7 @@ class OTPcapAnalyzer:
                     # (recon but often used pre-firmware), and FC 0x2B with MEI 0x0D/0x0F
                     # in some dialects carries vendor-specific file transfer payloads.
                     # tshark Info usually shows "Encapsulated Interface Transport".
-                    if (dport == 502 or sport == 502) and any(
+                    if to_server and (dport == 502 or sport == 502) and any(
                         t in il for t in ("encapsulated interface transport",
                                           "read device identification",
                                           "mei type 14", "function 43")
@@ -5503,7 +5762,7 @@ class OTPcapAnalyzer:
                             "engineering tool, but a common precursor to targeted exploitation.",
                             [ev], [src], [dst], "Modbus TCP", [pn],
                             f"modbus::mei::{src}::{dst}",
-                            tags=["recon", "modbus"],
+                            tags=["discovery", "modbus"],
                         )
 
                     # ---- Zigbee (IEEE 802.15.4 / ZigBee NWK / APS) ------
@@ -5521,7 +5780,7 @@ class OTPcapAnalyzer:
                                 zigbee["write_samples"].append(ev)
 
                     # ---- CoAP (Constrained Application Protocol) ---------
-                    if "coap" in fp or dport in {5683, 5684} or sport in {5683, 5684}:
+                    if _l7 and ("coap" in fp or dport in {5683, 5684} or sport in {5683, 5684}):
                         coap_acc["rows_seen"] = True
                         coap_acc["pcap_names"].add(pn)
                         if len(coap_acc["samples"]) < 5:
@@ -5548,7 +5807,7 @@ class OTPcapAnalyzer:
                     # PLC command protocol.  No native authentication or
                     # encryption.  tshark has a partial FINS dissector; Info
                     # strings can include memory-area function names.
-                    if dport == 9600 or sport == 9600:
+                    if _l7 and (dport == 9600 or sport == 9600):
                         fins["rows_seen"] = True
                         fins["pcap_names"].add(pn)
                         if len(fins["samples"]) < 5:
@@ -5557,7 +5816,7 @@ class OTPcapAnalyzer:
                             "memory area write", "file write", " write ", "stop", " run",
                             "cpu unit data write", "forced set", "forced reset",
                         )
-                        if any(t in il for t in fins_write_kw):
+                        if to_server and any(t in il for t in fins_write_kw):
                             self.add_finding(
                                 SEVERITY_HIGH, "Omron FINS",
                                 "Omron FINS write/control operation observed",
@@ -5570,12 +5829,12 @@ class OTPcapAnalyzer:
                     # ---- GE-SRTP (TCP 18245) ----------------------------
                     # GE Service Request Transport Protocol used by GE
                     # PACSystems (RX3i, 90-30) PLCs.  Cleartext, no auth.
-                    if dport == 18245 or sport == 18245:
+                    if _l7 and (dport == 18245 or sport == 18245):
                         gertp["rows_seen"] = True
                         gertp["pcap_names"].add(pn)
                         if len(gertp["samples"]) < 5:
                             gertp["samples"].append(ev)
-                        if any(t in il for t in ("write", "force", "program", "start", "stop")):
+                        if to_server and any(t in il for t in ("write", "force", "program", "start", "stop")):
                             self.add_finding(
                                 SEVERITY_HIGH, "GE SRTP",
                                 "GE SRTP write/control operation observed",
@@ -5585,34 +5844,15 @@ class OTPcapAnalyzer:
                                 f"gertp::write::{src}::{dst}", tags=["write", "ge_srtp"],
                             )
 
-                    # ---- SCHNEIDER UMAS (TCP 1024) ----------------------
-                    # Unified Messaging Application Services — Schneider
-                    # Electric proprietary layer over TCP/1024 for Modicon
-                    # M340/Premium PLCs.  Cleartext, no auth.
-                    if dport == 1024 or sport == 1024:
-                        umas["rows_seen"] = True
-                        umas["pcap_names"].add(pn)
-                        if len(umas["samples"]) < 5:
-                            umas["samples"].append(ev)
-                        if any(t in il for t in ("write", "stop", "run", "download", "upload", "reserve")):
-                            self.add_finding(
-                                SEVERITY_HIGH, "Schneider UMAS",
-                                "Schneider UMAS write/control operation observed",
-                                f"Schneider UMAS traffic consistent with a write or control command was observed "
-                                f"from {src} to {dst}. UMAS has no native authentication or encryption.",
-                                [ev], [src], [dst], "Schneider UMAS", [pn],
-                                f"umas::write::{src}::{dst}", tags=["write", "umas", "schneider"],
-                            )
-
                     # ---- MITSUBISHI MELSEC (TCP 5007) -------------------
                     # MELSEC SLMP 3E frame format — used by Mitsubishi Q-
                     # series and iQ-R PLCs.  Cleartext, no authentication.
-                    if dport == 5007 or sport == 5007:
+                    if _l7 and (dport == 5007 or sport == 5007):
                         melsec["rows_seen"] = True
                         melsec["pcap_names"].add(pn)
                         if len(melsec["samples"]) < 5:
                             melsec["samples"].append(ev)
-                        if any(t in il for t in ("write", "remote run", "remote stop", "remote reset", "unlock")):
+                        if to_server and any(t in il for t in ("write", "remote run", "remote stop", "remote reset", "unlock")):
                             self.add_finding(
                                 SEVERITY_HIGH, "Mitsubishi MELSEC",
                                 "Mitsubishi MELSEC write/control operation observed",
@@ -5622,33 +5862,27 @@ class OTPcapAnalyzer:
                                 f"melsec::write::{src}::{dst}", tags=["write", "melsec", "mitsubishi"],
                             )
 
-                    # ---- OSISOFT PI SERVER (TCP 9001) -------------------
-                    # OSIsoft PI Data Archive historian default port.
-                    # Older PI versions use unauthenticated cleartext sessions.
-                    # Attacker access = read/corrupt process historian data.
-                    if dport == 9001 or sport == 9001:
+                    # ---- OSISOFT / AVEVA PI (TCP 5450 Data Archive, 5457 AF) ----
+                    # Historian access = read or corrupt the process record.
+                    if _l7 and (service_port in (5450, 5457)):
                         pi_srv["rows_seen"] = True
                         pi_srv["pcap_names"].add(pn)
                         if len(pi_srv["samples"]) < 5:
                             pi_srv["samples"].append(ev)
 
-                    # ---- IGNITION GATEWAY (TCP 4592) --------------------
-                    # Inductive Automation Ignition OPC-UA server port
-                    # (used in some versions/configurations).  Presence of
-                    # unencrypted traffic on this port is a misconfiguration.
-                    if dport == 4592 or sport == 4592:
+                    # ---- IGNITION GATEWAY (TCP 62541 OPC UA, 8060 gateway network) ----
+                    if _l7 and (service_port in (62541, 8060)):
                         ignition["rows_seen"] = True
                         ignition["pcap_names"].add(pn)
                         if len(ignition["samples"]) < 5:
                             ignition["samples"].append(ev)
-                        if "tls" not in fp:
+                        if service_port == 8060 and "data" in fp.split(":") and "tls" not in fp.split(":"):
                             self.add_finding(
-                                SEVERITY_HIGH, "Ignition Gateway",
-                                "Ignition Gateway OPC-UA without TLS observed",
-                                f"Traffic on TCP/4592 (Ignition OPC-UA) was observed without TLS from {src} to {dst}. "
-                                "Unencrypted Ignition connections expose tag reads, writes, and control actions.",
-                                [ev], [src], [dst], "Ignition Gateway", [pn],
-                                f"ignition::cleartext::{src}::{dst}", tags=["cleartext", "ignition"],
+                                SEVERITY_HIGH, "Ignition Gateway", "Ignition gateway network traffic without TLS",
+                                f"Gateway-network traffic between {client} and {server}:8060 carried data without TLS. "
+                                "The Ignition gateway network uses TLS by default, so this indicates a weakened configuration.",
+                                [ev], [client], [server], "Ignition Gateway", [pn],
+                                f"ignition::cleartext::{server}", tags=["cleartext", "ignition"],
                             )
 
                     # ---- NODE-RED (TCP 1880) ----------------------------
@@ -5656,23 +5890,28 @@ class OTPcapAnalyzer:
                     # Exposure of the Node-RED dashboard/API without auth
                     # allows any attacker on the network to deploy arbitrary
                     # flows — including flows that control OT devices.
-                    if dport == 1880 or sport == 1880:
+                    if _l7 and (dport == 1880 or sport == 1880):
                         nodered["rows_seen"] = True
                         nodered["pcap_names"].add(pn)
                         if len(nodered["samples"]) < 5:
                             nodered["samples"].append(ev)
-                        # HTTP access to Node-RED without auth indicators
-                        if "http" in fp and "authorization" not in il and "401" not in il:
-                            self.add_finding(
-                                SEVERITY_HIGH, "Node-RED",
-                                "Node-RED dashboard exposed without authentication",
-                                f"HTTP traffic to the Node-RED interface on TCP/1880 was observed from {src} to {dst} "
-                                "without visible authentication headers. Unauthenticated access allows an attacker to "
-                                "view, modify, or deploy flows that may control OT devices.",
-                                [ev], [src], [dst], "Node-RED", [pn],
-                                f"nodered::noauth::{src}::{dst}", tags=["cleartext", "noauth", "nodered"],
-                            )
-                        if any(t in il for t in ("post /flows", "post /flow", "delete /flow", "deploy")):
+                        # adminAuth sends a Bearer token on editor/API requests and
+                        # answers 401 without one; neither ever appears = no auth.
+                        if "http" in fp.split(":") and server:
+                            pair_state = nodered["pairs"][(client, server)]
+                            pair_state["pcaps"].add(pn)
+                            request_line = re.match(r"(?:get|post|put|delete|patch|head) (\S+)", il)
+                            if (to_server and request_line and re.search(
+                                    r"/(?:flows?|nodes|settings|library|context|diagnostics|plugins)(?:[/?]|$)",
+                                    request_line.group(1))):
+                                pair_state["requests"] += 1
+                                if row.get("http.authorization"):
+                                    pair_state["authorized"] += 1
+                                if not pair_state["sample"]:
+                                    pair_state["sample"] = ev
+                            elif not to_server and (row.get("http.response.code") or "") == "401":
+                                pair_state["denied"] += 1
+                        if to_server and any(t in il for t in ("post /flows", "post /flow", "delete /flow", "deploy")):
                             self.add_finding(
                                 SEVERITY_CRITICAL, "Node-RED",
                                 "Node-RED flow deployment observed",
@@ -5684,30 +5923,25 @@ class OTPcapAnalyzer:
                             )
 
                     # ---- PHYSICAL SECURITY --------------------------------
-                    is_phys = "rtsp" in fp or dport in (554, 8554, 3702, 8080) or sport in (554, 8554, 3702)
+                    is_phys = _l7 and ("rtsp" in fp_layers or service_port in (554, 8554))
                     if is_phys:
                         phys["rows_seen"] = True
                         phys["pcap_names"].add(pn)
-                        if ("describe" in il and "www-authenticate" not in il) or ("rtsp" in il and "401" not in il and "unauthorized" not in il):
-                            self.add_finding(
-                                SEVERITY_HIGH, "Physical Security", "RTSP stream without authentication challenge",
-                                "RTSP activity was observed without a visible authentication challenge.",
-                                [ev], [src], [dst], "RTSP", [pn],
-                                f"rtsp::no-auth::{src}::{dst}",
-                            )
-                        if dport == 8080 and "rtsp" in il:
+                        if "rtsp" in fp.split(":") and server:
+                            rtsp_state = phys["rtsp_pairs"][(client, server)]
+                            rtsp_state["pcaps"].add(pn)
+                            if (row.get("rtsp.status") or "") == "401":
+                                rtsp_state["challenged"] = True
+                            if to_server and (row.get("rtsp.method") or "").upper() in ("DESCRIBE", "SETUP", "PLAY"):
+                                rtsp_state["streamed"] = True
+                                if not rtsp_state["sample"]:
+                                    rtsp_state["sample"] = ev
+                        if service_port == 8080 and "rtsp" in il:
                             self.add_finding(
                                 SEVERITY_MEDIUM, "Physical Security", "RTSP tunneled over HTTP",
                                 "RTSP content was observed over TCP/8080.",
-                                [ev], [src], [dst], "RTSP/HTTP", [pn],
-                                f"rtsp::http-tunnel::{src}::{dst}",
-                            )
-                        if "ws-discovery" in il or dport == 3702:
-                            self.add_finding(
-                                SEVERITY_MEDIUM, "Physical Security", "ONVIF discovery observed",
-                                "ONVIF WS-Discovery traffic was observed.",
-                                [ev], [src], [dst], "ONVIF", [pn],
-                                f"onvif::discovery::{src}::{dst}",
+                                [ev], [client], [server], "RTSP/HTTP", [pn],
+                                f"rtsp::http-tunnel::{client}::{server}",
                             )
                         if "osdp" in il and "secure channel" not in il:
                             self.add_finding(
@@ -5787,7 +6021,7 @@ class OTPcapAnalyzer:
                         if not pr["sample"]:
                             pr["sample"] = ev
                     # GigE Vision machine-vision cameras (GVCP control channel)
-                    if ("gvcp" in fp.split(":") or dport == 3956 or sport == 3956) and src and dst:
+                    if _l7 and ("gvcp" in fp_layers or dport == 3956 or sport == 3956) and src and dst:
                         av["pcap_names"].add(pn)
                         pr = av["gige_pairs"][(src, dst)]
                         pr["pkts"] += 1
@@ -5850,14 +6084,21 @@ class OTPcapAnalyzer:
                     # Track timestamps per (src, dst, dport).  Bound samples to
                     # the first 500 per pair so memory stays bounded on chatty
                     # polling traffic; that's enough to compute jitter stats.
-                    if src and dst and dport:
-                        bpair = (src, dst, dport)
+                    if (to_server and client and server and service_port
+                            and service_port not in KNOWN_OT_PORTS and service_port not in _BEACON_EXEMPT_PORTS
+                            and not _is_mcast_dst and not server.endswith(".255")
+                            and (_transport != "TCP" or _tcp_flag_bits(row) & 0x0A)):
+                        bpair = (client, server, service_port)
                         samples = bcn["timestamps"][bpair]
                         if len(samples) < 500:
                             try:
-                                samples.append(float(row.get("frame.time_epoch") or "0"))
+                                ts_b = float(row.get("frame.time_epoch") or "0")
                             except ValueError:
-                                pass
+                                ts_b = 0.0
+                            # One sample per exchange: a connection's SYN and its
+                            # request, or a request and its continuation, are one event.
+                            if ts_b and (not samples or abs(ts_b - samples[-1]) >= 1.0):
+                                samples.append(ts_b)
                         bcn["pcap_names"].add(pn)
 
                     # ---- DNS anomalies -----------------------------------
@@ -5901,46 +6142,50 @@ class OTPcapAnalyzer:
                                 dns_state["nxdomain_per_src"][victim] += 1
 
                     # ---- SNMP depth --------------------------------------
-                    if dport == 161 or sport == 161 or "snmp" in fp:
+                    if _l7 and (dport == 161 or sport == 161 or "snmp" in fp):
                         snmp_state["pcap_names"].add(pn)
-                        if "get-next" in il or "getnextrequest" in il:
-                            if src:
-                                snmp_state["getnext_per_src"][src] += 1
-                        if "set-request" in il or "setrequest" in il:
-                            if len(snmp_state["set_events"]) < 50:
-                                snmp_state["set_events"].append((pn, src, dst, info[:160]))
-                        if "snmpv1" in il or "snmpv2c" in il or "community=" in il:
-                            if src:
+                        pdu = _int_field(row, "snmp.data")
+                        if pdu in (1, 5) and src:
+                            snmp_state["getnext_per_src"][src] += 1
+                        if pdu == 3 and len(snmp_state["set_events"]) < 50:
+                            snmp_state["set_events"].append((pn, src, dst, info[:160]))
+                        community = row.get("snmp.community") or ""
+                        if community and (row.get("snmp.version") or "") in ("0", "1"):
+                            snmp_state["communities"][community] += 1
+                            if src and pdu != 2:
                                 snmp_state["v1v2c_sources"].add(src)
-                            m_c = re.search(r"community=([A-Za-z0-9_\-]{1,64})", info)
-                            if m_c:
-                                snmp_state["communities"][m_c.group(1)] += 1
 
                     # ---- TLS inspection ----------------------------------
                     if "tls" in fp or "ssl" in fp:
                         tls_state["rows_seen"] = True
                         tls_state["pcap_names"].add(pn)
-                        info_lower = il
-                        # Version
-                        if "tlsv1.0" in info_lower or "sslv3" in info_lower or "sslv2" in info_lower:
-                            if len(tls_state["old_versions"]) < 50:
-                                version = "SSLv2" if "sslv2" in info_lower else ("SSLv3" if "sslv3" in info_lower else "TLS 1.0")
-                                tls_state["old_versions"].append((pn, src, dst, version))
-                        if "tlsv1.1" in info_lower:
-                            if len(tls_state["old_versions"]) < 50:
-                                tls_state["old_versions"].append((pn, src, dst, "TLS 1.1"))
-                        # Weak ciphers in Info
-                        weak_kw = ("rc4", "3des", "des-cbc", "_null_", "_anon_", "md5", "export")
-                        for kw in weak_kw:
-                            if kw in info_lower:
-                                if len(tls_state["weak_ciphers"]) < 50:
-                                    tls_state["weak_ciphers"].append((pn, src, dst, kw.upper().replace("_", "")))
-                                break
-                        # Self-signed / expired indicators
-                        if "self signed" in info_lower or "self-signed" in info_lower:
-                            tls_state["self_signed"].append((pn, src, dst, info[:120]))
-                        if "certificate expired" in info_lower or "expired certificate" in info_lower:
-                            tls_state["expired_certs"].append((pn, src, dst, info[:120]))
+                        handshake_types = {t.strip() for t in (row.get("tls.handshake.type") or "").split(",")}
+                        if "2" in handshake_types:
+                            # ServerHello: the version and cipher the server actually chose.
+                            version = _int_field(row, "tls.handshake.extensions.supported_version")
+                            if version < 0:
+                                version = _int_field(row, "tls.handshake.version")
+                            if version in (0x0002, 0x0300, 0x0301, 0x0302) and len(tls_state["old_versions"]) < 50:
+                                version_name = _TLS_VERSION_NAMES[version]
+                                if not any(e[2] == server and e[3] == version_name for e in tls_state["old_versions"]):
+                                    tls_state["old_versions"].append((pn, client, server, version_name))
+                            suite = _int_field(row, "tls.handshake.ciphersuite")
+                            if suite >= 0:
+                                suite_name = tls_cipher_name(suite)
+                                weak = weak_cipher_label(suite_name)
+                                cipher_label = f"{weak}: {suite_name}"
+                                if (weak and len(tls_state["weak_ciphers"]) < 50
+                                        and not any(e[2] == server and e[3] == cipher_label for e in tls_state["weak_ciphers"])):
+                                    tls_state["weak_ciphers"].append((pn, client, server, cipher_label))
+                        if ((row.get("_ws.col.Protocol") or "").upper() == "SSLV2" and len(tls_state["old_versions"]) < 50
+                                and not any(e[2] == server and e[3] == "SSLv2" for e in tls_state["old_versions"])):
+                            tls_state["old_versions"].append((pn, client, server, "SSLv2"))
+                        alert = _int_field(row, "tls.alert_message.desc")
+                        if alert in (42, 45, 48):
+                            alert_list = tls_state["expired_certs"] if alert == 45 else tls_state["rejected_certs"]
+                            if len(alert_list) < 50 and not any(e[1] == client and e[2] == server for e in alert_list):
+                                alert_name = {42: "bad certificate", 45: "certificate expired", 48: "unknown CA"}[alert]
+                                alert_list.append((pn, client, server, f"{alert_name} | {info[:120]}"))
                         # JA3 fingerprint — flag known offensive tooling
                         ja3 = (row.get("tls.handshake.ja3") or "").strip().lower()
                         if ja3 and ja3 in _JA3_KNOWN_BAD:
@@ -5958,7 +6203,9 @@ class OTPcapAnalyzer:
                         noise_proto = "NetBIOS-NS/DGM"
                     elif dport == 1900 or sport == 1900:
                         noise_proto = "SSDP"
-                    if noise_proto and src:
+                    elif dport == 3702 or sport == 3702:
+                        noise_proto = "WS-Discovery"
+                    if noise_proto and src and _l7:
                         subnet = subnet_from_ip(src)
                         slot = noise_state["by_proto_subnet"][(noise_proto, subnet)]
                         slot["hosts"].add(src)
@@ -6007,7 +6254,7 @@ class OTPcapAnalyzer:
                             ntp_state["pcap_names"].add(pn)
                     except ValueError:
                         pass
-                    if dport == 123 or sport == 123 or "ntp" in fp:
+                    if _l7 and (dport == 123 or sport == 123 or "ntp" in fp):
                         if src:
                             ntp_state["ntp_queries"][src] += 1
                             if dst:
@@ -6015,10 +6262,13 @@ class OTPcapAnalyzer:
 
                     # ---- NETWORK HYGIENE (RST / SYN anomalies) -----------
                     pair = (src, dst)
-                    if "rst" in il:
+                    tcp_bits = _tcp_flag_bits(row)
+                    if tcp_bits & 0x04:
                         hyg["rst_counts"][pair] += 1
-                    if "syn" in il and "ack" not in il:
+                    if tcp_bits & 0x12 == 0x02:
                         hyg["syn_counts"][pair] += 1
+                    elif tcp_bits & 0x12 == 0x12:
+                        hyg["synack_counts"][pair] += 1
                     hyg["pcap_names"].add(pn)
 
                     # ---- ARP SPOOFING / MAC-IP BINDING -------------------
@@ -6096,120 +6346,100 @@ class OTPcapAnalyzer:
             for (src, dst), count in mb["write_sources"].items():
                 if src not in mb["read_masters"]:
                     self.add_finding(SEVERITY_CRITICAL, "Modbus TCP", "Unexpected Modbus write source",
-                        f"{src} issued Modbus write traffic toward {dst} without also appearing as a normal polling master.",
-                        [f"Write count: {count}"], [src], [dst], "Modbus TCP", sorted(mb["pcap_names"]),
+                        f"{src} issued Modbus write requests to {dst} without also appearing as a normal polling master.",
+                        [f"Write requests: {count}"], [src], [dst], "Modbus TCP", sorted(mb["pcap_names"]),
                         f"modbus::unexpected-writer::{src}::{dst}", tags=["write", "unexpected_writer"])
-            for (src, dst), values in mb["address_ranges"].items():
-                if len(values) >= 20 and max(values) - min(values) > 100:
-                    self.add_finding(SEVERITY_HIGH, "Modbus TCP", "Possible Modbus register scanning",
-                        f"{src} queried a wide sequential range of Modbus register values on {dst}.",
-                        [f"Address span observed: {min(values)}-{max(values)} over {len(values)} values"],
-                        [src], [dst], "Modbus TCP", sorted(mb["pcap_names"]),
-                        f"modbus::scan::{src}::{dst}", tags=["recon", "modbus"])
+            # Register scanning: many start addresses, each read once or twice.
+            # An HMI re-reads the same short scan list every cycle.
+            for (src, dst), starts in mb["read_starts"].items():
+                if len(starts) < 50:
+                    continue
+                reads_per_start = median(starts.values())
+                if reads_per_start > 2:
+                    continue
+                addresses = sorted(starts)
+                self.add_finding(SEVERITY_HIGH, "Modbus TCP", "Possible Modbus register scanning",
+                    f"{src} read {len(starts)} different start addresses on {dst}, most of them only once or twice — "
+                    "a sweep of the register map rather than an HMI's repeated polling of a fixed scan list.",
+                    [f"Distinct start addresses: {len(starts)} (span {addresses[0]}-{addresses[-1]})",
+                     f"Median reads per address: {reads_per_start:g}"],
+                    [src], [dst], "Modbus TCP", sorted(mb["pcap_names"]),
+                    f"modbus::scan::{src}::{dst}", tags=["recon", "modbus"])
             for dst, count in mb["exception_counts"].items():
                 if count >= 5:
                     self.add_finding(SEVERITY_HIGH, "Modbus TCP", "Elevated Modbus exceptions",
                         f"{dst} returned {count} Modbus exception responses.",
                         [f"Exception responses: {count}"], [], [dst], "Modbus TCP", sorted(mb["pcap_names"]),
                         f"modbus::exceptions::{dst}")
-            for pair, points in mb["timestamps"].items():
-                if len(points) >= 8:
-                    diffs = [b - a for a, b in zip(points, points[1:]) if b > a]
-                    if diffs:
-                        base = median(diffs)
-                        compressed = [d for d in diffs if d < (base / max(self.config.get("polling_anomaly_multiplier", DEFAULT_POLLING_ANOMALY_MULTIPLIER), 1.1))]
-                        if base > 0 and len(compressed) >= 5:
-                            self.add_finding(SEVERITY_HIGH, "Modbus TCP", "Modbus polling burst anomaly",
-                                f"Packet timing between {pair[0]} and {pair[1]} deviated sharply from the baseline polling interval.",
-                                [f"Median interval: {base:.3f}s | anomalous intervals: {len(compressed)}"],
-                                [pair[0]], [pair[1]], "Modbus TCP", sorted(mb["pcap_names"]),
-                                f"modbus::timing::{pair[0]}::{pair[1]}", tags=["timing_anomaly", "modbus"])
-            # ---- Repetitive single-register polling (B) ---------------
-            # Distinguishes hammer-style polling from wide-range scanning.
-            # Threshold ≥ 1000 reads of one register from one source
-            # to one destination — well below normal HMI polling rates
-            # for fast scan groups (typically 10-200/s) but high enough
-            # that brief bursts in a short capture won't trigger.
-            for (src, dst), reg_counts in mb["register_read_counts"].items():
-                if not reg_counts:
+            # Polling bursts: one-second request counts far above the pair's own baseline.
+            multiplier = max(self.config.get("polling_anomaly_multiplier", DEFAULT_POLLING_ANOMALY_MULTIPLIER), 1.1)
+            for (src, dst), points in mb["timestamps"].items():
+                if len(points) < 30:
                     continue
-                top_reg, top_count = reg_counts.most_common(1)[0]
-                if top_count >= 1000:
-                    distinct = len(reg_counts)
-                    severity = SEVERITY_MEDIUM
-                    why_extra = ""
-                    # Pure single-register hammering = anomaly (DoS or
-                    # injection); a few hot registers among many is
-                    # normal HMI behavior.
-                    if distinct <= 3:
-                        severity = SEVERITY_HIGH
-                        why_extra = (
-                            " The polling targets only one or two registers, which is unusual "
-                            "for normal HMI scan groups and consistent with a hammer-style "
-                            "test, denial-of-service probe, or injected loop."
-                        )
-                    self.add_finding(
-                        severity, "Modbus TCP",
-                        "Repetitive single-register polling pattern",
-                        f"{src} polled register {top_reg} on {dst} {top_count:,} times "
-                        f"across {distinct} distinct register(s) overall." + why_extra,
-                        [
-                            f"Top register: {top_reg} ({top_count:,} reads)",
-                            f"Distinct registers polled: {distinct}",
-                            "Top 5 registers: " + ", ".join(
-                                f"{r}({c})" for r, c in reg_counts.most_common(5)),
-                        ],
+                per_second = Counter(int(point) for point in points)
+                if len(per_second) < 10:
+                    continue
+                baseline = median(per_second.values())
+                bursts = sorted(second for second, count in per_second.items()
+                                if count >= baseline * multiplier and count >= baseline + 20)
+                if bursts:
+                    self.add_finding(SEVERITY_MEDIUM, "Modbus TCP", "Modbus polling burst anomaly",
+                        f"The request rate from {src} to {dst} spiked to {max(per_second.values())} requests per second "
+                        f"against a baseline of {baseline:g}. HMIs do this briefly when they reconnect; sustained or "
+                        "repeated bursts suggest a second client, a flood, or a script.",
+                        [f"Baseline: {baseline:g} requests/s (median of active seconds) | peak: {max(per_second.values())} requests/s",
+                         f"Burst seconds: {len(bursts)} | first burst at {bursts[0]} (epoch)"],
                         [src], [dst], "Modbus TCP", sorted(mb["pcap_names"]),
-                        f"modbus::repetitive-poll::{src}::{dst}",
-                        tags=["modbus", "polling_pattern"],
-                    )
-
-            # ---- Identical-response replay timing (A) -----------------
-            # For each (src, dst, response-fingerprint) bucket: if the
-            # SAME response content reappears with timing gaps that don't
-            # match the polling cadence, that's a replay-attack signal.
-            # We compute the median inter-arrival of the global flow
-            # (mb["timestamps"][(src,dst)]) and compare to the per-
-            # fingerprint inter-arrivals.  Identical responses at gaps
-            # >> baseline = anomaly.
-            for (src_r, dst_r, sig), times in mb["response_fp_times"].items():
-                if len(times) < 4:
+                        f"modbus::timing::{src}::{dst}", tags=["timing_anomaly", "modbus"])
+            # Hammering: one start address read at a high sustained rate.
+            for (src, dst), starts in mb["read_starts"].items():
+                if not starts:
                     continue
-                times_sorted = sorted(times)
-                fp_diffs = [b - a for a, b in zip(times_sorted, times_sorted[1:]) if b > a]
-                if not fp_diffs:
+                top_reg, top_count = starts.most_common(1)[0]
+                if top_count < 1000:
                     continue
-                base_pair_times = mb["timestamps"].get((dst_r, src_r)) or mb["timestamps"].get((src_r, dst_r))
-                if not base_pair_times or len(base_pair_times) < 4:
+                first_read, last_read = mb["read_span"].get(((src, dst), top_reg), (0.0, 0.0))
+                rate = top_count / (last_read - first_read) if last_read > first_read else float(top_count)
+                if rate < 20:
                     continue
-                base_diffs = [b - a for a, b in zip(sorted(base_pair_times), sorted(base_pair_times)[1:]) if b > a]
-                if not base_diffs:
+                distinct = len(starts)
+                severity = SEVERITY_HIGH if distinct <= 3 else SEVERITY_MEDIUM
+                self.add_finding(
+                    severity, "Modbus TCP",
+                    "Repetitive single-register polling pattern",
+                    f"{src} read address {top_reg} on {dst} {top_count:,} times at about {rate:.0f} requests per second "
+                    f"({distinct} distinct start address(es) overall). HMI scan groups rarely exceed a few reads per "
+                    "second per block; a sustained high rate on one address suggests a hammer-style test, a "
+                    "denial-of-service probe, or a misconfigured client.",
+                    [f"Top address: {top_reg} ({top_count:,} reads, ~{rate:.0f}/s)",
+                     f"Distinct start addresses: {distinct}",
+                     "Top 5 addresses: " + ", ".join(f"{r}({c})" for r, c in starts.most_common(5))],
+                    [src], [dst], "Modbus TCP", sorted(mb["pcap_names"]),
+                    f"modbus::repetitive-poll::{src}::{dst}",
+                    tags=["modbus", "polling_pattern"],
+                )
+            # Replay / injection: a server answers each transaction exactly once.
+            for pair_mb in sorted(set(mb["duplicate_responses"]) | set(mb["unsolicited_responses"])):
+                duplicates = mb["duplicate_responses"][pair_mb]
+                unsolicited = mb["unsolicited_responses"][pair_mb]
+                responses = max(mb["responses"][pair_mb], 1)
+                if duplicates < 3 and not (unsolicited >= 3 and unsolicited / responses >= 0.02):
                     continue
-                base_median = median(base_diffs)
-                fp_median = median(fp_diffs)
-                # Replay signal: identical-content response repeats with
-                # inter-arrival ≥ 5× the surrounding flow's baseline.
-                if base_median > 0 and fp_median >= base_median * 5 and len(fp_diffs) >= 3:
-                    self.add_finding(
-                        SEVERITY_HIGH, "Modbus TCP",
-                        "Identical Modbus response with anomalous timing (possible replay)",
-                        f"An identical Modbus response from {src_r} to {dst_r} repeated "
-                        f"{len(times)} times at intervals far longer than the surrounding "
-                        f"polling cadence ({fp_median:.2f}s vs baseline {base_median:.3f}s). "
-                        "Identical content reappearing at off-baseline timing is the canonical "
-                        "signature of a replayed packet — an attacker injecting a previously "
-                        "captured response to mask the true register state.",
-                        [
-                            f"Response signature: {sig}",
-                            f"Repeat count: {len(times)}",
-                            f"Median repeat interval: {fp_median:.2f}s",
-                            f"Baseline flow interval: {base_median:.3f}s",
-                            f"Ratio: {fp_median / base_median:.1f}× baseline",
-                        ],
-                        [src_r], [dst_r], "Modbus TCP", sorted(mb["pcap_names"]),
-                        f"modbus::replay::{src_r}::{dst_r}::{hash(sig) & 0xFFFF}",
-                        tags=["modbus", "replay", "intrusion", "timing_anomaly"],
-                    )
+                client_mb, server_mb = pair_mb
+                self.add_finding(
+                    SEVERITY_HIGH, "Modbus TCP",
+                    "Duplicate or unsolicited Modbus responses (possible replay/injection)",
+                    f"Traffic from {server_mb} to {client_mb} contained {duplicates} second answer(s) to transactions "
+                    f"that were already answered and {unsolicited} answer(s) to no outstanding request. A Modbus "
+                    "server answers each request exactly once, so extra answers mean another party is injecting or "
+                    "replaying responses — or a gateway is duplicating frames. Unsolicited answers alone can also "
+                    "come from packets the capture dropped.",
+                    list(mb["response_samples"][pair_mb])
+                    + [f"Duplicate answers: {duplicates} | unsolicited answers: {unsolicited} | responses: {responses}"],
+                    [server_mb], [client_mb], "Modbus TCP", sorted(mb["pcap_names"]),
+                    f"modbus::extra-responses::{client_mb}::{server_mb}",
+                    tags=["modbus", "replay", "intrusion"],
+                )
 
             server_writers: Dict[str, set[str]] = defaultdict(set)
             for src, dst in mb["write_sources"]:
@@ -6394,14 +6624,25 @@ class OTPcapAnalyzer:
                     "MQTT was declared as expected, but no MQTT traffic was observed on ports 1883 or 8883.",
                     ["No MQTT packets matched."], [], [], "MQTT", pcap_name_list, "absence::mqtt")
         else:
-            for src, points in mq["reconnect_tracker"].items():
-                if len(points) >= 3:
-                    intervals = [b - a for a, b in zip(points, points[1:])]
-                    if any(i < 5 for i in intervals):
-                        self.add_finding(SEVERITY_MEDIUM, "MQTT", "Rapid MQTT reconnect behavior observed",
-                            f"{src} disconnected and reconnected rapidly on MQTT.",
-                            [f"Reconnect intervals: {intervals[:10]}"], [src], [], "MQTT",
-                            sorted(mq["pcap_names"]), f"mqtt::reconnect::{src}", tags=["mqtt"])
+            for broker_ip, broker in sorted(mq["brokers"].items()):
+                clients_mq = sorted(broker["clients"])
+                self.add_finding(SEVERITY_HIGH, "MQTT", "Cleartext MQTT observed",
+                    f"{len(clients_mq)} client(s) exchanged MQTT with broker {broker_ip} on TCP/1883 without TLS. "
+                    "Topics, payloads, and any credentials are readable and modifiable by anyone on the path.",
+                    list(broker["samples"]) + [f"Clients ({len(clients_mq)}): {', '.join(clients_mq[:20])}"],
+                    clients_mq[:20], [broker_ip], "MQTT", sorted(broker["pcaps"]),
+                    f"mqtt::cleartext::{broker_ip}", tags=["cleartext", "mqtt"])
+            for (src, client_id), points in mq["reconnect_tracker"].items():
+                points = sorted(points)
+                intervals = [round(b - a, 2) for a, b in zip(points, points[1:])]
+                if sum(1 for i in intervals if i < 5) >= 2:
+                    label = f"{src} (client ID '{client_id}')" if client_id else src
+                    self.add_finding(SEVERITY_MEDIUM, "MQTT", "Rapid MQTT reconnect behavior observed",
+                        f"{label} connected to the broker {len(points)} times, several within five seconds of each other. "
+                        "Repeated CONNECTs under one client ID mean the session keeps dropping — or that two clients "
+                        "share the ID and keep evicting each other, which is also how a client ID is hijacked.",
+                        [f"CONNECT intervals (s): {intervals[:10]}"], [src], [], "MQTT",
+                        sorted(mq["pcap_names"]), f"mqtt::reconnect::{src}::{client_id}", tags=["mqtt"])
         print(colorize(f"[✓] MQTT complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
 
         # OPC-UA
@@ -6412,13 +6653,29 @@ class OTPcapAnalyzer:
                     "OPC-UA was declared as expected, but no TCP/4840 traffic was observed.",
                     ["No OPC-UA packets matched."], [], [], "OPC-UA", pcap_name_list, "absence::opcua")
         else:
+            for (client_ou, server_ou), channel in sorted(opc_sessions.items()):
+                if channel["policy_none"] or channel["mode"] == "None":
+                    self.add_finding(SEVERITY_HIGH, "OPC-UA", "OPC-UA SecureChannel with SecurityPolicy None",
+                        f"{client_ou} opened an OPC UA SecureChannel to {server_ou} with SecurityPolicy None — messages "
+                        "are neither signed nor encrypted, so reads, writes, and method calls can be read and altered in "
+                        "transit. Disable the None policy on the server endpoint (IEC 62541-2).",
+                        [channel["sample"] or "See pcap evidence"], [client_ou], [server_ou], "OPC-UA",
+                        sorted(channel["pcaps"]), f"opcua::policy-none::{server_ou}", tags=["cleartext", "opcua"])
+                elif channel["mode"] == "Sign":
+                    self.add_finding(SEVERITY_MEDIUM, "OPC-UA", "OPC-UA SecureChannel signed but not encrypted",
+                        f"The OPC UA SecureChannel from {client_ou} to {server_ou} uses MessageSecurityMode Sign: messages "
+                        "are protected against modification but readable by anyone on the path. Use SignAndEncrypt "
+                        "where process data or credentials are sensitive.",
+                        [channel["sample"] or "See pcap evidence"], [client_ou], [server_ou], "OPC-UA",
+                        sorted(channel["pcaps"]), f"opcua::sign-only::{server_ou}", tags=["opcua"])
             for src, count in opc["browse_counts"].items():
-                if count >= 25 or opc["read_counts"][src] >= 50:
-                    self.add_finding(SEVERITY_HIGH, "OPC-UA", "Possible OPC-UA reconnaissance activity",
-                        f"{src} generated a high volume of Browse/Read calls.",
-                        [f"Browse calls: {count} | Read calls: {opc['read_counts'][src]}"],
+                if count >= 50:
+                    self.add_finding(SEVERITY_MEDIUM, "OPC-UA", "Possible OPC-UA reconnaissance activity",
+                        f"{src} issued {count} Browse requests — an enumeration of the server's address space. "
+                        "SCADA clients browse at startup; from any other host this maps every tag the server exposes.",
+                        [f"Browse requests: {count} | Read requests: {opc['read_counts'][src]}"],
                         [src], [], "OPC-UA", sorted(opc["pcap_names"]),
-                        f"opcua::recon::{src}", tags=["recon", "opcua"])
+                        f"opcua::recon::{src}", tags=["discovery", "opcua"])
         print(colorize(f"[✓] OPC-UA complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
 
         # EtherNet/IP
@@ -6444,8 +6701,23 @@ class OTPcapAnalyzer:
         if not phys["rows_seen"]:
             if any(t in env_type for t in ("physical", "camera")) or self._expected_protocol(["physical", "rtsp", "osdp", "onvif", "camera"]):
                 self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected physical security traffic not observed",
-                    "Physical security protocols (RTSP/ONVIF/OSDP) were expected but no matching traffic was observed.",
+                    "Physical security protocols (RTSP/OSDP) were expected but no matching traffic was observed.",
                     ["No physical security protocol packets matched."], [], [], "Physical Security", pcap_name_list, "absence::physical-security")
+        else:
+            open_streams = {pair: st for pair, st in phys["rtsp_pairs"].items() if st["streamed"] and not st["challenged"]}
+            for camera in sorted({server_c for _, server_c in open_streams}):
+                camera_streams = {pair: st for pair, st in open_streams.items() if pair[1] == camera}
+                viewers = sorted({client_c for client_c, _ in camera_streams})
+                camera_pcaps: set = set()
+                for st in camera_streams.values():
+                    camera_pcaps.update(st["pcaps"])
+                self.add_finding(SEVERITY_MEDIUM, "Physical Security", "RTSP stream without authentication challenge",
+                    f"{camera} served RTSP stream requests (DESCRIBE/SETUP/PLAY) from {', '.join(viewers[:10])} without "
+                    "ever answering 401 Unauthorized. Either the camera streams without authentication or the client "
+                    "sent credentials up front; confirm on the camera that anonymous RTSP access is disabled.",
+                    [st["sample"] for st in camera_streams.values() if st["sample"]][:10],
+                    viewers[:20], [camera], "RTSP", sorted(camera_pcaps),
+                    f"rtsp::noauth::{camera}", tags=["noauth", "camera"])
         print(colorize(f"[✓] Physical Security Protocols complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
 
         # Omron FINS
@@ -6486,23 +6758,27 @@ class OTPcapAnalyzer:
                 ["No TCP 18245 packets matched."], [], [], "GE SRTP", pcap_name_list, "absence::srtp")
         print(colorize(f"[✓] GE SRTP complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
 
-        # Schneider UMAS
+        # Schneider UMAS (Modbus function code 90)
         before = len(self.session.findings)
         if umas["rows_seen"]:
+            umas_pairs = sorted(umas["pairs"])
             self.add_finding(
                 SEVERITY_HIGH, "Schneider UMAS",
-                "Schneider UMAS traffic observed (unauthenticated, cleartext)",
-                "Schneider UMAS (TCP 1024) was observed in the capture. Unified Messaging Application Services "
-                "is the Schneider Electric application layer for Modicon M340/Premium PLCs. It has no native "
-                "authentication or encryption; any host can issue read/write/stop commands.",
-                umas["samples"] or ["See pcap evidence"],
-                [], [], "Schneider UMAS", sorted(umas["pcap_names"]),
-                "umas::cleartext", tags=["cleartext", "umas", "schneider"],
+                "Schneider UMAS engineering traffic observed (Modbus function code 90)",
+                "Modbus function code 90 carries UMAS, Schneider Electric's engineering protocol for Modicon "
+                "M340/M580/Premium/Quantum PLCs: program upload and download, start/stop, and memory access. Unless "
+                "the PLC enforces an application password, any host that reaches TCP/502 can issue these commands; "
+                "confirm the client is the authorized engineering workstation.",
+                list(umas["samples"]) + ["Client -> PLC: " + ", ".join(f"{c} -> {s}" for c, s in umas_pairs[:10])],
+                sorted({c for c, _ in umas_pairs})[:20], sorted({s for _, s in umas_pairs})[:20],
+                "Schneider UMAS", sorted(umas["pcap_names"]),
+                "umas::engineering", tags=["schneider", "umas", "engineering"],
             )
-        elif self._expected_protocol(["umas", "schneider", "modicon"]):
+        elif self._expected_protocol(["umas"]):
             self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected Schneider UMAS traffic not observed",
-                "Schneider UMAS (TCP 1024) was declared as expected, but no traffic was observed on that port.",
-                ["No TCP 1024 packets matched."], [], [], "Schneider UMAS", pcap_name_list, "absence::umas")
+                "Schneider UMAS was declared as expected, but no Modbus function code 90 traffic was observed. UMAS "
+                "only appears while an engineering session is open, so absence is normal outside maintenance work.",
+                ["No Modbus function code 90 packets matched."], [], [], "Schneider UMAS", pcap_name_list, "absence::umas")
         print(colorize(f"[✓] Schneider UMAS complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
 
         # Mitsubishi MELSEC
@@ -6528,53 +6804,72 @@ class OTPcapAnalyzer:
         before = len(self.session.findings)
         if pi_srv["rows_seen"]:
             self.add_finding(
-                SEVERITY_MEDIUM, "OSIsoft PI Server",
-                "OSIsoft PI Server historian traffic observed",
-                "Traffic on TCP 9001 (OSIsoft PI Data Archive) was observed. Older PI server versions use "
-                "unauthenticated cleartext sessions on this port. An attacker with network access can read "
-                "historian data, insert false process values, or corrupt the operational record.",
+                SEVERITY_LOW, "OSIsoft PI Server",
+                "AVEVA PI (OSIsoft) historian traffic observed",
+                "Traffic to a PI Data Archive (TCP 5450) or PI AF server (TCP 5457) was observed. The historian holds "
+                "the plant's process record and often bridges the control and business networks. Confirm which "
+                "clients may reach it, that PI trusts and explicit logins are disabled in favor of Windows "
+                "authentication, and that the historian sits in a DMZ rather than on the control network.",
                 pi_srv["samples"] or ["See pcap evidence"],
                 [], [], "OSIsoft PI", sorted(pi_srv["pcap_names"]),
                 "pi_srv::presence", tags=["pi_server", "historian"],
             )
         elif self._expected_protocol(["historian", "osisoft", "pi server"]):
             self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected OSIsoft PI historian traffic not observed",
-                "OSIsoft PI Server (TCP 9001) was declared as expected, but no traffic was observed on that port.",
-                ["No TCP 9001 packets matched."], [], [], "OSIsoft PI", pcap_name_list, "absence::pi_srv")
+                "A PI historian was declared as expected, but no traffic was observed on TCP 5450 or 5457.",
+                ["No TCP 5450/5457 packets matched."], [], [], "OSIsoft PI", pcap_name_list, "absence::pi_srv")
         print(colorize(f"[✓] OSIsoft PI Server complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
 
         # Ignition Gateway
         before = len(self.session.findings)
         if ignition["rows_seen"]:
             self.add_finding(
-                SEVERITY_MEDIUM, "Ignition Gateway",
-                "Ignition Gateway traffic observed on TCP 4592",
-                "Traffic on TCP 4592 (Ignition Gateway OPC-UA) was observed in the capture. Verify that TLS "
-                "is enforced on this port; unencrypted Ignition sessions expose tag reads, writes, and the "
-                "full engineering project to any observer on the network.",
+                SEVERITY_LOW, "Ignition Gateway",
+                "Ignition gateway traffic observed",
+                "Traffic to an Inductive Automation Ignition gateway was observed on its OPC UA server port (TCP 62541) "
+                "or gateway-network port (TCP 8060). The gateway holds tag write access and the site's project; confirm "
+                "its OPC UA endpoint does not offer SecurityPolicy None, that gateway-network connections require "
+                "approval and TLS, and that only expected hosts connect.",
                 ignition["samples"] or ["See pcap evidence"],
                 [], [], "Ignition Gateway", sorted(ignition["pcap_names"]),
                 "ignition::presence", tags=["ignition"],
             )
         elif self._expected_protocol(["ignition"]):
             self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected Ignition Gateway traffic not observed",
-                "Ignition Gateway (TCP 4592) was declared as expected, but no traffic was observed on that port.",
-                ["No TCP 4592 packets matched."], [], [], "Ignition Gateway", pcap_name_list, "absence::ignition")
+                "Ignition was declared as expected, but no traffic was observed on TCP 62541 or 8060.",
+                ["No TCP 62541/8060 packets matched."], [], [], "Ignition Gateway", pcap_name_list, "absence::ignition")
         print(colorize(f"[✓] Ignition Gateway complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
 
         # Node-RED
         before = len(self.session.findings)
         if nodered["rows_seen"]:
             self.add_finding(
-                SEVERITY_HIGH, "Node-RED",
+                SEVERITY_MEDIUM, "Node-RED",
                 "Node-RED interface traffic observed on TCP 1880",
-                "Traffic on TCP 1880 (Node-RED default port) was observed. The Node-RED flow editor allows "
-                "arbitrary flow deployment, including flows that issue commands to OT devices. Exposure of "
-                "this interface on the OT network without authentication is a critical access-control gap.",
+                "Traffic on TCP 1880 (Node-RED default port) was observed without TLS. The Node-RED editor can deploy "
+                "flows that read from and write to connected OT devices, so its exposure and credentials matter.",
                 nodered["samples"] or ["See pcap evidence"],
                 [], [], "Node-RED", sorted(nodered["pcap_names"]),
                 "nodered::presence", tags=["cleartext", "nodered"],
             )
+            open_editors = {pair: st for pair, st in nodered["pairs"].items()
+                            if st["requests"] and not st["authorized"] and not st["denied"]}
+            for editor in sorted({server_n for _, server_n in open_editors}):
+                editor_pairs = {pair: st for pair, st in open_editors.items() if pair[1] == editor}
+                users = sorted({client_n for client_n, _ in editor_pairs})
+                editor_pcaps: set = set()
+                for st in editor_pairs.values():
+                    editor_pcaps.update(st["pcaps"])
+                self.add_finding(
+                    SEVERITY_HIGH, "Node-RED",
+                    "Node-RED editor exposed without authentication",
+                    f"Admin API requests to Node-RED on {editor} (flows, nodes, or settings) from {', '.join(users[:10])} "
+                    "carried no Authorization header and were never answered with 401. The editor appears to run without "
+                    "adminAuth, so anyone who reaches TCP/1880 can deploy flows that command connected OT devices.",
+                    [st["sample"] for st in editor_pairs.values() if st["sample"]][:10],
+                    users[:20], [editor], "Node-RED", sorted(editor_pcaps),
+                    f"nodered::noauth::{editor}", tags=["noauth", "nodered"],
+                )
         elif self._expected_protocol(["nodered", "node-red"]):
             self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected Node-RED traffic not observed",
                 "Node-RED (TCP 1880) was declared as expected, but no traffic was observed on that port.",
@@ -6903,7 +7198,7 @@ class OTPcapAnalyzer:
             if len(intervals) < 10:
                 continue
             mean_iv = sum(intervals) / len(intervals)
-            if mean_iv <= 0.5 or mean_iv > 86400:  # <0.5s = chatty polling; >1d = noise
+            if mean_iv < 5 or mean_iv > 86400:  # <5s = UI refresh / polling; >1d = noise
                 continue
             # Standard deviation
             variance = sum((x - mean_iv) ** 2 for x in intervals) / len(intervals)
@@ -6911,16 +7206,18 @@ class OTPcapAnalyzer:
             jitter_ratio = stdev / mean_iv if mean_iv else 1.0
             if jitter_ratio > 0.15:
                 continue
-            # We have a beacon. Raise severity if the destination is public.
+            # We have a beacon. Internal periodic traffic is usually an agent or
+            # health check; a public destination is the C2 case.
             dst_public = is_public_ip(bdst)
-            severity = SEVERITY_CRITICAL if dst_public else SEVERITY_HIGH
+            severity = SEVERITY_HIGH if dst_public else SEVERITY_MEDIUM
             self.add_finding(
                 severity, "Intrusion Indicators",
                 "Beaconing pattern observed",
                 f"{bsrc} contacted {bdst}:{bport} with low-jitter periodicity "
                 f"(mean interval {mean_iv:.2f}s, stdev {stdev:.2f}s, ratio {jitter_ratio:.3f}). "
-                "Tight, regular beacons to the same destination are a hallmark of command-and-control "
-                "callbacks. OT devices should rarely — if ever — exhibit this pattern to any destination.",
+                "Tight, regular callbacks to one destination are a hallmark of command-and-control beacons; "
+                "monitoring agents, license checks, and health probes look the same, so identify the process "
+                f"on {bsrc} that generates them.",
                 [
                     f"Samples: {len(intervals) + 1}",
                     f"Mean interval: {mean_iv:.3f}s",
@@ -7017,9 +7314,10 @@ class OTPcapAnalyzer:
                 self.add_finding(
                     SEVERITY_HIGH, "Intrusion Indicators",
                     "SNMP walk observed",
-                    f"{src2} issued {count} SNMP GETNEXT operations, consistent with an SNMP walk "
-                    "(full MIB enumeration). In OT environments this is often a reconnaissance step.",
-                    [f"GETNEXT count: {count}"],
+                    f"{src2} issued {count} SNMP GetNext/GetBulk requests, consistent with an SNMP walk "
+                    "(MIB enumeration). Network-management systems walk interface tables routinely; from any "
+                    "other host this is reconnaissance.",
+                    [f"GetNext/GetBulk requests: {count}"],
                     [src2], [], "SNMP",
                     sorted(snmp_state["pcap_names"]),
                     f"snmp::walk::{src2}",
@@ -7060,44 +7358,44 @@ class OTPcapAnalyzer:
             self.add_finding(
                 SEVERITY_HIGH, "Cleartext and Legacy Protocols",
                 f"Obsolete TLS/SSL version observed ({ver})",
-                f"An {ver} handshake was observed between {src2} and {dst2}. "
-                "TLS versions prior to 1.2 have known cryptographic weaknesses and should be disabled.",
-                [f"Version: {ver}"],
+                f"{dst2} negotiated {ver} with {src2}. SSL and TLS versions before 1.2 are deprecated "
+                "(RFC 8996) and have practical attacks; disable them on the server.",
+                [f"{pn2}: {src2} -> {dst2} | ServerHello selected {ver}"],
                 [src2], [dst2], "TLS", [pn2],
-                f"tls::oldver::{src2}::{dst2}::{ver}",
+                f"tls::oldver::{dst2}::{ver}",
                 tags=["legacy", "tls", "weak_crypto"],
             )
         for pn2, src2, dst2, cipher in tls_state["weak_ciphers"]:
             self.add_finding(
                 SEVERITY_HIGH, "Cleartext and Legacy Protocols",
                 f"Weak TLS cipher observed ({cipher})",
-                f"A TLS handshake between {src2} and {dst2} negotiated a weak cipher suite "
-                f"({cipher}). Weak ciphers (RC4, 3DES, DES, NULL, anon, MD5, EXPORT) are broken or "
-                "deprecated and must not be used.",
-                [f"Cipher indicator: {cipher}"],
+                f"{dst2} selected a weak cipher suite ({cipher}) for a session with {src2}. NULL, anonymous, "
+                "EXPORT, RC4, DES/3DES, and MD5-based suites are broken or deprecated and must be disabled.",
+                [f"{pn2}: {src2} -> {dst2} | ServerHello selected {cipher}"],
                 [src2], [dst2], "TLS", [pn2],
-                f"tls::weakcipher::{src2}::{dst2}::{cipher}",
+                f"tls::weakcipher::{dst2}::{cipher}",
                 tags=["weak_crypto", "tls"],
             )
-        for pn2, src2, dst2, subj in tls_state["self_signed"]:
+        for pn2, src2, dst2, alert_text in tls_state["rejected_certs"]:
+            reason = alert_text.split(" | ", 1)[0]
             self.add_finding(
                 SEVERITY_MEDIUM, "Cleartext and Legacy Protocols",
-                "Self-signed TLS certificate observed",
-                f"A self-signed certificate was presented between {src2} and {dst2}. "
-                "Self-signed certificates bypass the CA trust chain and are common on "
-                "embedded OT devices — but also let an attacker present any identity without detection.",
-                [f"Evidence: {subj}"],
+                f"TLS certificate rejected by peer ({reason})",
+                f"A TLS handshake between {src2} and {dst2} was aborted with a {reason} alert: the peer did not "
+                "trust the certificate it was shown. Self-signed and privately issued device certificates cause "
+                "this; users who learn to click past certificate warnings are exposed to interception.",
+                [f"{pn2}: {alert_text}"],
                 [src2], [dst2], "TLS", [pn2],
-                f"tls::selfsigned::{src2}::{dst2}",
+                f"tls::rejected::{src2}::{dst2}",
                 tags=["tls"],
             )
-        for pn2, src2, dst2, notAfter in tls_state["expired_certs"]:
+        for pn2, src2, dst2, alert_text in tls_state["expired_certs"]:
             self.add_finding(
                 SEVERITY_HIGH, "Cleartext and Legacy Protocols",
                 "Expired TLS certificate observed",
-                f"An expired TLS certificate was presented between {src2} and {dst2}. "
-                "Expired certificates indicate unmonitored PKI and may break trust validation.",
-                [f"Evidence: {notAfter}"],
+                f"A TLS handshake between {src2} and {dst2} was aborted because a certificate had expired. "
+                "Expired certificates indicate unmonitored PKI and train users to ignore trust warnings.",
+                [f"{pn2}: {alert_text}"],
                 [src2], [dst2], "TLS", [pn2],
                 f"tls::expired::{src2}::{dst2}",
                 tags=["tls"],
@@ -7141,7 +7439,7 @@ class OTPcapAnalyzer:
                 t_before = datetime.fromtimestamp(stamps[idx_max], timezone.utc).replace(tzinfo=None).isoformat() + "Z"
                 t_after  = datetime.fromtimestamp(stamps[idx_max + 1], timezone.utc).replace(tzinfo=None).isoformat() + "Z"
                 self.add_finding(
-                    SEVERITY_MEDIUM, "Network Hygiene",
+                    SEVERITY_MEDIUM, "Network Hygiene and Segmentation",
                     "Capture discontinuity (large inter-packet gap)",
                     f"A gap of {max_gap:.1f} seconds was observed in {pcap_name} between "
                     f"{t_before} and {t_after}. Large gaps may indicate a paused capture, "
@@ -7156,7 +7454,7 @@ class OTPcapAnalyzer:
             total_span = stamps[-1] - stamps[0]
             if total_span > 0 and total_span < 60 and len(stamps) > 500:
                 self.add_finding(
-                    SEVERITY_LOW, "Network Hygiene",
+                    SEVERITY_LOW, "Network Hygiene and Segmentation",
                     "Very short capture window",
                     f"{pcap_name} spans only {total_span:.1f}s with {len(stamps)} frames — "
                     "analysis results may be limited by the short observation window.",
@@ -7168,13 +7466,16 @@ class OTPcapAnalyzer:
 
         # Devices talking TCP/UDP but no NTP seen at all → time-sync gap.
         all_ntp_srcs = set(ntp_state["ntp_queries"].keys())
-        if not all_ntp_srcs and ntp_state["per_file_times"]:
+        capture_span = max((max(stamps) - min(stamps) for stamps in ntp_state["per_file_times"].values() if stamps),
+                           default=0.0)
+        if not all_ntp_srcs and capture_span >= 1800:
             self.add_finding(
-                SEVERITY_MEDIUM, "Network Hygiene",
+                SEVERITY_MEDIUM, "Network Hygiene and Segmentation",
                 "No NTP traffic observed in capture",
-                "No NTP (UDP/123) traffic was seen in any capture file. OT environments "
-                "without synchronized time make forensic correlation, SIEM alerting, and "
-                "certificate validity checks unreliable.",
+                f"No NTP (UDP/123) traffic was seen in {capture_span / 60:.0f} minutes of capture. OT environments "
+                "without synchronized time make forensic correlation, SIEM alerting, and certificate validity "
+                "checks unreliable. Some clients (Windows domain members) poll only every few hours, so confirm "
+                "the time source on the devices themselves.",
                 [f"Capture files: {', '.join(sorted(ntp_state['pcap_names']))}"],
                 [], [], "NTP", sorted(ntp_state["pcap_names"]),
                 "capture::no-ntp",
@@ -7184,7 +7485,7 @@ class OTPcapAnalyzer:
         for src_n, servers in ntp_state["ntp_servers"].items():
             if len(servers) >= 4:
                 self.add_finding(
-                    SEVERITY_LOW, "Network Hygiene",
+                    SEVERITY_LOW, "Network Hygiene and Segmentation",
                     "Host queried many NTP servers",
                     f"{src_n} queried {len(servers)} distinct NTP servers. OT endpoints "
                     "typically peer with 1–2 internal time sources; multi-resolver behavior "
@@ -7204,7 +7505,8 @@ class OTPcapAnalyzer:
         # network is not a finding.
         ot_subnets: set = set()
         for dev in self.session.devices.values():
-            if any(k in dev.inferred_role for k in ("Controller", "HMI", "OT Device", "Physical Security", "Dual-Zone")):
+            if any(k in dev.inferred_role for k in ("Controller", "HMI", "OT Device", "OT Server", "Machine-Vision",
+                                                    "Physical Security", "Dual-Zone")):
                 ot_subnets.add(subnet_from_ip(dev.ip))
         for (proto_name, subnet), slot in noise_state["by_proto_subnet"].items():
             if subnet not in ot_subnets:
@@ -7215,7 +7517,7 @@ class OTPcapAnalyzer:
             evidence = list(slot["samples"])
             evidence.append(f"Hosts emitting {proto_name} in {subnet}: {', '.join(host_list[:30])}")
             self.add_finding(
-                SEVERITY_MEDIUM, "Network Hygiene",
+                SEVERITY_MEDIUM, "Network Hygiene and Segmentation",
                 f"{proto_name} traffic observed on OT segment",
                 f"{len(host_list)} hosts in {subnet} emitted {proto_name} traffic. "
                 f"{proto_name} is an IT-class discovery / name-resolution protocol and "
@@ -7239,7 +7541,7 @@ class OTPcapAnalyzer:
             evidence = list(dhcp_state["samples"][subnet])
             evidence.append(f"Distinct server MACs in {subnet}: {', '.join(mac_list)}")
             self.add_finding(
-                SEVERITY_CRITICAL, "Network Hygiene",
+                SEVERITY_CRITICAL, "Network Hygiene and Segmentation",
                 "Multiple DHCP servers observed in subnet (possible rogue)",
                 f"{len(mac_list)} distinct MAC addresses served DHCP responses in {subnet}. "
                 "OT subnets typically have exactly one authorized DHCP server (often none — many "
@@ -7343,7 +7645,7 @@ class OTPcapAnalyzer:
                 if pub_to_lookup > 0:
                     self._log_ts(
                         f"      └─ {pub_to_lookup} public IP(s) need PTR/RDAP enrichment "
-                        f"(~2.5s each with timeout). Set environment_type=air-gapped to skip."
+                        f"(~2.5s each with timeout). Answer 'yes' to the air-gapped question or pass --offline to skip."
                     )
             before = len(self.session.findings)
             t0 = time.time()
@@ -7408,11 +7710,27 @@ class OTPcapAnalyzer:
         return result
 
     def compute_risk_summary(self) -> Dict[str, Any]:
-        """Compute the weighted risk score and top drivers."""
+        """Compute the weighted risk score and top drivers.
+
+        Findings are grouped by (category, title) and each group contributes
+        its three heaviest findings, so one detector repeating per host cannot
+        dominate the score.  INFO findings, protection guidance, and assessor
+        notes do not score.
+        """
         assert self.session is not None
         counts: Counter[str] = Counter(finding.severity for finding in self.session.findings)
-        score = sum(SCORE_WEIGHTS.get(severity, 0) * count for severity, count in counts.items())
-        contributors = sorted(self.session.findings, key=lambda finding: finding.score_weight, reverse=True)[:5]
+        groups: Dict[Tuple[str, str], List[Finding]] = defaultdict(list)
+        for finding in self.session.findings:
+            if finding.severity == SEVERITY_INFO or finding.category in NON_SCORING_CATEGORIES:
+                continue
+            groups[(finding.category, finding.title)].append(finding)
+        drivers: List[Tuple[int, Finding, int]] = []
+        for group in groups.values():
+            group.sort(key=lambda finding: SCORE_WEIGHTS.get(finding.severity, 0), reverse=True)
+            contribution = sum(SCORE_WEIGHTS.get(finding.severity, 0) for finding in group[:3])
+            drivers.append((contribution, group[0], len(group)))
+        score = sum(contribution for contribution, _, _ in drivers)
+        drivers.sort(key=lambda item: item[0], reverse=True)
         summary = {
             "counts": dict(counts),
             "score": score,
@@ -7421,9 +7739,10 @@ class OTPcapAnalyzer:
                 {
                     "severity": finding.severity,
                     "title": finding.title,
-                    "weight": finding.score_weight,
+                    "weight": contribution,
+                    "occurrences": occurrences,
                 }
-                for finding in contributors
+                for contribution, finding, occurrences in drivers[:5]
             ],
         }
         self.session.analysis_metadata["risk_summary"] = summary
@@ -7565,7 +7884,7 @@ class OTPcapAnalyzer:
         svg_lines.append(
             f'<text x="{W//2}" y="28" text-anchor="middle" font-size="15" '
             f'font-weight="bold" fill="#1A1A1A">'
-            f'OTscope Purdue Model — {self.session.site}</text>'
+            f'OTscope Purdue Model — {_xml_escape(self.session.site)}</text>'
         )
         # Legend
         lx = PAD
@@ -7618,7 +7937,7 @@ class OTPcapAnalyzer:
             )
             svg_lines.append(
                 f'<text x="{box_x + 14}" y="{y + 22}" font-size="12" '
-                f'font-weight="bold" fill="#111">{label}</text>'
+                f'font-weight="bold" fill="#111">{_xml_escape(label)}</text>'
             )
             svg_lines.append(
                 f'<text x="{box_x + 14}" y="{y + 40}" font-size="11" fill="#333">'
@@ -7626,7 +7945,7 @@ class OTPcapAnalyzer:
             )
             svg_lines.append(
                 f'<text x="{box_x + 14}" y="{y + 57}" font-size="10" fill="#555">'
-                f'Protocols: {top_protos}</text>'
+                f'Protocols: {_xml_escape(top_protos)}</text>'
             )
             y += BOX_H + GAP
 
@@ -7727,7 +8046,7 @@ class OTPcapAnalyzer:
         d_lines.append(
             f'<text x="{TOTAL_W//2}" y="28" text-anchor="middle" font-size="15" '
             f'font-weight="bold" fill="#1A1A1A">'
-            f'OTscope Purdue Detail — {self.session.site}</text>'
+            f'OTscope Purdue Detail — {_xml_escape(self.session.site)}</text>'
         )
 
         # Layer background rectangles
@@ -7738,7 +8057,7 @@ class OTPcapAnalyzer:
             )
             d_lines.append(
                 f'<text x="{lx + 10}" y="{ly + 18}" font-size="11" '
-                f'font-weight="bold" fill="#222">{label}</text>'
+                f'font-weight="bold" fill="#222">{_xml_escape(label)}</text>'
             )
 
         # ── Right panel: Top Connections list ─────────────────────────────
@@ -7785,7 +8104,7 @@ class OTPcapAnalyzer:
             _dst = _conn.destination_ip if len(_conn.destination_ip) <= 14 else _conn.destination_ip[:12] + "…"
             d_lines.append(
                 f'<text x="{PX}" y="{_ey + 13}" font-size="9" font-weight="bold" fill="#111">'
-                f'{_src} → {_dst}</text>'
+                f'{_xml_escape(_src)} → {_xml_escape(_dst)}</text>'
             )
             # Protocol · port · packet count
             _proto = (_conn.protocol or "TCP")[:10]
@@ -7793,7 +8112,7 @@ class OTPcapAnalyzer:
             _pkts = f"{_conn.packet_count:,} pkts"
             d_lines.append(
                 f'<text x="{PX}" y="{_ey + 25}" font-size="8" fill="#555">'
-                f'{_proto}{_port_str} · {_pkts}</text>'
+                f'{_xml_escape(_proto)}{_port_str} · {_pkts}</text>'
             )
             # Layer info (src layer short label)
             _sl = ip_to_layer.get(_conn.source_ip, "")
@@ -7811,7 +8130,7 @@ class OTPcapAnalyzer:
             _dl_lbl = _sl_short.get(_dl, _dl[:6] if _dl else "?")
             d_lines.append(
                 f'<text x="{PX}" y="{_ey + 35}" font-size="7.5" fill="#999">'
-                f'{_sl_lbl} → {_dl_lbl}</text>'
+                f'{_xml_escape(_sl_lbl)} → {_xml_escape(_dl_lbl)}</text>'
             )
             _ey += _entry_h
             _shown += 1
@@ -7846,17 +8165,17 @@ class OTPcapAnalyzer:
                 ip_label = dev.ip if len(dev.ip) <= 16 else dev.ip[:14] + "…"
                 d_lines.append(
                     f'<text x="{cx}" y="{by + 16}" text-anchor="middle" '
-                    f'font-size="10" font-weight="bold" fill="#111">{ip_label}</text>'
+                    f'font-size="10" font-weight="bold" fill="#111">{_xml_escape(ip_label)}</text>'
                 )
                 role_label = dev.inferred_role[:22] + ("…" if len(dev.inferred_role) > 22 else "")
                 d_lines.append(
                     f'<text x="{cx}" y="{by + 29}" text-anchor="middle" '
-                    f'font-size="9" fill="#444">{role_label}</text>'
+                    f'font-size="9" fill="#444">{_xml_escape(role_label)}</text>'
                 )
                 proto_short = (dev.protocols[0] if dev.protocols else "")[:18]
                 d_lines.append(
                     f'<text x="{cx}" y="{by + 41}" text-anchor="middle" '
-                    f'font-size="8" fill="#666">{proto_short}</text>'
+                    f'font-size="8" fill="#666">{_xml_escape(proto_short)}</text>'
                 )
 
         d_lines.append('</svg>')
@@ -7876,38 +8195,9 @@ class OTPcapAnalyzer:
         risk = self.compute_risk_summary()
         correlation_lines = correlation_summary_lines(self.session)
         protection_findings = [finding for finding in self.session.findings if finding.category == "Protection Guidance"]
-        report_issues = aggregated_report_issues(self.session, categories=[
-            # Core OT protocols
-            "Modbus TCP",
-            "BACnet/IP",
-            "DNP3",
-            "IEC 61850",
-            "MQTT",
-            "OPC-UA",
-            "EtherNet/IP",
-            "Siemens S7 / PROFINET",
-            # Vendor-specific OT protocols (v2.5.0+)
-            "Omron FINS",
-            "GE SRTP",
-            "Schneider UMAS",
-            "Mitsubishi MELSEC",
-            "OSIsoft PI Server",
-            "Ignition Gateway",
-            "Node-RED",
-            # IoT wireless protocols (v2.6.0 patch 5+)
-            "Zigbee / IEEE 802.15.4",
-            "CoAP",
-            "Z-Wave",
-            # Cross-cutting categories
-            "Physical Security",
-            "Cleartext and Legacy Protocols",
-            "Artifact Extraction",
-            "Network Hygiene and Segmentation",
-            "Intrusion Indicators",
-            "Unknown and Unclassified Traffic",
-            "Absence of Expected Traffic",
-            "Baseline Deviation",
-        ])
+        assessor_notes = [finding for finding in self.session.findings if finding.category == "Assessor Notes"]
+        report_issues = [issue for issue in aggregated_report_issues(self.session)
+                         if issue["category"] not in NON_SCORING_CATEGORIES]
         try:
             from docx import Document
             from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -8179,7 +8469,20 @@ class OTPcapAnalyzer:
                 return (-top_sev, cat)
 
             ordered_categories = sorted(issues_by_category.keys(), key=_cat_priority)
-            wireshark_categories_used: Dict[str, Tuple[str, List[str]]] = {}
+            # Category -> distinct specific guides used by its findings.  Findings
+            # with no specific guide point at the general steps instead.
+            wireshark_categories_used: Dict[str, List[Tuple[str, List[str]]]] = defaultdict(list)
+            general_guide_needed = False
+
+            def _note_guide(category: str, finding: Finding) -> str:
+                nonlocal general_guide_needed
+                guide = wireshark_guide_for(finding)
+                if guide is None:
+                    general_guide_needed = True
+                    return "Appendix A — General Investigation Steps"
+                if guide not in wireshark_categories_used[category]:
+                    wireshark_categories_used[category].append(guide)
+                return f"Appendix A — {category}"
             EVIDENCE_CAP_FULL = 5
             EVIDENCE_CAP_ABBREV = 3
             EP_CAP = 20
@@ -8218,11 +8521,7 @@ class OTPcapAnalyzer:
                 representative = issue["findings"][0]
                 sev = issue["severity"]
                 color = _SEV_COLOR.get(sev, RGBColor(0x44, 0x44, 0x44))
-                ws_filter, ws_steps = wireshark_steps_for_finding(representative)
-                appendix_key = issue["category"]
-                if ws_steps:
-                    wireshark_categories_used[appendix_key] = (ws_filter, ws_steps)
-                ws_ref = f"Appendix A — {appendix_key}" if ws_steps else "Appendix A"
+                ws_ref = _note_guide(issue["category"], representative)
 
                 h3 = document.add_heading(level=3)
                 h3_run = h3.add_run(f"[{sev}]  {issue['title']}")
@@ -8283,9 +8582,7 @@ class OTPcapAnalyzer:
                 representative = issue["findings"][0]
                 sev = issue["severity"]
                 color = _SEV_COLOR.get(sev, RGBColor(0x44, 0x44, 0x44))
-                ws_filter, ws_steps = wireshark_steps_for_finding(representative)
-                if ws_steps:
-                    wireshark_categories_used[issue["category"]] = (ws_filter, ws_steps)
+                _note_guide(issue["category"], representative)
 
                 p = document.add_paragraph()
                 title_run = p.add_run(f"[{sev}] {issue['title']}  ({fid})")
@@ -8329,6 +8626,21 @@ class OTPcapAnalyzer:
                         full_rendered += 1
                     else:
                         _render_abbrev_finding(issue, fid)
+
+            if protection_findings:
+                document.add_heading("Suggested Controls", level=1)
+                document.add_paragraph(
+                    "Defensive measures suggested by what the capture contained.  These are "
+                    "recommendations, not findings, and do not contribute to the risk score."
+                )
+                for finding in protection_findings[:20]:
+                    control_p = document.add_paragraph(style="List Bullet")
+                    control_p.add_run(f"{finding.title}: ").bold = True
+                    control_p.add_run(finding.description)
+            if assessor_notes:
+                document.add_heading("Assessor Notes", level=1)
+                for finding in assessor_notes:
+                    document.add_paragraph(finding.description, style="List Bullet")
 
             # ================================================================
             # 6. NETWORK INTERPRETATION SUMMARY
@@ -8460,7 +8772,7 @@ class OTPcapAnalyzer:
             # ================================================================
             # APPENDIX A: WIRESHARK INVESTIGATION GUIDE
             # ================================================================
-            if wireshark_categories_used:
+            if wireshark_categories_used or general_guide_needed:
                 document.add_page_break()
                 document.add_heading("Appendix A: Wireshark Investigation Guide", level=1)
                 document.add_paragraph(
@@ -8471,11 +8783,17 @@ class OTPcapAnalyzer:
                     "`frame.time_epoch >= A && frame.time_epoch <= B` to bracket the window."
                 )
                 for cat in sorted(wireshark_categories_used):
-                    ws_filter_a, ws_steps_a = wireshark_categories_used[cat]
                     document.add_heading(cat, level=2)
-                    if ws_filter_a:
-                        document.add_paragraph(f"Display filter: {ws_filter_a}")
-                    for step in ws_steps_a:
+                    for ws_filter_a, ws_steps_a in wireshark_categories_used[cat]:
+                        if ws_filter_a:
+                            filter_p = document.add_paragraph()
+                            filter_p.add_run("Display filter: ").bold = True
+                            filter_p.add_run(ws_filter_a)
+                        for step in ws_steps_a:
+                            document.add_paragraph(step, style="List Bullet")
+                if general_guide_needed:
+                    document.add_heading("General Investigation Steps", level=2)
+                    for step in _WIRESHARK_FALLBACK[1]:
                         document.add_paragraph(step, style="List Bullet")
 
             # ================================================================
@@ -9059,7 +9377,7 @@ def _list_pcap_subfolders() -> List[Path]:
         return []
     results = []
     for entry in sorted(_PCAPS_ROOT.iterdir()):
-        if entry.is_dir() and any(entry.rglob("*.pc*")):
+        if entry.is_dir() and any(is_capture_file(path) for path in entry.rglob("*")):
             results.append(entry)
     return results
 
@@ -9193,7 +9511,9 @@ def scan_flow(analyzer: OTPcapAnalyzer, config: Dict[str, Any], args: argparse.N
     folder = scan_path if scan_path.is_dir() else scan_path.parent
 
     assessor = getattr(args, "assessor", None) or "OTscope"
-    site = getattr(args, "site", None) or folder.name or "unknown-site"
+    # Scanning the shared pcaps/ drop folder: name the site after the workspace.
+    default_site = _SCRIPT_DIR.name if folder.resolve() == _PCAPS_ROOT.resolve() else folder.name
+    site = getattr(args, "site", None) or default_site or "unknown-site"
     session_name = safe_slug(f"{site}_{datetime.now().strftime('%Y%m%d')}")
 
     env_answers: Dict[str, str] = {key: "" for key, _ in discovery_questions()}
@@ -9343,11 +9663,11 @@ def run_application(args: argparse.Namespace) -> None:
     # dropped into an empty directory is fully self-provisioning.
     _bootstrap_workspace()
     # If the pcaps folder exists but holds no capture files, guide the user
-    # before they hit the file-selection prompt mid-session.
-    if _PCAPS_ROOT.is_dir() and not any(
-        f.suffix.lower() in {".pcap", ".pcapng", ".cap"}
-        for f in _PCAPS_ROOT.rglob("*")
-        if f.is_file()
+    # before they hit the file-selection prompt of a new interactive session.
+    interactive_new_session = not (getattr(args, "scan", None) or args.session or args.report_only or args.pcap
+                                   or args.save_baseline or args.compare_baseline)
+    if interactive_new_session and _PCAPS_ROOT.is_dir() and not any(
+        is_capture_file(f) for f in _PCAPS_ROOT.rglob("*")
     ):
         print(colorize(f"[i] No capture files found in {_PCAPS_ROOT}", "INFO"))
         print(colorize("    Drop your .pcap / .pcapng files into that folder, then run OTscope again.", "INFO"))

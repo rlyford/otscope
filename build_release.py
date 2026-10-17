@@ -3,8 +3,8 @@
 build_release.py — OTscope field-deployment package builder
 
 Creates dist/OTscope_v<VERSION>.zip containing everything a field assessor
-needs: the Python program, requirements, README, empty workspace folders,
-and the User Guide.
+needs: the Python program, requirements, README, license, empty workspace
+folders, and the User Guide.
 
 Usage:
     python build_release.py           # builds the zip
@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import re
-import sys
 import zipfile
 from pathlib import Path
 
@@ -34,7 +33,7 @@ def read_version() -> str:
     return match.group(1)
 
 
-def build_manifest(pkg_name: str) -> list[tuple[Path, str]]:
+def build_manifest(pkg_name: str) -> list[tuple[Path | None, str]]:
     """Return [(source_path, archive_path)] pairs for the release package.
 
     source_path=None means a directory-only entry (empty folder in the zip).
@@ -51,6 +50,7 @@ def build_manifest(pkg_name: str) -> list[tuple[Path, str]]:
     add(SRC_DIR / "otscope.py",   "otscope.py")
     add(SRC_DIR / "README.txt",   "README.txt")
     add(REPO_ROOT / "otscope" / "requirements.txt", "requirements.txt")
+    add(REPO_ROOT / "otscope" / "LICENSE.txt", "LICENSE.txt")
 
     # User Guide — prefer PDF, fall back to Markdown
     pdf  = DOCS_DIR / "OTscope_User_Guide.pdf"
@@ -62,8 +62,7 @@ def build_manifest(pkg_name: str) -> list[tuple[Path, str]]:
     else:
         print("[!] User Guide not found in docs/ — omitting from package.")
 
-    # Empty workspace directories (represented by a hidden placeholder that
-    # most zip tools strip, leaving just the directory entry)
+    # Empty workspace directories (explicit directory entries in the zip)
     manifest.append((None, f"{pkg_name}/pcaps/"))
     manifest.append((None, f"{pkg_name}/output/"))
 
@@ -77,7 +76,7 @@ def build(dry_run: bool = False) -> Path:
 
     manifest = build_manifest(pkg_name)
 
-    print(f"OTscope release builder")
+    print("OTscope release builder")
     print(f"  Version : {version}")
     print(f"  Package : {zip_name}")
     print(f"  Items   : {len(manifest)}")
@@ -97,8 +96,10 @@ def build(dry_run: bool = False) -> Path:
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for src, arc in manifest:
             if src is None:
-                # Add an explicit directory entry for the empty folder.
-                zf.mkdir(arc.rstrip("/"))
+                # Explicit directory entry; ZipFile.mkdir() needs Python 3.11+.
+                info = zipfile.ZipInfo(arc)
+                info.external_attr = (0o40755 << 16) | 0x10
+                zf.writestr(info, "")
             else:
                 zf.write(src, arc)
 

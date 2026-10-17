@@ -1,3 +1,2 @@
 # OTscope runtime dependencies (tshark is a system install, not a pip package).
 python-docx>=1.1.0
-scapy>=2.5.0

@@ -4,13 +4,14 @@
 
 This repo contains **OTscope**, an offline OT/ICS packet-capture analysis tool.
 
-Primary file: `otscope/src/otscope.py` — an intentionally single-file Python application (~9,400 lines).
+Primary file: `otscope/src/otscope.py` — an intentionally single-file Python application (~9,700 lines).
 
 Supporting docs:
 - `otscope/README.md` — quick-start and feature overview
 - `otscope/docs/OTscope_User_Guide.md` — full operator manual and version history
 - `otscope/requirements.txt` — Python dependencies
 - `otscope/LICENSE.txt` — source-available proprietary license
+- `tests/` — detection regression suite (see **Regression Tests** below)
 
 ---
 
@@ -18,7 +19,7 @@ Supporting docs:
 
 - **Single-file design is intentional.** Do not split `otscope.py` into modules or packages.
 - The file is structured in clear sections: dataclasses → tshark interface → main analyzer class → protocol checkers → report builders → UI → utilities.
-- Session state is serialized to `.otpa_session` JSON files; output artifacts go in `otscope/output/` (gitignored).
+- Session state is serialized to `.otpa_session` JSON files; output artifacts go in `output/` next to `otscope.py` (`otscope/src/output/` in this repo, contents gitignored).
 
 ---
 
@@ -33,7 +34,7 @@ Supporting docs:
 
 ## Versioning
 
-- Single version constant at line ~61: `VERSION = "x.y.z"`
+- Single version constant at line ~74: `VERSION = "x.y.z"`
 - Keep `VERSION` in `otscope.py` in sync with the version declared in `otscope/docs/OTscope_User_Guide.md`.
 - Update the version history section in the User Guide when bumping the version.
 
@@ -75,6 +76,16 @@ python3 otscope/src/otscope.py --pcap <file.pcap>
 pip install -r otscope/requirements.txt
 ```
 
+## Regression Tests
+
+```bash
+# From repo root (requires tshark and python-docx; the pcap generator is pure stdlib)
+python tests/run_regression.py                      # all scenarios
+python tests/run_regression.py --only benign_modbus_hmi --keep   # one scenario, keep its workspace
+```
+
+`tests/pcapgen.py` writes synthetic captures, `tests/scenarios.py` defines benign and attack scenarios, and `tests/run_regression.py` runs `otscope.py --scan --offline` on each in a temp workspace and checks the JSON / CSV / DOCX / SVG output. Run it after any detection change; add a scenario for new detection logic.
+
 ---
 
 ## Git Workflow
@@ -85,7 +96,7 @@ pip install -r otscope/requirements.txt
   ```bash
   git checkout main && git pull && git checkout -b <your-branch>
   ```
-- `.gitignore` already excludes `*.pcap`, `*.pcapng`, `otscope/output/`, and `otscope/pcaps/`.
+- `.gitignore` already excludes capture files (`*.pcap`, `*.pcapng`, `*.cap`, and their `.gz` forms), the contents of `otscope/src/pcaps/` and `otscope/src/output/`, the legacy `otscope/output/` and `otscope/pcaps/`, `dist/`, and `otscope-vault/`.
 - Never commit pcap files or generated output artifacts.
 
 ---

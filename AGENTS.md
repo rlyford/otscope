@@ -8,13 +8,14 @@ This file is for Codex and other AGENTS.md-aware AI coding agents. `CLAUDE.md` i
 
 This repo contains **OTscope**, an offline OT/ICS packet-capture analysis tool.
 
-Primary file: `otscope/src/otscope.py` — an intentionally single-file Python application (~7,700 lines).
+Primary file: `otscope/src/otscope.py` — an intentionally single-file Python application (~9,700 lines).
 
 Supporting docs:
 - `otscope/README.md` — quick-start and feature overview
 - `otscope/docs/OTscope_User_Guide.md` — full operator manual and version history
 - `otscope/requirements.txt` — Python dependencies
 - `otscope/LICENSE.txt` — source-available proprietary license
+- `tests/` — detection regression suite (see **Regression Tests** below)
 
 ---
 
@@ -31,7 +32,7 @@ Supporting docs:
   - UI (interactive menus, ANSI colors, progress ETAs)
   - Utilities (IP classification, OUI lookup, risk scoring)
 - Session state is serialized to `.otpa_session` JSON files.
-- Output artifacts go in `otscope/output/` (gitignored — never commit these).
+- Output artifacts go in `output/` next to `otscope.py` (`otscope/src/output/` in this repo; contents gitignored — never commit these).
 
 ---
 
@@ -53,7 +54,7 @@ Violating these rules could constitute license infringement. When in doubt, leav
 
 ## Versioning
 
-- Single version constant near line 61: `VERSION = "x.y.z"`
+- Single version constant near line 74: `VERSION = "x.y.z"`
 - **Keep `VERSION` in `otscope.py` in sync with the version header in `otscope/docs/OTscope_User_Guide.md`.**
 - When bumping the version, also add an entry to the Version History section of the User Guide (newest at top).
 
@@ -99,6 +100,16 @@ python3 otscope/src/otscope.py
 python3 otscope/src/otscope.py --offline
 ```
 
+## Regression Tests
+
+```bash
+# From repo root (requires tshark and python-docx; the pcap generator is pure stdlib)
+python tests/run_regression.py                      # all scenarios
+python tests/run_regression.py --only benign_modbus_hmi --keep   # one scenario, keep its workspace
+```
+
+`tests/pcapgen.py` writes synthetic captures, `tests/scenarios.py` defines benign and attack scenarios, and `tests/run_regression.py` runs `otscope.py --scan --offline` on each in a temp workspace and checks the JSON / CSV / DOCX / SVG output. Run it after any detection change; add a scenario for new detection logic.
+
 ---
 
 ## Git Workflow
@@ -109,7 +120,7 @@ python3 otscope/src/otscope.py --offline
   ```bash
   git checkout main && git pull && git checkout -b <your-branch>
   ```
-- Never commit pcap files or generated output artifacts — they are gitignored.
+- Never commit pcap files or generated output artifacts — they are gitignored (capture files including `*.cap` and `.gz` forms, `otscope/src/pcaps/` and `otscope/src/output/` contents, `dist/`, and `otscope-vault/`).
 - If GitHub CLI or GitHub API commands fail from Codex with a proxy error to `127.0.0.1:9`, clear inherited proxy variables for that command and retry:
   ```powershell
   $env:HTTP_PROXY=''; $env:HTTPS_PROXY=''; $env:ALL_PROXY=''; $env:GIT_HTTP_PROXY=''; $env:GIT_HTTPS_PROXY=''; gh auth status
