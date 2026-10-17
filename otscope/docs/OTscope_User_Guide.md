@@ -4,7 +4,7 @@
 
 Interactive multi-pcap OT/ICS traffic analysis with session persistence, role inference, attack-chain correlation, MITRE ATT&CK for ICS mapping, Wireshark investigation guidance, Purdue-Model architecture diagrams, and machine-readable artifacts.
 
-> **Version 2.7.0**  ·  July 2026
+> **Version 2.8.0**  ·  October 2026
 > Authored by Ryan Lyford  ·  © 2026 Ryan Lyford. All rights reserved.
 
 ---
@@ -30,14 +30,14 @@ Interactive multi-pcap OT/ICS traffic analysis with session persistence, role in
 
 ## 1. What OTscope Is
 
-OTscope is a single-file Python program for offline analysis of OT/ICS packet captures (`.pcap` / `.pcapng`). It reads pcaps with tshark, builds a unified device and flow inventory across one or many capture files, runs a battery of vulnerability and intrusion-detection checks, and produces a Word report plus several machine-readable artifacts (JSON, two CSVs, and Purdue-Model SVG diagrams).
+OTscope is a single-file Python program for offline analysis of OT/ICS packet captures (`.pcap`, `.pcapng`, or `.cap`, optionally gzip-compressed). It reads pcaps with tshark, builds a unified device and flow inventory across one or many capture files, runs a battery of vulnerability and intrusion-detection checks, and produces a Word report plus several machine-readable artifacts (JSON, two CSVs, and Purdue-Model SVG diagrams).
 
 It is designed for the case where you receive a pile of pcap files from a site you don't fully know and need to answer: *what's on this network, is anything obviously misconfigured, and is anyone attacking it?*
 
 ### 1.1 Two Primary Goals
 
 - **Vulnerability detection** — unauthenticated protocols, cleartext communications, insecure configurations, exposed management interfaces, IT/OT boundary violations, weak TLS, EOL services, segmentation gaps.
-- **Intrusion detection** — reconnaissance, unauthorized writes, polling-burst anomalies, lateral movement, beaconing/C2, DNS abuse, ARP spoofing / Adversary-in-the-Middle, brute-force, replay attacks, attacker tool User-Agents, suppression-attack signatures (DNP3 disable spontaneous, cold/warm restart), and recon-then-write sequences.
+- **Intrusion detection** — reconnaissance (port scans, host sweeps, register-map sweeps, SNMP walks), unauthorized writes, polling-burst anomalies, beaconing/C2, DNS abuse, ARP spoofing / Adversary-in-the-Middle, brute-force, replayed or injected Modbus responses, attacker tool User-Agents, suppression-attack signatures (DNP3 disable spontaneous, cold/warm restart), and recon-then-write sequences.
 
 ---
 
@@ -45,11 +45,11 @@ It is designed for the case where you receive a pile of pcap files from a site y
 
 | Component | Notes |
 | --- | --- |
-| Python 3.8+ | Standard on Kali / most Linux distros and macOS. Windows: download from python.org — check "Add Python to PATH" during install. |
+| Python 3.8+ | Tested with Python 3.14. Standard on Kali / most Linux distros and macOS. Windows: download from python.org — check "Add Python to PATH" during install. |
 | tshark 4.6.4+ | Installed as part of Wireshark. See install commands below. |
 | python-docx | `pip install python-docx` — Word report writer. |
 
-`scapy` and `capinfos` are optional. SVG diagrams require no additional dependencies — pure stdlib.
+No other Python packages are needed: SVG diagrams are pure stdlib, and device vendor names come from the manufacturer database that ships with Wireshark (read offline with `tshark -G manuf`).
 
 **Install dependencies:**
 
@@ -64,6 +64,8 @@ sudo apt install tshark                        # Debian / Ubuntu / Kali
 brew install wireshark                         # macOS
 ```
 
+> **Linux note:** distribution repositories can lag behind the required tshark 4.6.4. On Ubuntu, the Wireshark team's stable PPA tracks current releases: `sudo add-apt-repository ppa:wireshark-dev/stable && sudo apt install tshark`. Check with `tshark --version`.
+
 > **Windows note:** The standard Wireshark installer for Windows includes tshark. During installation, ensure the "TShark" component is selected (it is included by default). After install, you may need to add the Wireshark folder (e.g. `C:\Program Files\Wireshark`) to your system PATH, or restart your terminal.
 
 > **tshark build note:** The standard Wireshark installer includes dissectors for all supported protocols. Z-Wave detection specifically requires a tshark build that includes the `zwave` dissector — if it is absent, OTscope prints an informational message and skips Z-Wave detection gracefully. All other protocols (including Zigbee/IEEE 802.15.4 and CoAP) work with any standard tshark 4.6.4+ install.
@@ -76,15 +78,15 @@ OTscope is fully self-provisioning: drop `otscope.py` — and optionally your ca
 Building 1\
     otscope.py          ← the only file you need to copy
     site_capture.pcap   ← optional: loose captures are moved into pcaps\ automatically
-    requirements.txt    ← auto-generated (pip dependency list)
-    README_FIRST.txt    ← auto-generated plain-text quick-start
+    requirements.txt    ← auto-generated (pip dependency list; refreshed if it is an older OTscope-generated copy)
+    README_FIRST.txt    ← auto-generated plain-text quick-start (kept current with the OTscope version)
     pcaps\              ← auto-created; capture files live here
     output\             ← auto-created; reports appear here
 ```
 
-Any `.pcap` / `.pcapng` files sitting loose next to `otscope.py` are moved into `pcaps\` at startup (with a `[i] Moved capture into workspace: …` notice; name collisions get a `_v2` suffix rather than overwriting). The same run then finds them in the default location — so "one folder with the script and the captures" is a complete deployment.
+Any capture files sitting loose next to `otscope.py` (`.pcap`, `.pcapng`, `.cap`, or the same names ending in `.gz`) are moved into `pcaps\` at startup (with a `[i] Moved capture into workspace: …` notice; name collisions get a `_v2` suffix rather than overwriting). The same run then finds them in the default location — so "one folder with the script and the captures" is a complete deployment.
 
-If `pcaps\` is empty, the startup message will prompt you to drop capture files there before proceeding. If Python packages are missing, the startup dependency check prints the exact `pip install -r requirements.txt` command pointing at the generated file.
+If `pcaps\` is empty when you start an interactive new session, the startup message prompts you to drop capture files there before proceeding. If Python packages are missing, the startup dependency check prints the exact `pip install -r requirements.txt` command pointing at the generated file.
 
 Use `build_release.py` (at the repo root) to package this layout into a zip:
 
@@ -124,6 +126,16 @@ On startup OTscope prints a banner, the network-safety status (see §4), and pro
 | Hard-lock all outbound network calls | `python3 otscope.py --offline` |
 | Print version | `python3 otscope.py --version` |
 
+### 3.1 Session Lifecycle
+
+| Phase | What Happens |
+| --- | --- |
+| New | Pick a folder of pcaps, name the session, answer environment-discovery questions, run analysis. |
+| Active | Streaming + per-protocol passes generate findings; per-step ETAs print as you go. |
+| Resume | Reload an `.otpa_session` file, see findings counts, choose: Re-run / Add / Generate report / Review / Exit. |
+| Add | Process only NEW pcaps; cross-file correlation re-runs across the full set. |
+| Report | Word + JSON + CSV addenda + Purdue SVG diagrams regenerated from current session state. |
+
 ### 3.2 Non-Interactive Scan Mode (`--scan`)
 
 `--scan <path>` accepts either a single pcap file or a folder (searched recursively). It skips all prompts — discovery questions use empty/unknown defaults — runs the full analysis pipeline, auto-generates a report, and exits. No keyboard input required at any point.
@@ -133,7 +145,7 @@ Optional flags that combine with `--scan`:
 | Flag | Purpose | Default when omitted |
 | --- | --- | --- |
 | `--assessor <name>` | Assessor name embedded in the report | `OTscope` |
-| `--site <name>` | Site name used in the report and filename slug | Folder name |
+| `--site <name>` | Site name used in the report and filename slug | Folder name (the workspace folder's name when scanning the `pcaps\` drop folder itself) |
 | `--env <type>` | Environment type hint (e.g. `manufacturing`, `power`, `water`, `building-automation`, `scada`) | *(empty)* |
 | `--format word\|json\|both` | Report format(s) to generate | `word` |
 | `--technical-appendix` | Append Appendix B (raw evidence lines + per-pcap breakdown) to the Word report | *(omitted — concise report only)* |
@@ -158,16 +170,6 @@ python otscope.py --scan C:\captures\site-a\ --assessor "Ryan" --site "Plant-A" 
 ```
 
 `--assessor` and `--site` also work in interactive mode (`--pcap` or no-arg) to pre-fill those prompts without skipping the rest of the questionnaire. `--env` pre-fills the environment-type discovery question in interactive mode.
-
-### 3.1 Session Lifecycle
-
-| Phase | What Happens |
-| --- | --- |
-| New | Pick a folder of pcaps, name the session, answer environment-discovery questions, run analysis. |
-| Active | Streaming + per-protocol passes generate findings; per-step ETAs print as you go. |
-| Resume | Reload an `.otpa_session` file, see findings counts, choose: Re-run / Add / Generate report / Review / Exit. |
-| Add | Process only NEW pcaps; cross-file correlation re-runs across the full set. |
-| Report | Word + JSON + CSV addenda + Purdue SVG diagrams regenerated from current session state. |
 
 ---
 
@@ -196,7 +198,7 @@ Asked once at session start. All are optional — press Enter to skip a question
 
 | Question | Effect on analysis |
 | --- | --- |
-| **Environment type** | Calibrates severity for environment-specific protocols. `power` / `electrical` / `substation` escalates DNP3 no-Secure-Auth to CRITICAL and adds absence checks for IEC 61850 and IEC 104. `physical` / `camera` adds absence checks for RTSP/ONVIF/OSDP. |
+| **Environment type** | Calibrates severity for environment-specific protocols. `power` / `electrical` / `substation` escalates DNP3 no-Secure-Auth to CRITICAL and adds absence checks for IEC 61850 and IEC 104. `physical` / `camera` adds absence checks for RTSP/OSDP. |
 | **Expected OT protocols** | Enables absence-of-expected-traffic findings for any protocol you list. If a declared protocol has no traffic in the captures, OTscope adds a MEDIUM finding. See keyword list below. |
 | **Known HMI / EWS IPs** | Any IP listed here is pinned to role "HMI / Engineering Workstation" during device-role inference, overriding the heuristic classifier. |
 | **Air-gapped (yes/no)** | Suppresses all outbound PTR and RDAP lookups (equivalent to `--offline`). Also escalates new-device baseline-diff findings to CRITICAL. |
@@ -220,12 +222,12 @@ Type any of these keywords (comma-separated) to enable absence detection for tha
 | `s7`, `profinet`, `siemens` | Siemens S7 / PROFINET |
 | `omron`, `fins` | Omron FINS (TCP/UDP 9600) |
 | `srtp`, `ge` | GE SRTP (TCP 18245) |
-| `umas`, `schneider`, `modicon` | Schneider UMAS (TCP 1024) |
+| `umas` | Schneider UMAS (Modbus function code 90 on TCP 502; appears only during engineering sessions) |
 | `melsec`, `mitsubishi`, `slmp` | Mitsubishi MELSEC SLMP (TCP 5007) |
-| `historian`, `osisoft` | OSIsoft PI Server (TCP 9001) |
-| `ignition` | Ignition Gateway (TCP 4592) |
+| `historian`, `osisoft`, `pi server` | AVEVA / OSIsoft PI (TCP 5450 Data Archive, TCP 5457 Asset Framework) |
+| `ignition` | Ignition Gateway (TCP 62541 OPC UA server, TCP 8060 gateway network) |
 | `nodered`, `node-red` | Node-RED (TCP 1880) |
-| `physical`, `rtsp`, `osdp`, `onvif`, `camera` | Physical Security (RTSP / ONVIF / OSDP) |
+| `physical`, `rtsp`, `osdp`, `onvif`, `camera` | Physical Security (RTSP / OSDP) |
 | `zigbee`, `zbee`, `ieee 802.15.4` | Zigbee / IEEE 802.15.4 wireless |
 | `coap` | CoAP (UDP 5683 cleartext / 5684 DTLS) |
 | `zwave`, `z-wave` | Z-Wave wireless |
@@ -243,79 +245,90 @@ After the questionnaire, OTscope runs a calibrated pipeline. The first pass meas
 
 Always runs. One full tshark pass per pcap that builds the unified device and flow inventory. Outputs total packets, duplicate count, time range, unified device count (after low-confidence pruning), top talker pairs, and per-machine bytes-per-second calibration for ETAs.
 
+- **Flow direction.** Every flow is oriented client → server. The server side comes from the TCP handshake (SYN / SYN-ACK) when the capture contains it; otherwise from well-known service ports. A flow is recorded once as *client → server : service port* — the client's ephemeral port never becomes a "destination port", and a device's **ports** are the services it actually answered on (its **client ports** are the services it used).
+- **Truncated captures.** A capture that ends mid-packet or has a damaged record (common when a capture is stopped abruptly or copied while still being written) is analyzed up to the damage, flagged `truncated` in the JSON report, and noted on the console — it is not dropped.
+
 ### 6.2 Phase 2 — Streaming Protocol Pass
 
 ONE combined tshark read per pcap with a single display filter that covers all protocols and hygiene signals. Per-protocol accumulators are fed in parallel, then findings are emitted post-loop. This is the single biggest performance win — N protocols × M files becomes 1 × M.
 
-- Modbus TCP — writes, scans, exceptions, timing burst, unit-id-0, replay, repetitive single-register polling, register value anomaly (sudden large jumps indicating spoofed/injected responses).
-- BACnet/IP — Who-Is/I-Am, WriteProperty, BBMD/forwarded NPDU.
-- DNP3 — Direct Operate, Freeze, Disable Spontaneous, Cold/Warm Restart, broadcast, no-Secure-Authentication.
-- IEC 61850 / GOOSE / MMS — control operations, GOOSE state-number anomalies, MMS without TLS.
-- IEC 60870-5-104 — cleartext substation control protocol.
-- MQTT — anonymous CONNECT, control-keyword topics, wildcard SUBSCRIBE, retained-control messages.
-- OPC-UA — SecurityMode None, Browse/Read enumeration, Write service calls.
-- EtherNet/IP / CIP — write services, reset, PCCC, Write Tag Fragmented.
-- Siemens S7 / PROFINET — PLC Stop/Start, Write Variable, block download/upload, DCP-Set.
-- Omron FINS (TCP/UDP 9600) — presence, cleartext/no-auth, write/control command indicators.
-- GE SRTP (TCP 18245) — presence, cleartext/no-auth, write/control indicators (GE PACSystems).
-- Schneider UMAS (TCP 1024) — presence, cleartext/no-auth, write/stop/download indicators (Modicon M340/Premium).
-- Mitsubishi MELSEC SLMP (TCP 5007) — presence, cleartext/no-auth, remote run/stop/write indicators.
-- OSIsoft PI Server (TCP 9001) — historian traffic presence, potential data exfiltration.
-- Ignition Gateway (TCP 4592) — OPC-UA without TLS indicators.
-- Node-RED (TCP 1880) — unauthenticated dashboard access, flow deployment events.
+Detectors read structured tshark fields — function codes, transaction IDs, TLS handshake fields, SNMP community and PDU type, MQTT flags — rather than parsing the Info column. Fields an older tshark does not know are simply read as empty. Checks keyed on a port need application data: a refused connection (SYN answered by RST), a bare ACK, or an ICMP error quoting a probe does not count as that protocol's traffic. Command and write detectors only fire on requests travelling client → server, never on the device's reply.
+
+- Modbus TCP — write requests (by function code), Unit ID 0 broadcast writes, register-map sweeps (many start addresses read once or twice each), exceptions per server, polling bursts (one-second request rate far above the pair's own baseline), hammer-rate single-address polling (≥1,000 reads at ≥20/s), duplicate or unsolicited responses matched by transaction ID (TCP retransmissions excluded), register value anomaly, Schneider UMAS engineering traffic (function code 90), and Read Device Identification (MEI).
+- BACnet/IP — Who-Is/I-Am, WriteProperty requests, BBMD/forwarded NPDU.
+- DNP3 — Direct Operate, Freeze, Disable Spontaneous, Cold/Warm Restart, broadcast (link-layer destination 0xFFFD–0xFFFF), no-Secure-Authentication (no SA function codes 32/33/131 seen).
+- IEC 61850 / GOOSE / MMS — control operations, GOOSE state-number anomalies, MMS without TLS. Requires the MMS dissector, so S7comm on TCP/102 is not mistaken for MMS.
+- IEC 60870-5-104 — cleartext sessions per server, control ASDUs, general interrogation (INFO).
+- MQTT — CONNECT without a username, cleartext MQTT per broker, readable MQTT on 8883 (the TLS port), control-keyword topics, wildcard SUBSCRIBE, retained control messages, rapid reconnects per client ID.
+- OPC-UA — SecureChannels using SecurityPolicy None or Sign-only mode, Browse enumeration, Write requests.
+- EtherNet/IP / CIP — List Identity (device discovery), Forward Open, write services, reset, logic transfer, PCCC.
+- Siemens S7 / PROFINET — PLC Stop/Start, Write Variable, block download/upload, Read SZL, DCP Identify All / Set.
+- Omron FINS (TCP/UDP 9600), GE SRTP (TCP 18245), Mitsubishi MELSEC SLMP (TCP 5007) — presence (cleartext, no authentication) and write/control requests.
+- AVEVA / OSIsoft PI (TCP 5450 / 5457) — historian traffic presence.
+- Ignition Gateway (TCP 62541 / 8060) — presence; gateway-network traffic without TLS.
+- Node-RED (TCP 1880) — admin API reachable without authentication (requests to `/flows`, `/nodes`, `/settings`… with no Authorization header and no 401 reply), flow deployment events.
 - Zigbee / IEEE 802.15.4 — wireless presence, unencrypted frames (no zbee_nwk security header), ZCL write/control commands.
 - CoAP (UDP 5683/5684) — cleartext CoAP presence (5683), DTLS-protected traffic (5684), PUT/POST/DELETE write operations.
 - Z-Wave — wireless presence detection.
-- Physical Security — RTSP/ONVIF cleartext, ONVIF discovery storms.
+- Physical Security — RTSP streams served without an authentication challenge (per camera), OSDP without Secure Channel.
 - Audio/Video streaming — signaled RTP flows classified audio vs. video (payload type + bitrate), SIP/VoIP call signaling, active RTSP stream requests, MPEG-TS distribution (IPTV/CCTV multicast), RTMP, sustained multicast UDP, unsignaled media-like UDP heuristic, GigE Vision machine-vision cameras, CCTV DVR/NVR vendor ports (Hikvision 8000 / Dahua 37777).
-- Beaconing / C2 — low-jitter periodic flows.
-- DNS anomalies — DGA-like NXDOMAIN bursts, long names, large TXT, multi-resolver.
-- SNMP — walks, SETs, plaintext communities.
-- TLS inspection — old versions (SSLv2/3, TLS 1.0/1.1), weak ciphers (RC4/3DES/DES/NULL/MD5/EXPORT), self-signed, expired.
-- NTP / capture integrity — large inter-packet gaps, no-NTP, multi-resolver NTP.
-- IT noise on OT — mDNS / LLMNR / NBNS / SSDP from OT subnets.
+- Beaconing / C2 — low-jitter periodic client → server exchanges (mean interval 5 s – 1 day). OT protocol ports, DNS, NTP, SNMP, syslog, discovery protocols, multicast, and broadcast are excluded. MEDIUM for internal destinations, HIGH for public ones.
+- DNS anomalies — DGA-like NXDOMAIN bursts, long names, high-entropy names, large TXT, multi-resolver.
+- SNMP — walks (≥50 GetNext/GetBulk), SETs, SNMPv1/v2c community strings.
+- TLS inspection — version and cipher suite the server selected in its ServerHello (SSLv2/3, TLS 1.0/1.1; NULL, anonymous, EXPORT, RC4, DES/3DES, MD5 suites, named from Wireshark's cipher table), certificates rejected by the peer (unknown CA / bad certificate alerts), expired certificates (certificate_expired alerts), and JA3 fingerprints of known offensive tools.
+- NTP / capture integrity — large inter-packet gaps, very short captures, no NTP at all (only reported for captures of 30 minutes or longer), hosts querying many NTP servers.
+- IT noise on OT — mDNS / LLMNR / NetBIOS / SSDP / WS-Discovery from subnets that hold OT devices.
 - DHCP rogue server detection.
 - ICMP sweep / unreachable burst.
-- TCP RST / SYN-no-ACK storm counters.
+- TCP RST bursts and repeated unanswered SYNs (SYN-ACK counts separate answered from unanswered).
 - ARP — gratuitous-burst, multi-IP-per-MAC, multi-MAC-per-IP, eth/ARP MAC mismatch, unsolicited replies.
 
 ### 6.3 Phase 3 — Per-Category Passes
 
 Phase 2 covers the majority of detection. Three checks need their own pass: Cleartext / Legacy / Credential extraction (PAYLOAD fields are expensive), Artifact extraction (model names / firmware / project files), and Network Hygiene + Intrusion / Unknown (consume already-built session state, no tshark re-read).
 
+- **Cleartext / legacy** inventories legacy services by the port the server answered on, extracts credentials (FTP, Telnet logins reassembled across packets, HTTP Basic, HTTP form posts, SNMPv1/v2c communities, MQTT, POP3/IMAP), and reports authentication-failure bursts from the server's replies (FTP 530, HTTP 401, Telnet login failures).
+- **Unknown traffic** reports unclassified service ports on OT-adjacent devices; dynamic-range ports (≥49152) are never treated as services.
+
 ### 6.4 Phase 4 — Correlations
 
-- Recon-then-write — reconnaissance tags + write tags on the same source IP → CORRELATION finding.
+- Recon-then-write — strong reconnaissance and write/control commands from the same source IP → CORRELATION finding. Only scans, sweeps, SNMP walks, and scanner tooling count as reconnaissance; routine discovery that engineering tools perform (IEC 104 general interrogation, CIP List Identity, S7 Read SZL, Modbus Read Device ID, OPC UA browsing, PROFINET Identify All) is tagged *discovery* and does not trigger it.
+- Possible OT protocol scanning — one source touching ≥3 OT protocol ports on ≥5 endpoints, at least half of them with ≤4 packets (broad and shallow, unlike a SCADA master's long-lived sessions) → INTRUSION.
+- Write/control commands sent to many devices — one source writing to at least `write_burst_count` devices (known HMIs exempt) → HIGH.
 - ARP-based Adversary-in-the-Middle — multi-MAC-per-IP + eth/ARP mismatch on the same IP, escalates to INTRUSION when subsequent OT writes are seen in the same subnet.
-- Combined-signal anomalies — anonymous MQTT + control-keyword topic, lateral movement + write protocol, etc. (~20 patterns).
+- Anonymous MQTT plus control topics from the same source → CRITICAL.
 
 ### 6.5 Phase 5 — Risk Scoring
 
+Findings are grouped by category and title. Each group contributes the weights of its three most severe findings, so a detector that fires once per host cannot dominate the score:
+
 ```text
-Score = (CRITICAL × 10) + (HIGH × 5) + (MEDIUM × 2) + (LOW × 1)
-      + (CORRELATION × 15) + (INTRUSION × 20)
+Weights:  INTRUSION 20 · CORRELATION 15 · CRITICAL 10 · HIGH 5 · MEDIUM 2 · LOW 1
+Score  =  Σ over distinct (category, title)  of  the weights of its 3 heaviest findings
 ```
+
+INFO findings, Suggested Controls, and Assessor Notes score zero.
 
 | Score Range | Risk Band |
 | --- | --- |
-| 0 – 15 | LOW RISK |
-| 16 – 40 | MODERATE RISK |
-| 41 – 80 | HIGH RISK |
-| 81 – 150 | CRITICAL RISK |
-| 151+ | SEVERE / ACTIVE COMPROMISE SUSPECTED |
+| 0 – 9 | MINIMAL |
+| 10 – 34 | LOW |
+| 35 – 74 | MODERATE |
+| 75 – 119 | HIGH |
+| 120+ | SEVERE |
 
 ---
 
 ## 7. Reports and Artifacts
 
-OTscope writes up to six artifacts alongside any session, named with the site slug + date:
+OTscope writes up to six report artifacts alongside the session file, named with the site slug + date:
 
 | Artifact | Filename Pattern / Purpose |
 | --- | --- |
 | Word report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.docx` — the human-readable deliverable. |
 | JSON report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.json` — machine-readable findings + devices + risk for SIEM/ticketing. |
 | Device Inventory CSV | `OT_Device_Inventory_<site>_<YYYYMMDD>.csv` — full device list with per-device traffic, role, vendor, OS, VLAN, source pcaps, `is_critical_in_findings` flag. |
-| Flow Allowlist CSV | `OT_Flow_Allowlist_<site>_<YYYYMMDD>.csv` — observed (src, dst, dport, proto) tuples sorted by frequency, with a default ALLOW action column for asset-owner review. |
+| Flow Allowlist CSV | `OT_Flow_Allowlist_<site>_<YYYYMMDD>.csv` — observed (client, server, service port, protocol) tuples sorted by frequency, with a default ALLOW action column for asset-owner review. |
 | Purdue Summary SVG | `OTscope_Purdue_Summary_<site>_<YYYYMMDD>.svg` — visual layered diagram (always written). |
 | Purdue Detail SVG | `OTscope_Purdue_Detail_<site>_<YYYYMMDD>.svg` — per-device visual diagram (only for ≤50 devices). |
 
@@ -325,29 +338,31 @@ The Word report is designed as an **auditor workpaper** for IT-oriented cybersec
 
 **Sections:**
 
-1. **Cover Page** — Site, Assessor, Session name, generated date/time, OTscope version.
-2. **Document Purpose and Scope** — what this report is, what pcap files it covers, what it does not cover.
-3. **How to Use This Report** — reading order guidance, cross-reference map (Word → JSON → CSVs), `--technical-appendix` note.
-4. **Executive Summary** — overall risk band, finding counts by severity, key narrative observations, top affected hosts, recommended immediate actions.
-5. **Network Interpretation Summary** — narrative paragraphs describing the observed network architecture and behavior in plain language for audit readers.
-6. **Risk Summary** — color-coded table (Severity · Count · Score Contribution); each row shaded in its severity color.
-7. **Findings** (grouped by category, severity-sorted within each category). Each finding includes:
+1. **Cover Page** — site, assessor, session name, generation time, risk score, and tool credit.
+2. **Table of Contents** — right-click → *Update Field* after opening to populate it.
+3. **Executive Summary** — risk score and band, finding breakdown by severity, top affected assets, the primary concern, attack-chain indicators, immediate next steps, and the companion artifacts.
+4. **Environment Discovery and Context** — the questionnaire answers the analysis used.
+5. **Priority Findings** — every category that produced a scoring finding, ordered by its top severity. HIGH and above (plus the first finding of each category) get full detail:
    - Auto-sequential finding ID (e.g. `MODBUS-001`, `DNP3-002`) for cross-referencing
-   - Severity and category
+   - Affected assets, inferred OT roles, category, MITRE ATT&CK for ICS techniques, advisory and standards references
    - **Detection confidence** (High / Medium / Low) — how certain OTscope is that this event was correctly detected
    - **Maliciousness confidence** (High / Medium / Low, with "may be authorized maintenance" qualifier where applicable) — how likely the activity represents a threat vs. legitimate operation
-   - **OT Significance** — one-paragraph explanation of why this matters specifically in an OT/ICS context, written for IT audit readers
-   - Description and evidence summary
-   - **Auditor Action** — 3–5 specific verification and follow-up steps
-   - **Benign Explanation** — one sentence describing the most likely legitimate cause, for auditors to ask the asset owner about
-   - Compact metadata: affected endpoints, source pcaps, MITRE IDs, advisory references, Wireshark pointer
-8. **Timeline / Attack-Chain Summary** — chronological table of MEDIUM+ findings (capped at 80), highlighting correlated attack sequences.
-9. **MITRE ATT&CK for ICS Coverage** — table of technique IDs and names observed across all findings.
-10. **Top Riskiest Devices** — top 15 devices by severity-weighted score.
-11. **Device Inventory** — top 200 devices by traffic volume; full list in the Device Inventory CSV.
-12. **Appendix A: Wireshark Investigation Guide** — per-category filter recipes and investigation steps (see §8).
+   - **What Was Observed**, **OT Significance** (why it matters in an OT/ICS context, written for IT audit readers), and **Key Evidence**
+   - **Auditor Guidance** — 3–5 specific verification and follow-up steps
+   - **What Would Make This Benign** and **Recommended Action**
+   - Pointers to the JSON finding, Appendix A, and (when included) Appendix B
 
-**Appendix B (optional — `--technical-appendix`):** Raw evidence lines and per-pcap breakdown for each finding category. Not included by default to keep the document readable for non-technical reviewers. Pass `--technical-appendix` on the command line to include it. The same detail is always available in the JSON export.
+   Lower-severity findings get a compact summary: assets, MITRE IDs, description, evidence, and action.
+6. **Suggested Controls** — defensive measures suggested by what the capture contained (for example, IDS signatures for exposed credentials). Recommendations, not findings; not scored.
+7. **Assessor Notes** — free-text notes recorded during the session.
+8. **Network Interpretation Summary** — plain-language paragraphs describing the observed architecture: likely initiators and controllers, IT discovery protocols on OT subnets, services on dynamic ports.
+9. **MITRE ATT&CK for ICS Coverage** — technique IDs (hyperlinked to attack.mitre.org), names, and finding counts.
+10. **Device Inventory Summary** — top 15 devices by traffic with role, zone, protocols, and risk score; the full list is in the Device Inventory CSV.
+11. **Flow Allowlist Summary** — how to use the Flow Allowlist CSV for segmentation review.
+12. **Limitations of Analysis** — disclosures to carry into a formal audit.
+13. **Appendix A: Wireshark Investigation Guide** — the investigation guides that match the reported findings, grouped by category (see §8).
+
+**Appendix B (optional — `--technical-appendix`):** B.1 Timeline / Attack Chain (chronological MEDIUM+ findings), B.2 Full Evidence by Finding, B.3 Inferred Network Map, B.4 Top Riskiest Devices (top 15 by severity-weighted score), B.5 Full Device Inventory (top 200 by traffic). Not included by default to keep the document readable for non-technical reviewers. Pass `--technical-appendix` on the command line to include it. The same detail is always available in the JSON export.
 
 All tables use a consistent dark-blue header row (white bold text, full grid borders). Right-click the Table of Contents and select *Update Field* after opening the document to populate page numbers.
 
@@ -370,7 +385,7 @@ OTscope writes one or two visual Purdue-Model architecture diagrams alongside ev
 
 #### 7.3.1 Summary Diagram (always written)
 
-One color-coded box per Purdue layer with device count, top protocols, and severity tally. Inter-layer arrows scaled by packet volume. Readable at any network size — even on flood-scale captures with millions of devices, this aggregated view stays legible.
+One color-coded box per Purdue layer with its device count and top protocols, stacked in Purdue order. Readable at any network size — even on flood-scale captures with millions of devices, this aggregated view stays legible.
 
 - External / Public
 - Purdue L4/L5 — IT / Corporate
@@ -384,7 +399,7 @@ Empty layers are skipped automatically.
 
 #### 7.3.2 Detail Diagram (only for ≤50 devices)
 
-Same Purdue stack, but each device is its own labeled box (IP + role + vendor). Top 30 inter-device flows drawn as bezier curves. CRITICAL/INTRUSION-touched devices and flows are highlighted red so they pop out of the diagram.
+Same Purdue stack, but each device is its own labeled box (IP, inferred role, primary protocol), colored by the most severe finding that touches it; CRITICAL/INTRUSION devices get a heavy red border. A panel on the right lists the top connections (client → server, protocol:port, packet count, and the Purdue layers at each end).
 
 Above 50 devices the Detail diagram is automatically skipped with a log message — drawing every device on a flood-scale capture would produce an unreadable spaghetti picture. The Summary diagram and the Device Inventory CSV cover that case.
 
@@ -432,7 +447,7 @@ frame.time_epoch == 1745801234.567
 
 ### 8.2 Session-Aggregated Findings — Observation Window
 
-Findings built from session-level state (ARP spoof, multi-subnet, public-IP, VLAN crossings) include an "Observation window" evidence line with two epochs to bracket the activity:
+Findings built from session-level state (ARP spoof, public-IP, VLAN crossings) include an "Observation window" evidence line with two epochs to bracket the activity:
 
 ```text
 Observation window: first seen @1745801234.567890, last seen @1745801999.123456
@@ -442,7 +457,7 @@ Observation window: first seen @1745801234.567890, last seen @1745801999.123456
 
 ### 8.3 Appendix A — Per-Category Guides
 
-Each category that fired at least one finding gets a guide entry in Appendix A of the Word report, with a recommended display filter and 4-5 concrete steps (column suggestions, Follow Stream targets, Statistics menu paths). Categories covered include ARP/MITM, Modbus, DNP3, BACnet, IEC 104 / IEC 61850 / GOOSE / MMS, OPC-UA, EtherNet/IP/CIP, Siemens S7, PROFINET, cleartext/legacy/credentials, TLS weakness, beaconing/C2, DNS anomalies, SNMP, ARP/RST/SYN/ICMP scans, mDNS/LLMNR/NBNS/SSDP, DHCP rogue, suspicious UA / EOL banners, auth-failure bursts, public IP exposure, baseline drift, audio/video streaming (RTP/SIP/RTSP/MPEG-TS), and capture-integrity / no-NTP.
+Each category that fired at least one finding gets the guides matching its findings in Appendix A of the Word report — a category with several finding types can show several guides — each with a display filter and 3-5 concrete steps (column suggestions, Follow Stream targets, Statistics menu paths). Findings without a specific guide point to a General Investigation Steps section. Every display filter is valid tshark/Wireshark 4.x syntax (set members are comma-separated, e.g. `tcp.port in {512, 513}`); a few contain `<src>`-style placeholders to fill in. Categories covered include ARP/MITM, Modbus, DNP3, BACnet, IEC 104 / IEC 61850 / GOOSE / MMS, OPC-UA, EtherNet/IP/CIP, Siemens S7, PROFINET, cleartext/legacy/credentials, TLS weakness, beaconing/C2, DNS anomalies, SNMP, ARP/RST/SYN/ICMP scans, mDNS/LLMNR/NBNS/SSDP, DHCP rogue, suspicious UA / EOL banners, auth-failure bursts, public IP exposure, baseline drift, audio/video streaming (RTP/SIP/RTSP/MPEG-TS), and capture-integrity / no-NTP.
 
 ---
 
@@ -455,7 +470,7 @@ The baseline mechanism is the highest-signal detection mechanism for OT environm
 ```bash
 $ python3 otscope.py
   ... [discovery question 'Save current run as baseline? y']
-  → captures/<site>_baseline.otpa_baseline
+  → output/<site>_baseline.otpa_baseline   (the session folder; _v2, _v3 … if one exists)
 
 # Or after the fact:
 $ python3 otscope.py --session captures/known_good.otpa_session \
@@ -500,7 +515,8 @@ After every pcap is fully processed (in both inventory and streaming passes), th
 On flood-scale captures (e.g. ping-flood or Modbus query-flood test pcaps with 1M+ spoofed source IPs), per-finding emission caps engage automatically:
 
 - Network hygiene findings cap at 200 per type (25 in fast-path mode); excess collapses to one rollup finding per type.
-- Device Inventory table caps at top 200 by traffic — full list in CSV.
+- Repeated detections merge into one finding that keeps at most 50 evidence lines and 1,000 IPs per side, with an `occurrences` count in the JSON.
+- Device Inventory Summary shows the top 15 devices; Appendix B.5 the top 200 by traffic — full list in CSV.
 - Network Map caps at 30 devices per Purdue zone (text view).
 - Purdue Detail diagram is skipped above 50 devices; Summary always renders.
 - Affected Endpoints lines cap at 30, Source Pcaps at 8 per finding.
@@ -531,7 +547,7 @@ Net result: a 1.4M-device flood capture renders as a ~50-page Word report with t
 | `<session_folder>/OTscope_Purdue_Summary_<site>_<YYYYMMDD>.svg` | Visual Purdue diagram (always). |
 | `<session_folder>/OTscope_Purdue_Detail_<site>_<YYYYMMDD>.svg` | Visual per-device diagram (≤50 devices only). |
 
-> **Field deployment note:** When running from the standard field layout, `pcaps\` is the default pcap drop folder and `output\` is the default session folder — both are siblings of `otscope.py` and are auto-created on first run, along with `requirements.txt` and `README_FIRST.txt` (see §2.1). Loose capture files next to `otscope.py` are moved into `pcaps\` at startup. Existing files are never overwritten.
+> **Field deployment note:** `<session_folder>` is `output\` next to `otscope.py` (or the pcap folder if `output\` cannot be written). When running from the standard field layout, `pcaps\` is the default pcap drop folder and `output\` is the default session folder — both are siblings of `otscope.py` and are auto-created on first run, along with `requirements.txt` and `README_FIRST.txt` (see §2.1). Loose capture files next to `otscope.py` are moved into `pcaps\` at startup. Existing files are never overwritten.
 
 ---
 
@@ -540,10 +556,10 @@ Net result: a 1.4M-device flood capture renders as a ~50-page Word report with t
 When the Word report opens, work top-down for fastest triage:
 
 1. Open the Purdue Summary SVG first — visual confirmation of which Purdue layers have findings, before reading any text.
-2. Executive Summary on page 2 — read the Key Attack Chain Narratives bullets first. If any ⚠ ACTIVE ATTACK CHAIN line appears, that is the headline finding.
-3. Top Riskiest Devices — these are the IPs that show up across the most severity-weighted findings.
-4. Findings → INTRUSION-class items first (deep red), then CRITICAL (dark red), then CORRELATION (dark blue), then HIGH.
-5. Timeline / Attack Chain — confirm the sequence: was there reconnaissance before the writes? Did beaconing precede a control action?
+2. Executive Summary on page 2 — read the Attack Chain Indicators first. If any ⚠ line appears, that is the headline finding.
+3. Riskiest devices — the console prints the top 5 at the end of the run, the Device Inventory Summary carries a risk score per device, and Appendix B.4 (with `--technical-appendix`) lists the top 15.
+4. Priority Findings → INTRUSION-class items first (deep red), then CRITICAL (dark red), then CORRELATION (dark blue), then HIGH.
+5. Timeline / Attack Chain (Appendix B.1, with `--technical-appendix`) — confirm the sequence: was there reconnaissance before the writes? Did beaconing precede a control action?
 6. Use Appendix A guides + the `@<epoch>` tags in the evidence to drop into Wireshark on any finding that needs deeper confirmation.
 7. Hand the Device Inventory CSV and Flow Allowlist CSV to the asset owner for segmentation-policy review.
 
@@ -554,7 +570,9 @@ When the Word report opens, work top-down for fastest triage:
 - Single-threaded tshark per file. Parallel reads are deferred until profiling justifies the refactor risk.
 - Some payload-level CIP services (symbolic-name extraction for service `0x4e`, multi-service-packet frame counts) are not parsed. Use Wireshark for those forensic drills.
 - Baseline behavior is not auto-learned — you must capture a known-good run with `--save-baseline`.
-- OUI table (~140 entries) covers major industrial + IT vendors but is not the full IEEE registry.
+- Vendor names come from Wireshark's manufacturer database (`tshark -G manuf`, read offline, including /28 and /36 assignments). If that lookup fails, a small built-in table of industrial and IT vendors is the fallback.
+- Flow direction comes from the TCP handshake. For connections already open when the capture started (and for UDP), OTscope uses well-known service ports; when neither port is recognized the lower port is taken as the service.
+- Replay detection compares Modbus transaction IDs. A verbatim copy of an old frame (same TCP sequence number) is indistinguishable from a TCP retransmission and is not counted, and responses whose requests the capture dropped can look unsolicited.
 - Passive OS fingerprinting is heuristic (TCP SYN TTL + window) — accurate for Windows / Linux / BSD / IoT-class but not deterministic.
 - Public-IP RDAP/PTR enrichment is best-effort and skipped entirely under `--offline`. Reports under offline mode omit the "owner / network / country" fields on public IP findings.
 - Purdue Detail SVG is only emitted for ≤50 devices. Above that threshold the Summary SVG plus the Device Inventory CSV cover the picture.
@@ -566,6 +584,28 @@ When the Word report opens, work top-down for fastest triage:
 ## 14. Version History
 
 Running log of capabilities added in each release. Newest at the top.
+
+### Version 2.8.0 · October 2026
+
+Detection-accuracy release. Most changes remove false positives on normal OT traffic and make detectors fire on the traffic they describe; a stdlib-only regression suite now guards the behavior.
+
+- **Client/server flow orientation** — every flow is oriented from the TCP handshake (or well-known service ports when the handshake wasn't captured) and recorded once as client → server : service port. Ephemeral ports no longer appear as device ports, "unknown traffic", legacy services, or Flow Allowlist rows; a device's `ports` are the services it answered on, and the new `client_ports` lists the services it used. Write and control detectors fire only on requests, never on the device's echo.
+- **Structured fields instead of Info-column parsing** — TLS version and cipher (from the ServerHello, named via Wireshark's cipher table), TLS alerts, SNMP community and PDU type, MQTT flags/topic/client ID, Modbus function code / transaction ID / unit ID / exception, DNP3 destination and function code, BACnet PDU type, OPC UA security policy and mode, RTSP and HTTP status codes, and HTTP Authorization headers are read as tshark fields. Detectors for weak TLS, SNMP communities, anonymous MQTT, Telnet logins, and HTTP Basic credentials now work (several never fired before). Fields an older tshark lacks read as empty.
+- **Fixed tshark filter syntax** — the Cleartext/Legacy check and several Appendix A guide filters used space-separated sets (`{21 23}`), which tshark 4.x rejects; that check had silently produced no findings. All filters are now validated against tshark.
+- **Modbus** — register scanning now means many start addresses each read once or twice (an HMI's repeated scan list no longer qualifies); replay detection replaced by duplicate/unsolicited responses matched by transaction ID with TCP retransmissions excluded; polling bursts measured as one-second request rates; hammer polling requires ≥20 reads/s; Unit ID 0 broadcast writes; register value anomaly now actually collects values (it never fired before).
+- **Schneider UMAS** is detected as Modbus function code 90 (TCP 502) instead of TCP 1024; **AVEVA PI** uses TCP 5450/5457 instead of 9001; **Ignition** uses TCP 62541/8060 instead of 4592.
+- **Fewer false positives** — routine discovery (IEC 104 general interrogation, CIP List Identity, S7 Read SZL, Modbus Read Device ID, OPC UA browsing, PROFINET Identify All) no longer counts as reconnaissance for the recon-then-write correlation; "OT protocol scanning" requires broad, shallow probing instead of any multi-protocol master; the lateral-movement and multi-subnet checks were removed; beaconing ignores OT polling, DNS, NTP, SNMP, syslog, discovery, multicast, and broadcast, collapses each exchange into one sample, and rates internal beacons MEDIUM; refused connections and ICMP errors no longer count as protocol traffic; DNS/ICMP/IPv6 hygiene findings are aggregated; "No NTP" needs a capture of at least 30 minutes; S7comm on TCP/102 is no longer reported as IEC 61850 MMS; WS-Discovery is treated as IT noise rather than ONVIF.
+- **New and reworked findings** — OPC UA SecurityPolicy None / Sign-only per SecureChannel; cleartext MQTT per broker and readable MQTT on 8883; MQTT reconnects per client ID; Node-RED editor reachable without authentication (admin API with no Authorization header and no 401); RTSP streams served without an authentication challenge (per camera); TLS certificates rejected by the peer; authentication-failure bursts read from server replies (FTP 530, HTTP 401, Telnet failures); "Write/control commands sent to many devices"; "Repeated unanswered SYNs".
+- **Risk score** — each distinct finding title contributes its three heaviest findings; INFO findings, Suggested Controls, and Assessor Notes do not score. Bands are unchanged.
+- **Word report** — every scoring category is reported (A/V Streaming, IEC 60870-5-104, and Network Hygiene and Segmentation findings were previously left out); new Suggested Controls and Assessor Notes sections; Appendix A lists every guide matching a category's findings instead of overwriting one guide with another or with the generic steps.
+- **Purdue SVGs** — site names and labels are XML-escaped, so names containing `&` or `<` no longer produce invalid SVG files.
+- **Truncated captures** — captures that end mid-packet are analyzed up to the damage and flagged `truncated` instead of being dropped from the inventory.
+- **Vendor lookup** — OUI vendors come from Wireshark's manufacturer database (`tshark -G manuf`, offline, including /28 and /36 blocks); 42 incorrect entries were removed from the built-in fallback table and seven relabeled.
+- **References** — MITRE ATT&CK for ICS mappings corrected (e.g. discovery → T0846, cleartext → T0842, GOOSE spoofing → T0856) and the advisory map rewritten to cite verifiable standards (IEC 62351, IEEE 1815, ODVA CIP Security, RFC 8996, NIST SP 800-82r3 and others), CISA advisories, and vendor PSIRTs.
+- **Inputs and outputs** — `.cap` and gzip-compressed captures (`.pcap.gz`, `.pcapng.gz`, `.cap.gz`) are accepted everywhere; `--scan` of the `pcaps\` drop folder names the site after the workspace folder; repeated merges of one finding are bounded (50 evidence lines, 1,000 IPs per side) with an `occurrences` counter; the packet-dedup fingerprint now includes MACs, ports, and IP ID so distinct frames in the same millisecond are kept.
+- **Dependencies** — `scapy` removed (it was never used); `python-docx` is the only Python package. Stale generated `requirements.txt` / `README_FIRST.txt` files in a workspace are refreshed.
+- **Regression suite** — `tests/` holds a pure-stdlib pcap generator and thirteen scenarios (benign HMI polling, SCADA master, office LAN, dual-zone HMI, credential brute force, Modbus recon and injection, ARP MITM, camera/VoIP, S7 engineering, same-millisecond ARP, Modbus register spike, truncated capture, and a DNP3 sample capture when `otscope/pcaps/dnp3_challenge.pcap` is present). Run `python tests/run_regression.py`.
+- **Release package** — `build_release.py` now includes `LICENSE.txt` and builds on Python versions before 3.11.
 
 ### Version 2.7.0 · July 2026
 

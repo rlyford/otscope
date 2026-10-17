@@ -6,6 +6,10 @@ __pycache__/
 # Capture files — never commit pcap data
 *.pcap
 *.pcapng
+*.cap
+*.pcap.gz
+*.pcapng.gz
+*.cap.gz
 
 # Dev-repo legacy output/pcaps dirs (parent of src/)
 otscope/output/

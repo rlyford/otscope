@@ -17,7 +17,7 @@ It is designed for the case where you receive a pile of pcap files from a site y
 | | |
 |---|---|
 | **Scope** | Vulnerability detection AND active-intrusion detection. Both run on every analysis. |
-| **Input** | Multiple `.pcap` / `.pcapng` files merged into one unified session. Incremental — add new files later without re-analyzing the old ones. |
+| **Input** | Multiple `.pcap` / `.pcapng` / `.cap` files (gzip-compressed is fine) merged into one unified session. Incremental — add new files later without re-analyzing the old ones. |
 | **Output** | Word report, JSON report, two CSVs, and Purdue-Model SVG diagrams. |
 | **Safety** | `--offline` hard-lock means the tool never leaks DNS / HTTPS for unknown-source pcaps. tshark always invoked with `-n`. |
 | **Performance** | Single combined tshark pass per file across all protocol checks (N protocols × M files becomes 1 × M). Calibrated per-step ETAs. Atomic session checkpointing — resume from any boundary. |
@@ -28,7 +28,7 @@ It is designed for the case where you receive a pile of pcap files from a site y
 
 ## Quick Start
 
-> **Field deployment:** `otscope.py` is fully self-provisioning — drop the single file (plus your capture files) into any folder and run it. It creates `pcaps\`, `output\`, `requirements.txt`, and a `README_FIRST.txt` quick-start on first run, and moves any loose `.pcap` / `.pcapng` files sitting next to the script into `pcaps\` automatically.
+> **Field deployment:** `otscope.py` is fully self-provisioning — drop the single file (plus your capture files) into any folder and run it. It creates `pcaps\`, `output\`, `requirements.txt`, and a `README_FIRST.txt` quick-start on first run, and moves any loose capture files sitting next to the script into `pcaps\` automatically.
 
 ```bash
 # Install Python dependencies (all platforms)
@@ -58,10 +58,10 @@ python3 otscope.py
 python3 otscope.py --pcap /path/to/capture.pcap
 
 # Resume a saved session
-python3 otscope.py --session captures/<site>.otpa_session
+python3 otscope.py --session output/<site>_<YYYYMMDD>.otpa_session
 
 # Generate a report from an existing session, no re-analysis
-python3 otscope.py --report-only captures/<site>.otpa_session
+python3 otscope.py --report-only output/<site>_<YYYYMMDD>.otpa_session
 
 # Hard-lock outbound network (recommended for unknown-source pcaps)
 python3 otscope.py --offline
@@ -73,44 +73,44 @@ On startup in interactive mode, OTscope prints a banner, the network-safety stat
 
 ## Detection Coverage
 
-OT/ICS protocols, attack patterns, and hygiene anomalies are detected in a single combined streaming pass.
+OT/ICS protocols, attack patterns, and hygiene anomalies are detected in a single combined streaming pass. Every flow is oriented client → server from the TCP handshake (or well-known service ports), detectors read structured tshark fields rather than the Info column, and write/control detectors fire only on requests.
 
 ### OT/ICS Protocols
 
-- **Modbus TCP** — writes, register scanning, exception bursts, polling-burst timing anomalies, Unit ID 0, identical-response replay timing, single-register repetitive polling, **register value anomaly** (sudden large jumps indicating spoofed/injected responses).
-- **DNP3** — Direct Operate, Freeze, Disable Spontaneous, Cold/Warm Restart, broadcast, traffic without Secure Authentication.
+- **Modbus TCP** — write requests by function code, Unit ID 0 broadcast writes, register-map sweeps, exception bursts, polling-burst anomalies, hammer-rate polling, **duplicate or unsolicited responses** (replay/injection, matched by transaction ID), **register value anomaly** (sudden large jumps indicating spoofed/injected values), Read Device ID.
+- **DNP3** — Direct Operate, Freeze, Disable Spontaneous, Cold/Warm Restart, broadcast addresses, traffic without Secure Authentication.
 - **BACnet/IP** — WriteProperty, BBMD/forwarded NPDU, broadcast storms.
 - **IEC 61850 / GOOSE / MMS** — control operations, GOOSE state-number anomalies, MMS without TLS.
-- **IEC 60870-5-104** — cleartext substation control.
-- **MQTT** — anonymous CONNECT, control-keyword topics, wildcard SUBSCRIBE, retained-control messages.
-- **OPC-UA** — SecurityMode None, Browse/Read enumeration, Write service calls.
-- **EtherNet/IP / CIP** — write services, reset, PCCC, Write Tag Fragmented.
-- **Siemens S7 / PROFINET** — PLC Stop/Start, Write Variable, block download/upload, DCP-Set.
+- **IEC 60870-5-104** — cleartext sessions, control ASDUs, general interrogation.
+- **MQTT** — CONNECT without credentials, cleartext brokers, readable traffic on 8883, control-keyword topics, wildcard SUBSCRIBE, retained-control messages, reconnect loops per client ID.
+- **OPC-UA** — SecureChannels with SecurityPolicy None or Sign-only mode, Browse enumeration, Write requests.
+- **EtherNet/IP / CIP** — List Identity discovery, Forward Open, write services, reset, logic transfer, PCCC.
+- **Siemens S7 / PROFINET** — PLC Stop/Start, Write Variable, block download/upload, Read SZL, DCP Identify All / Set.
 - **Omron FINS (TCP/UDP 9600)** — presence, cleartext/no-auth, write/control command indicators.
 - **GE SRTP (TCP 18245)** — presence, cleartext/no-auth, write indicators (GE PACSystems RX3i / 90-30).
-- **Schneider UMAS (TCP 1024)** — presence, cleartext/no-auth, write/stop/download indicators (Modicon M340/Premium).
+- **Schneider UMAS (Modbus function code 90)** — engineering sessions to Modicon M340/M580/Premium/Quantum PLCs.
 - **Mitsubishi MELSEC SLMP (TCP 5007)** — presence, cleartext/no-auth, remote run/stop/write indicators.
-- **OSIsoft PI Server (TCP 9001)** — historian traffic presence, potential data exfiltration.
-- **Ignition Gateway (TCP 4592)** — OPC-UA without TLS indicators.
-- **Node-RED (TCP 1880)** — unauthenticated dashboard access and flow deployment events.
-- **Physical Security** — RTSP/ONVIF cleartext, ONVIF discovery storms.
+- **AVEVA / OSIsoft PI (TCP 5450 / 5457)** — historian traffic presence.
+- **Ignition Gateway (TCP 62541 / 8060)** — presence, gateway-network traffic without TLS.
+- **Node-RED (TCP 1880)** — editor/admin API reachable without authentication, flow deployment events.
+- **Physical Security** — RTSP streams served without an authentication challenge, OSDP without Secure Channel.
 - **IoT wireless** — Zigbee / IEEE 802.15.4 (presence, unencrypted frames, ZCL write/control), CoAP (cleartext presence, DTLS, PUT/POST/DELETE writes), Z-Wave (presence).
 - **Audio/Video streaming** — RTP flows classified audio vs. video (payload type + bitrate), SIP/VoIP call signaling, active RTSP stream requests, MPEG-TS distribution (IPTV/CCTV multicast), RTMP, sustained multicast UDP, unsignaled media-like UDP heuristic, GigE Vision machine-vision cameras (UDP 3956), CCTV DVR/NVR vendor ports (Hikvision 8000 / Dahua 37777).
 
 ### Attack and Anomaly Patterns
 
 - **Adversary-in-the-Middle (ARP MITM)** — multi-MAC-per-IP, eth/ARP MAC mismatch, gratuitous-ARP burst. Combined-signal MITM correlation escalates to INTRUSION when subsequent OT writes appear in the same subnet.
-- **Beaconing / C2** — low-jitter periodic flows.
-- **DNS abuse** — DGA-like NXDOMAIN bursts, long names, large TXT, multi-resolver.
-- **TLS weakness** — SSLv2/3, TLS 1.0/1.1, RC4/3DES/DES/NULL/MD5/EXPORT ciphers, self-signed, expired.
-- **SNMP** — walks (≥50 GETNEXT), SET ops, plaintext communities.
-- **Reconnaissance** — ICMP sweeps, port-scan unreachable bursts, register scanning, suspicious tool User-Agents (Mimikatz, Cobalt Strike, sqlmap, masscan, nmap), recon-then-write correlation.
+- **Beaconing / C2** — low-jitter periodic client → server exchanges (OT polling, DNS, NTP, SNMP, syslog, and discovery traffic excluded).
+- **DNS abuse** — DGA-like NXDOMAIN bursts, long and high-entropy names, large TXT, multi-resolver.
+- **TLS weakness** — the version and cipher suite each server actually selected (SSLv2/3, TLS 1.0/1.1; NULL/anon/EXPORT/RC4/DES/3DES/MD5 suites), certificates rejected by the peer, expired certificates, JA3 fingerprints of known offensive tools.
+- **SNMP** — walks (≥50 GetNext/GetBulk), SET ops, SNMPv1/v2c community strings.
+- **Reconnaissance** — broad-and-shallow OT port scans, ICMP sweeps, port-scan unreachable bursts, register-map sweeps, SNMP walks, suspicious tool User-Agents (Mimikatz, Cobalt Strike, sqlmap, masscan, nmap), recon-then-write correlation. Routine engineering discovery (IEC 104 interrogation, CIP List Identity, S7 Read SZL) is reported but not treated as reconnaissance.
 - **Suppression attacks** — DNP3 disable-spontaneous, cold/warm restart, alarm silencing.
-- **Brute-force** — auth-failure bursts on FTP/Telnet/SSH/HTTP.
+- **Brute-force** — authentication-failure bursts read from server replies (FTP 530, HTTP 401, Telnet login failures).
 - **Boundary violations** — IT/OT crossings, dual-zone bridging, public-IP exposure of OT devices.
-- **IT-noise on OT segments** — mDNS, LLMNR, NBNS, SSDP from OT subnets.
+- **IT-noise on OT segments** — mDNS, LLMNR, NetBIOS, SSDP, WS-Discovery from subnets that hold OT devices.
 - **DHCP rogue server** detection.
-- **Capture integrity** — large inter-packet gaps, no-NTP networks, multi-resolver NTP.
+- **Capture integrity** — large inter-packet gaps, no-NTP networks, multi-resolver NTP, truncated captures (analyzed and flagged).
 - **EOL services** — IIS 5/6, Apache 1.x/2.0, OpenSSL 0.x, Boa, GoAhead, etc.
 - **Cleartext credential extraction** — FTP, Telnet, HTTP Basic, HTTP Form, SNMP, MQTT, POP3, IMAP.
 - **Baseline diff** — new device, new flow, new protocol, new port relative to a known-good snapshot.
@@ -121,16 +121,16 @@ Every finding auto-attaches MITRE ATT&CK for ICS technique IDs and CISA / NIST /
 
 ## Output Artifacts
 
-Each session writes up to six artifacts alongside the pcap files:
+Each session writes up to six artifacts to `output\` next to `otscope.py` (or the pcap folder if `output\` cannot be written):
 
 | Artifact | Filename Pattern | Purpose |
 |---|---|---|
-| Word report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.docx` | Human-readable deliverable. TOC, Executive Summary, findings grouped by category, Timeline / Attack Chain, MITRE coverage, Top Riskiest Devices, Device Inventory, Wireshark Investigation Appendix. |
+| Word report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.docx` | Human-readable deliverable. Executive Summary, Priority Findings by category, Suggested Controls, Network Interpretation, MITRE coverage, Device Inventory and Flow Allowlist summaries, Wireshark guides (Appendix A); timeline and full evidence with `--technical-appendix` (Appendix B). |
 | JSON report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.json` | SIEM / ticketing / scripting input. |
-| Device Inventory CSV | `OT_Device_Inventory_<site>_<YYYYMMDD>.csv` | Full device list (Word table is capped at top 200 by traffic). |
-| Flow Allowlist CSV | `OT_Flow_Allowlist_<site>_<YYYYMMDD>.csv` | Observed (src, dst, dport, proto) tuples for asset-owner segmentation review. |
+| Device Inventory CSV | `OT_Device_Inventory_<site>_<YYYYMMDD>.csv` | Full device list (the Word report shows the top 15 by traffic). |
+| Flow Allowlist CSV | `OT_Flow_Allowlist_<site>_<YYYYMMDD>.csv` | Observed (client, server, service port, protocol) tuples for asset-owner segmentation review. |
 | Purdue Summary SVG | `OTscope_Purdue_Summary_<site>_<YYYYMMDD>.svg` | Visual layered architecture diagram (always written; readable at any network size). |
-| Purdue Detail SVG | `OTscope_Purdue_Detail_<site>_<YYYYMMDD>.svg` | Per-device visual diagram with inter-device flow arrows (only for ≤50 devices). |
+| Purdue Detail SVG | `OTscope_Purdue_Detail_<site>_<YYYYMMDD>.svg` | Per-device visual diagram with a top-connections panel (only for ≤50 devices). |
 
 Findings include `@<epoch>` jump tags so you can paste any evidence line's timestamp into Wireshark as `frame.time_epoch == <value>` and land on the exact frame.
 
@@ -151,7 +151,7 @@ tshark is invoked with `-n` on every call, so it never resolves any IP, MAC, or 
 
 ## Documentation
 
-The complete operator manual is **[OTscope_User_Guide.md](./otscope/docs/OTscope_User_Guide.md)**. It covers:
+The complete operator manual is **[OTscope_User_Guide.md](/otscope/docs/OTscope_User_Guide.md)**. It covers:
 
 - Installation, dependencies, first-run walkthrough
 - All operating modes and CLI flags
@@ -176,34 +176,36 @@ otscope/                            # repo root
 ├── README.md                       # this file
 ├── CLAUDE.md                       # Claude Code agent guide
 ├── AGENTS.md                       # Codex agent guide
+├── build_release.py                # packages dist/OTscope_v<VERSION>.zip
 ├── .gitignore
+├── tests/                          # detection regression suite (stdlib only)
+│   ├── pcapgen.py                  # synthetic pcap writer
+│   ├── scenarios.py                # benign and attack scenarios
+│   └── run_regression.py           # runs otscope --scan on each and checks the output
 └── otscope/                        # tool directory
     ├── src/
-    │   └── otscope.py              # the tool (single-file Python program)
+    │   ├── otscope.py              # the tool (single-file Python program)
+    │   ├── README.txt              # field quick-start shipped in the release zip
+    │   ├── pcaps/                  # contents gitignored — drop captures (or site subfolders) here
+    │   └── output/                 # contents gitignored — generated artifacts land here
+    │       ├── <site>_<date>.otpa_session
+    │       ├── OT_PCAP_Analysis_*.docx / *.json
+    │       ├── OT_Device_Inventory_*.csv
+    │       ├── OT_Flow_Allowlist_*.csv
+    │       └── OTscope_Purdue_Summary_*.svg / OTscope_Purdue_Detail_*.svg
     ├── docs/
     │   └── OTscope_User_Guide.md   # complete operator manual
     ├── requirements.txt
     ├── LICENSE.txt
-    ├── README.md                   # mirrored quick-start (same as repo root)
-    ├── pcaps/                      # gitignored — put your pcap subfolders here
-    │   └── <site-name>/
-    │       └── *.pcap / *.pcapng
-    └── output/                     # gitignored — generated artifacts land here
-        ├── <session>.otpa_session
-        ├── OT_PCAP_Analysis_*.docx
-        ├── OT_PCAP_Analysis_*.json
-        ├── OT_Device_Inventory_*.csv
-        ├── OT_Flow_Allowlist_*.csv
-        ├── OTscope_Purdue_Summary_*.svg
-        └── OTscope_Purdue_Detail_*.svg
+    └── README.md                   # mirrored quick-start (same as repo root)
 ```
 
 ---
 
 ## Requirements
 
-- **Python 3.8+** — type hints, walrus operator, dataclasses, `from __future__ import annotations`.
-- **tshark 4.6.4+** — uses display-filter set-membership syntax (`tcp.port in {…}`).
+- **Python 3.8+** — tested with Python 3.14.
+- **tshark 4.6.4+** — also supplies the offline vendor (OUI) and TLS cipher-name tables.
 - **python-docx** — installed via `requirements.txt`.
 
 That's the entire dependency surface. SVG diagrams use only the standard library.
@@ -216,7 +218,7 @@ That's the entire dependency surface. SVG diagrams use only the standard library
 
 OTscope is **source-available** under a proprietary license. You may run it for OT/ICS security-assessment work within your own organization (including for paid client engagements where you are the assessor) and share the resulting reports / CSVs / SVG diagrams with your engagement clients. Public redistribution, forking, SaaS hosting, and modification for redistribution require prior written permission. Authorship attribution must be preserved in all copies.
 
-See **[LICENSE.txt](./LICENSE.txt)** for the complete terms.
+See **[LICENSE.txt](/otscope/LICENSE.txt)** for the complete terms.
 
 For commercial licensing (redistribution, hosting, OEM, white-label), contact Ryan Lyford with "OTscope licensing" in the subject line.
 
@@ -232,9 +234,16 @@ For issues, suggestions, or feature requests, open a GitHub issue with:
 - Operating system
 - Brief description, ideally with a representative pcap snippet (or anonymized excerpt) if relevant
 
-Pull requests are welcome. Please ensure new detection logic includes:
+Pull requests are welcome. Run the regression suite before submitting:
+
+```bash
+python tests/run_regression.py
+```
+
+Please ensure new detection logic includes:
 
 - A dedicated finding title that doesn't collide with existing ones.
+- A scenario in `tests/scenarios.py` with a check in `tests/run_regression.py` (benign traffic that must stay quiet, and the behavior that must fire).
 - An entry in the relevant `MITRE_ICS_MAP` and `ADVISORY_MAP` tables.
 - A Wireshark Investigation guide entry for the new finding category in `_WIRESHARK_GUIDE`.
 - An update to the Version History in `OTscope_User_Guide.md`.
