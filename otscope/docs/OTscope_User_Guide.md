@@ -4,7 +4,7 @@
 
 Interactive multi-pcap OT/ICS traffic analysis with session persistence, role inference, attack-chain correlation, MITRE ATT&CK for ICS mapping, Wireshark investigation guidance, Purdue-Model architecture diagrams, and machine-readable artifacts.
 
-> **Version 2.8.1**  ·  October 2026
+> **Version 2.8.2**  ·  October 2026
 > Authored by Ryan Lyford  ·  © 2026 Ryan Lyford. All rights reserved.
 
 ---
@@ -255,7 +255,7 @@ ONE combined tshark read per pcap with a single display filter that covers all p
 
 Detectors read structured tshark fields — function codes, transaction IDs, TLS handshake fields, SNMP community and PDU type, MQTT flags — rather than parsing the Info column. Fields an older tshark does not know are simply read as empty. Checks keyed on a port need application data: a refused connection (SYN answered by RST), a bare ACK, or an ICMP error quoting a probe does not count as that protocol's traffic. Command and write detectors only fire on requests travelling client → server, never on the device's reply.
 
-- Modbus TCP — write requests (by function code), Unit ID 0 broadcast writes, register-map sweeps (many start addresses read once or twice each), exceptions per server, polling bursts (one-second request rate far above the pair's own baseline), hammer-rate single-address polling (≥1,000 reads at ≥20/s), duplicate or unsolicited responses (answers are matched to each connection's queue of outstanding requests; segments that carry several requests, TCP retransmissions, and request bytes tshark could not decode are all accounted for), register value anomaly, writes confirmed from the server's answer when a client's requests are split into segments too small for tshark to decode, Schneider UMAS engineering traffic (function code 90), and Read Device Identification (MEI).
+- Modbus TCP — write requests (by function code), Unit ID 0 broadcast writes, register-map sweeps (many start addresses read once or twice each), exceptions per server, polling bursts (one-second request rate far above the pair's own baseline), hammer-rate single-address polling (≥1,000 reads at ≥20/s, timed within each capture file — and pooled across files, for a flood split over rotated captures — so files analyzed out of date order cannot inflate the rate), duplicate or unsolicited responses (answers are matched to each connection's queue of outstanding requests; segments that carry several requests, TCP retransmissions, and request bytes tshark could not decode are all accounted for), register value anomaly, writes confirmed from the server's answer when a client's requests are split into segments too small for tshark to decode, Schneider UMAS engineering traffic (function code 90), and Read Device Identification (MEI).
 - BACnet/IP — Who-Is/I-Am, WriteProperty requests, BBMD/forwarded NPDU.
 - DNP3 — Direct Operate, Freeze, Disable Spontaneous, Cold/Warm Restart, broadcast (link-layer destination 0xFFFD–0xFFFF), no-Secure-Authentication (no SA function codes 32/33/131 seen).
 - IEC 61850 / GOOSE / MMS — control operations, GOOSE state-number anomalies, MMS without TLS. Requires the MMS dissector, so S7comm on TCP/102 is not mistaken for MMS.
@@ -277,7 +277,7 @@ Detectors read structured tshark fields — function codes, transaction IDs, TLS
 - DNS anomalies — DGA-like NXDOMAIN bursts, long names, high-entropy names, large TXT, multi-resolver.
 - SNMP — walks (≥50 GetNext/GetBulk), SETs, SNMPv1/v2c community strings.
 - TLS inspection — version and cipher suite the server selected in its ServerHello (SSLv2/3, TLS 1.0/1.1; NULL, anonymous, EXPORT, RC4, DES/3DES, MD5 suites, named from Wireshark's cipher table), certificates rejected by the peer (unknown CA / bad certificate alerts), expired certificates (certificate_expired alerts), and JA3 fingerprints of known offensive tools.
-- NTP / capture integrity — large inter-packet gaps, very short captures, no NTP at all (only reported for captures of 30 minutes or longer), hosts querying many NTP servers.
+- NTP / capture integrity — large inter-packet gaps (with readable durations such as "3 days"), very short captures, no NTP at all (only reported when one capture file holds at least 30 minutes of continuous traffic; pauses of a minute or more do not count), hosts querying many NTP servers.
 - IT noise on OT — mDNS / LLMNR / NetBIOS / SSDP / WS-Discovery from subnets that hold OT devices.
 - DHCP rogue server detection.
 - ICMP sweep / unreachable burst.
@@ -332,7 +332,7 @@ OTscope writes up to six report artifacts alongside the session file, named with
 | Artifact | Filename Pattern / Purpose |
 | --- | --- |
 | Word report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.docx` — the human-readable deliverable. |
-| JSON report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.json` — machine-readable findings + devices + risk for SIEM/ticketing. |
+| JSON report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.json` — machine-readable findings (each with its report ID, e.g. `MODBUS-001`) + devices + risk + `remediation_plan` for SIEM/ticketing. |
 | Device Inventory CSV | `OT_Device_Inventory_<site>_<YYYYMMDD>.csv` — full device list with per-device traffic, role, vendor, OS, VLAN, source pcaps, `is_critical_in_findings` flag, plus `client_ports` (services the device used), `ipv6_link_local` (folded IPv6 addresses), and `observations` (e.g. "impersonated by MAC …", "ARP cache poisoned by …"). |
 | Flow Allowlist CSV | `OT_Flow_Allowlist_<site>_<YYYYMMDD>.csv` — observed (client, server, service port, protocol) tuples sorted by frequency, with a default ALLOW action column for asset-owner review. |
 | Purdue Summary SVG | `OTscope_Purdue_Summary_<site>_<YYYYMMDD>.svg` — visual layered diagram (always written). |
@@ -346,27 +346,35 @@ The Word report is designed as an **auditor workpaper** for IT-oriented cybersec
 
 1. **Cover Page** — site, assessor, session name, generation time, risk score, and tool credit.
 2. **Table of Contents** — right-click → *Update Field* after opening to populate it.
-3. **Executive Summary** — risk score and band (with the reason when a confirmed intrusion raised it), finding breakdown by severity, top affected assets, the highest-severity finding with its narrative, attack-chain indicators, up to three distinct immediate actions, and the companion artifacts.
-4. **Environment Discovery and Context** — the questionnaire answers the analysis used.
-5. **Priority Findings** — every category that produced a scoring finding, ordered by its top severity. HIGH and above (plus the first finding of each category) get full detail:
-   - Auto-sequential finding ID (e.g. `MODBUS-001`, `DNP3-002`) for cross-referencing
-   - Affected assets, inferred OT roles, category, MITRE ATT&CK for ICS techniques, advisory and standards references
-   - **Detection confidence** (High / Medium / Low) — how certain OTscope is that this event was correctly detected
-   - **Maliciousness confidence** (High / Medium / Low, with "may be authorized maintenance" qualifier where applicable) — how likely the activity represents a threat vs. legitimate operation
-   - **What Was Observed**, **OT Significance** (why it matters in an OT/ICS context, written for IT audit readers), and **Key Evidence**
-   - **Auditor Guidance** — 3–5 specific verification and follow-up steps
-   - **What Would Make This Benign** and **Recommended Action**
+3. **Executive Summary** — risk score and band (with the reason when a confirmed intrusion raised it), finding breakdown by severity, top affected assets, the highest-severity finding with its narrative, attack-chain indicators, up to three immediate next steps (the first step of each top Remediation Plan row, with finding IDs), and the companion artifacts.
+4. **Remediation Plan** — one row per fix, in priority order, with the devices involved, the findings it covers (by ID), and the likely owner (for example *Controls engineer* or *OT network engineer, incident response*). Findings that share a fix share a row, which takes the most urgent priority among them:
+
+   | Priority | Severities |
+   | --- | --- |
+   | 1 — Act now | INTRUSION, CRITICAL |
+   | 2 — This week | CORRELATION, HIGH |
+   | 3 — Next maintenance window | MEDIUM |
+   | 4 — Backlog | LOW, INFO |
+5. **Environment Discovery and Context** — the questionnaire answers the analysis used.
+6. **Priority Findings** — every category that produced a scoring finding, ordered by its top severity. HIGH and above (plus the first finding of each category) get full detail, in this order:
+   - Heading with severity, title, and auto-sequential finding ID (e.g. `MODBUS-001`, `DNP3-002`) for cross-referencing
+   - **Summary box** — *What happened*, *Why it matters*, and *What to do now*, one sentence each
+   - **What to Do** — numbered steps **1. Contain now**, **2. Fix**, **3. Verify** (how to confirm the fix worked), then an **OT safety note** on making the change without disrupting the process
+   - **What Was Observed** — the full description; when the same issue occurred between several device pairs, an **Occurrences** list gives each pair (source → destination) with its own sentence and how often it was seen
+   - **OT Significance** (why it matters in an OT/ICS context, written for IT audit readers) and **Key Evidence** (grouped by device pair when there are several)
+   - **Auditor Guidance** — 3–5 specific verification and follow-up steps — and **What Would Make This Benign**
+   - **Reference** table — finding ID, affected assets, inferred OT roles, category, likely owner, MITRE ATT&CK for ICS techniques, advisory and standards references, **detection confidence** (how certain OTscope is that the event was correctly detected), and **maliciousness confidence** (how likely the activity is a threat rather than legitimate operation)
    - Pointers to the JSON finding, Appendix A, and (when included) Appendix B
 
-   Lower-severity findings get a compact summary: assets, MITRE IDs, description, evidence, and action.
-6. **Suggested Controls** — defensive measures suggested by what the capture contained (for example, IDS signatures for exposed credentials). Recommendations, not findings; not scored.
-7. **Assessor Notes** — free-text notes recorded during the session.
-8. **Network Interpretation Summary** — plain-language paragraphs describing the observed architecture: likely initiators and controllers, host observations (impersonated, impostor, poisoned), IPv6 addresses matched to their IPv4 hosts, broadcast and multicast destinations, IT discovery protocols on OT subnets, services on dynamic ports.
-9. **MITRE ATT&CK for ICS Coverage** — technique IDs (hyperlinked to attack.mitre.org), names, and finding counts.
-10. **Device Inventory Summary** — top 15 devices by traffic with MAC and vendor (⚠ marks an IP seen with more than one MAC), role, zone, protocols, and risk score, followed by any per-device observations; the full list is in the Device Inventory CSV.
-11. **Flow Allowlist Summary** — how to use the Flow Allowlist CSV for segmentation review.
-12. **Limitations of Analysis** — disclosures to carry into a formal audit.
-13. **Appendix A: Wireshark Investigation Guide** — the investigation guides that match the reported findings, grouped by category (see §8).
+   Lower-severity findings get a compact summary: assets, MITRE IDs, the description (or one line per device pair), evidence, and a one-line *What to do*.
+7. **Suggested Controls** — defensive measures suggested by what the capture contained (for example, IDS signatures for exposed credentials). Recommendations, not findings; not scored.
+8. **Assessor Notes** — free-text notes recorded during the session.
+9. **Network Interpretation Summary** — plain-language paragraphs describing the observed architecture: likely initiators and controllers, host observations (impersonated, impostor, poisoned), IPv6 addresses matched to their IPv4 hosts, broadcast and multicast destinations, IT discovery protocols on OT subnets, services on dynamic ports.
+10. **MITRE ATT&CK for ICS Coverage** — technique IDs (hyperlinked to attack.mitre.org), names, and finding counts.
+11. **Device Inventory Summary** — top 15 devices by traffic with MAC and vendor (⚠ marks an IP seen with more than one MAC), role, zone, protocols, and risk score, followed by any per-device observations; the full list is in the Device Inventory CSV.
+12. **Flow Allowlist Summary** — how to use the Flow Allowlist CSV for segmentation review.
+13. **Limitations of Analysis** — disclosures to carry into a formal audit.
+14. **Appendix A: Wireshark Investigation Guide** — the investigation guides that match the reported findings, grouped by category (see §8).
 
 **Appendix B (optional — `--technical-appendix`):** B.1 Timeline / Attack Chain (chronological MEDIUM+ findings), B.2 Full Evidence by Finding, B.3 Inferred Network Map, B.4 Top Riskiest Devices (top 15 by severity-weighted score), B.5 Full Device Inventory (top 200 by traffic). Not included by default to keep the document readable for non-technical reviewers. Pass `--technical-appendix` on the command line to include it. The same detail is always available in the JSON export.
 
@@ -562,7 +570,7 @@ Net result: a 1.4M-device flood capture renders as a ~50-page Word report with t
 When the Word report opens, work top-down for fastest triage:
 
 1. Open the Purdue Summary SVG first — visual confirmation of which Purdue layers have findings, before reading any text.
-2. Executive Summary on page 2 — read the Attack Chain Indicators first. If any ⚠ line appears, that is the headline finding.
+2. Executive Summary on page 2 — read the Attack Chain Indicators first. If any ⚠ line appears, that is the headline finding. The Remediation Plan that follows says what to do first and who usually owns it.
 3. Riskiest devices — the console prints the top 5 at the end of the run, the Device Inventory Summary carries a risk score per device, and Appendix B.4 (with `--technical-appendix`) lists the top 15.
 4. Priority Findings → INTRUSION-class items first (deep red), then CRITICAL (dark red), then CORRELATION (dark blue), then HIGH.
 5. Timeline / Attack Chain (Appendix B.1, with `--technical-appendix`) — confirm the sequence: was there reconnaissance before the writes? Did beaconing precede a control action?
@@ -591,6 +599,21 @@ When the Word report opens, work top-down for fastest triage:
 ## 14. Version History
 
 Running log of capabilities added in each release. Newest at the top.
+
+### Version 2.8.2 · October 2026
+
+Report readability release: each finding now says plainly what to do about it. Driven by a review of the reports from an entry-level OT security reader's point of view.
+
+- **Every detailed finding opens with what to do.** A shaded summary box gives *what happened*, *why it matters*, and *what to do now*. A **What to Do** section follows with numbered steps — contain now, fix, verify — and an **OT safety note** for making the change without disrupting the process. The metadata table moves below the evidence as a **Reference** table, which also names the likely owner. All remediation text comes from one per-family source (specific steps for 26 finding families), so the summary box, the plan, the JSON, and the plain-text fallback agree.
+- **Remediation Plan** after the Executive Summary — one row per fix with priority (Act now / This week / Next maintenance window / Backlog), devices, finding IDs, and likely owner. The Executive Summary's immediate next steps come from its top rows. The JSON report gains `remediation_plan`, and every JSON finding carries its report ID (`report_id`, e.g. `NETHYG-001`), so the report's "See JSON finding …" pointers resolve.
+- **Each device pair listed separately.** When one issue occurs between several device pairs (for example two masters sending a DNP3 cold restart), the finding lists every pair with its own sentence and count, and groups the evidence by pair.
+- **Bugs fixed:**
+  - The hammer-rate polling check timed reads from the first capture file analyzed to the last, so captures analyzed out of date order produced a false HIGH such as "21,955 times at about 21955 requests per second". Rates are now timed within each capture file, and pooled across files only by adding up each file's own span.
+  - Durations read naturally ("3 days", "2.6 years", "45 minutes") instead of "1345068 minutes" or "a gap of 80692773.0 seconds".
+  - "No NTP traffic observed" counted the time across pauses between recordings and looked at only the first 20,000 frames of each file. It now needs 30 minutes of continuous traffic in one capture file, and the capture-gap check sees every frame.
+  - An impostor with several own addresses reads "its own addresses are A and B"; the restart/suppression benign text no longer says "restart" for Disable Spontaneous.
+  - Table header rows were dark blue with black text (the text was written after the header was styled); they are now white and bold. The cover-page details are a plain label/value table.
+- **Regression suite** — 15 scenarios. New `multi_capture_out_of_order`: two captures analyzed out of date order, one with a three-day pause, plus a genuine 50-per-second hammer. The runner supports multi-file scenarios, reads the full Word text, and checks the Remediation Plan, the What to Do steps, per-pair occurrences, JSON report IDs, and header-row contrast.
 
 ### Version 2.8.1 · October 2026
 
