@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import xml.dom.minidom
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -156,6 +157,8 @@ def expect_common(r: Result, out: RunOutput) -> None:
             r.failures.append(f"{svg.name} is not valid XML ({exc})")
     r.check("Traceback" not in out.log, "Python traceback in run log")
     r.check("Word report generation failed" not in out.log, "Word report fell back to plain text")
+    r.check("traffic_coverage" in out.report, "JSON report has no traffic_coverage block")
+    r.check("=== Summary ===" in out.log and "Files written to" in out.log, "no end-of-run summary in the log")
     r.check(out.unreadable_header_cells == 0,
             f"{out.unreadable_header_cells} table header cell(s) have dark text on the dark header fill")
 
@@ -367,6 +370,34 @@ def check_multi_capture_out_of_order(r: Result, out: RunOutput) -> None:
             "three-day pause in plant_a.pcap not reported in days")
 
 
+def check_tristation_sis(r: Result, out: RunOutput) -> None:
+    hits = out.matching("Triconex TriStation safety-controller traffic observed", src="10.13.0.5", dst="10.13.0.50",
+                        severity="CRITICAL")
+    r.check(bool(hits), "TriStation session from an undeclared host not reported as CRITICAL")
+    if hits:
+        r.check(hits[0]["category"] == "Safety Instrumented Systems", f"TriStation filed under {hits[0]['category']}")
+        r.check(hits[0].get("report_id", "").startswith("SIS-"), f"report ID {hits[0].get('report_id')!r}")
+    r.check(out.device("10.13.0.50").get("inferred_role") == "Controller / Safety System (SIS)",
+            f"safety controller classified as {out.device('10.13.0.50').get('inferred_role')!r}")
+    r.check(BAND_ORDER.index(out.band()) >= BAND_ORDER.index("MODERATE"), f"risk band {out.band()} for SIS access")
+    plan = out.report.get("remediation_plan", [])
+    r.check(bool(plan) and plan[0]["action"] == "Confirm who is talking to the safety controller"
+            and plan[0]["priority"] == 1, "remediation plan does not open with the safety controller")
+    forbid(r, out, "Traffic not identified by OTscope")
+    require_text(r, out, "TriStation is the Triconex engineering protocol")
+
+
+def check_unidentified_udp(r: Result, out: RunOutput) -> None:
+    require(r, out, "Traffic not identified by OTscope", severity="LOW")
+    coverage = out.report.get("traffic_coverage", {})
+    r.check(coverage.get("identified_percent") == 0.0, f"identified_percent is {coverage.get('identified_percent')}")
+    flows = coverage.get("unidentified_flows", [])
+    r.check(bool(flows) and flows[0].get("port") == 4000 and flows[0].get("packets") == 896,
+            f"unidentified flows: {flows[:1]}")
+    r.check("Traffic identified: 0 of 896 packets" in out.log, "console does not report the unidentified traffic")
+    require_text(r, out, "Most of the traffic could not be identified")
+
+
 CHECKS: Dict[str, Callable[[Result, RunOutput], None]] = {
     "benign_modbus_hmi": check_benign_modbus_hmi,
     "benign_scada_master": check_benign_scada_master,
@@ -383,7 +414,59 @@ CHECKS: Dict[str, Callable[[Result, RunOutput], None]] = {
     "truncated_capture": check_truncated,
     "dnp3_sample": check_dnp3_sample,
     "multi_capture_out_of_order": check_multi_capture_out_of_order,
+    "tristation_sis": check_tristation_sis,
+    "unidentified_udp": check_unidentified_udp,
 }
+INTERACTIVE = "interactive_sessions"
+
+
+def run_interactive_sessions(otscope: Path, workspace: Path, captures: List[Path]) -> Result:
+    """Drive the prompts: new session, a second session with the same name, add
+    captures to the first, then resume it and generate a report."""
+    r = Result(INTERACTIVE)
+    home = workspace / "home"
+    (workspace / "pcaps").mkdir(parents=True)
+    home.mkdir()
+    shutil.copy2(otscope, workspace / "otscope.py")
+    for capture in captures:
+        shutil.copy2(capture, workspace / "pcaps" / capture.name)
+    out = workspace / "output"
+    name = f"plant_{datetime.now().strftime('%Y%m%d')}"
+    first = out / f"{name}.otpa_session"
+    env = dict(os.environ)
+    env.update({"HOME": str(home), "USERPROFILE": str(home), "PYTHONIOENCODING": "utf-8"})
+
+    def run(step: str, answers: List[str]) -> str:
+        proc = subprocess.run([sys.executable, "otscope.py", "--offline"], cwd=str(workspace), env=env,
+                              input="\n".join(answers) + "\n", capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=900)
+        log = (proc.stdout or "") + (proc.stderr or "")
+        r.check(proc.returncode == 0, f"{step}: otscope exited {proc.returncode}")
+        for bad in ("Traceback", "EOF when reading", "No saved sessions", "No capture files were found"):
+            r.check(bad not in log, f"{step}: '{bad}' in the log")
+        return log
+
+    def captures_in(path: Path) -> List[str]:
+        if not path.exists():
+            return []
+        return sorted(json.loads(path.read_text(encoding="utf-8")).get("processed_pcaps", {}))
+
+    a, b = captures[0].name, captures[1].name
+    run("new session", ["N", "", "1", "tester", "plant", "", "S", "", "", "n"])
+    r.check(captures_in(first) == [a], f"new session holds {captures_in(first)}")
+    log = run("same-name session", ["N", "", "1", "", "", "", "", "S", "", "", "n"])
+    r.check("already exists" in log, "no warning about the existing session name")
+    r.check(captures_in(first) == [a], "the first session was overwritten by a session with the same name")
+    r.check(captures_in(out / f"{name}_2.otpa_session") == [a], "second session not saved under a new name")
+    r.check(len(list(out.glob("OTscope_Purdue_Summary_*.svg"))) == 2, "Purdue diagrams of the first run were overwritten")
+    run("add captures", ["A", name, "", "1", "", "", "n"])
+    r.check(captures_in(first) == [a, b], f"after adding, the session holds {captures_in(first)}")
+    reports = len(list(out.glob("*.docx")))
+    log = run("resume and report", ["R", name, "G", "", "n"])
+    r.check(len(list(out.glob("*.docx"))) == reports + 1 and "Word report written" in log,
+            "resume did not generate a report")
+    r.summary = f"{len(list(out.glob('*.otpa_session')))} sessions, {len(list(out.glob('*.docx')))} reports"
+    return r
 SITES = {"benign_modbus_hmi": None, "s7_engineering": "R&D Plant <North>"}
 LOOSE = {"benign_modbus_hmi"}
 
@@ -397,7 +480,7 @@ def main() -> int:
     if shutil.which("tshark") is None:
         print("tshark not found on PATH — cannot run the regression suite.")
         return 2
-    names = list(CHECKS)
+    names = list(CHECKS) + [INTERACTIVE]
     if args.only:
         names = [n for n in names if n in args.only]
     root = Path(tempfile.mkdtemp(prefix="otscope-regress-"))
@@ -409,6 +492,17 @@ def main() -> int:
             result = Result(name)
             capture_dir = root / "captures" / name
             capture_dir.mkdir(parents=True, exist_ok=True)
+            if name == INTERACTIVE:
+                pair = [capture_dir / "a_modbus.pcap", capture_dir / "b_arp.pcap"]
+                SCENARIOS["modbus_value_jump"]().write(str(pair[0]))
+                SCENARIOS["arp_same_ms"]().write(str(pair[1]))
+                result = run_interactive_sessions(args.otscope, root / name, pair)
+                results.append(result)
+                status = "PASS" if not result.failures else "FAIL"
+                print(f"[{status}] {name:<32} {result.summary}", flush=True)
+                for failure in result.failures:
+                    print(f"         - {failure}", flush=True)
+                continue
             if name == "dnp3_sample":
                 if not DNP3_SAMPLE.exists():
                     result.summary = "skipped (sample pcap not present)"

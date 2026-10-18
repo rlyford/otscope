@@ -72,7 +72,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 
 TOOL_NAME = "OTscope"
-VERSION = "2.8.2"
+VERSION = "2.8.3"
 __author__ = "Ryan Lyford"
 __copyright__ = "© 2026 Ryan Lyford. All rights reserved."
 
@@ -90,6 +90,7 @@ __copyright__ = "© 2026 Ryan Lyford. All rights reserved."
 # ----------------------------------------------------------------------
 OFFLINE_MODE: bool = False
 NON_INTERACTIVE: bool = False  # set by --scan; suppresses all prompts
+VERBOSE: bool = False  # set by --verbose; prints every protocol detector's result
 CONFIG_PATH = Path.home() / ".ot_pcap_analyzer.conf"
 # All paths are anchored to the directory that contains otscope.py so the tool
 # works correctly whether it lives inside the dev repo (otscope/src/) or as a
@@ -182,11 +183,12 @@ KNOWN_OT_PORTS = {
     62541: "Ignition OPC UA server",
     8060: "Ignition gateway network",
     1880: "Node-RED",
+    1502: "Triconex TriStation (safety controllers)",
 }
 
 # Ports whose server side is a field device (PLC / RTU / IED) rather than an
 # OT server, broker, or historian.  Used for role inference.
-CONTROLLER_PORTS = {102, 502, 2222, 2404, 20000, 44818, 47808, 34962, 34963, 34964, 9600, 18245, 5007}
+CONTROLLER_PORTS = {102, 502, 2222, 2404, 20000, 44818, 47808, 34962, 34963, 34964, 9600, 18245, 5007, 1502}
 
 # 1935 RTMP, 5060/5061 SIP, 8000 Hikvision DVR / HTTP-alt, 37777 Dahua DVR —
 # A/V endpoints are IT-class gear, not OT devices.  NTP and SNMP are neutral
@@ -562,7 +564,7 @@ CHECK_ORDER: List[Tuple[str, str, str]] = [
     ("artifact_extraction", "Artifact Extraction", "Extracts model names, passwords, project files, firmware names, flag-like strings, and defensive clues from protocol and payload content."),
     ("network_hygiene", "Network Hygiene and Segmentation", "Highlights OT/IT crossings, public IPs, DNS, ARP anomalies, IPv6, and VLAN anomalies."),
     ("intrusion", "Intrusion Indicators", "Looks for behavioral patterns such as scanning, bursts, and lateral movement."),
-    ("unknown", "Unknown and Unclassified Traffic", "Flags unexplained traffic touching likely OT devices."),
+    ("unknown", "Unknown and Unclassified Traffic", "Flags unexplained services on OT devices and any traffic OTscope cannot identify."),
 ]
 
 
@@ -756,6 +758,8 @@ ADVISORY_MAP: List[Tuple[Tuple[str, ...], List[str]]] = [
         ["Modbus Organization: MODBUS/TCP Security Protocol Specification (TLS on TCP 802)", "NIST SP 800-82r3 (Guide to OT Security)"]),
     (("dnp3 disable spontaneous", "dnp3 cold restart", "dnp3 warm restart"),
         ["IEEE 1815-2012 (DNP3 Secure Authentication v5)", "NIST SP 800-82r3 (Guide to OT Security)"]),
+    (("tristation", "triconex", "safety instrumented"),
+        ["CISA MAR-17-352-01 (HatMan — safety system targeted malware)", "IEC 61511 (functional safety — safety instrumented systems)", "NIST SP 800-82r3 (Guide to OT Security)"]),
     (("omron fins", "fins write", "fins cleartext"),
         ["Omron cybersecurity advisories", "NIST SP 800-82r3 (Guide to OT Security)"]),
     (("ge srtp", "ge-srtp"),
@@ -869,6 +873,18 @@ def _versioned_path(folder: Path, base_name: str, ext: str) -> Path:
         candidate = folder / f"{base_name}_v{version}.{ext}"
         if not candidate.exists():
             return candidate
+        version += 1
+
+
+def _versioned_paths(folder: Path, base_names: Sequence[str], ext: str) -> List[Path]:
+    """Like _versioned_path, with one shared _vN suffix that is free for every
+    name, so files written together (the two Purdue diagrams) stay paired."""
+    version = 1
+    while True:
+        suffix = "" if version == 1 else f"_v{version}"
+        candidates = [folder / f"{name}{suffix}.{ext}" for name in base_names]
+        if not any(candidate.exists() for candidate in candidates):
+            return candidates
         version += 1
 
 
@@ -1093,6 +1109,16 @@ def human_duration(seconds: float) -> str:
     return f"{days / 365.25:.1f} years"
 
 
+def format_share(part: int, total: int) -> str:
+    """Percentage of part in total for report text: "0%", "37%", "99.6%", "100%"."""
+    if total <= 0:
+        return "n/a"
+    share = 100.0 * part / total
+    if 99.0 < share < 100.0:
+        return f"{share:.1f}%"
+    return f"{share:.0f}%"
+
+
 RISK_BANDS = ["MINIMAL", "LOW", "MODERATE", "HIGH", "SEVERE"]
 
 
@@ -1175,6 +1201,8 @@ class ConnectionSummary:
     last_seen: Optional[str] = None
     source_pcaps: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+    # Packets that carried this flow's protocol label; None for flows saved before v2.8.3.
+    labelled_packets: Optional[int] = None
 
 
 @dataclass
@@ -1466,6 +1494,7 @@ _NARRATIVE_RULES: List[Tuple[str, Tuple[str, ...], Tuple[str, ...]]] = [
     # (family, title substrings, tags)
     ("mitm", ("adversary-in-the-middle", "arp ", "arp-", "multiple mac", "gratuitous arp", "claims multiple ips"),
      ("mitm", "arp_spoof", "mac_conflict")),
+    ("sis", ("tristation", "triconex", "safety instrumented"), ("sis", "tristation")),
     ("replay", ("duplicate or unsolicited", "replay"), ("replay",)),
     ("restart", ("cold restart", "warm restart", "plc stop", "disable spontaneous", "stop/start"), ("restart", "suppression")),
     ("value_anomaly", ("register value anomaly",), ("value_anomaly",)),
@@ -1517,6 +1546,7 @@ def narrative_family(finding: "Finding") -> str:
 
 _WHY_THIS_MATTERS: Dict[str, str] = {
     "mitm": "This finding matters because a host that can rewrite ARP mappings sits invisibly between OT devices and can read, alter, or drop any command or process value that passes through it.",
+    "sis": "This finding matters because a safety instrumented system is the last automated layer that keeps the process from harming people or equipment, and its engineering protocol can read and change the safety logic.",
     "replay": "This finding matters because injected or replayed responses let an attacker show operators false process values while the real process changes.",
     "restart": "This finding matters because stopping, restarting, or silencing a controller has immediate operational impact and can hide follow-on manipulation.",
     "value_anomaly": "This finding matters because sudden jumps in reported values can mean the values were spoofed rather than measured.",
@@ -1553,6 +1583,12 @@ _REMEDIATION_STEPS: Dict[str, Tuple[str, str, str, str]] = {
         "Find the switch port the impostor MAC is connected to (switch MAC address table) and isolate it, then clear the ARP caches of the affected hosts.",
         "Enable Dynamic ARP Inspection or port security on the OT switch ports, and add static ARP entries for critical controller/HMI pairs.",
         "Check controller logic, setpoints, and recent writes against a known-good backup, then recapture and confirm each affected IP is claimed by only one MAC.",
+    ),
+    "sis": (
+        "Confirm who is talking to the safety controller",
+        "Confirm the host is the approved SIS engineering workstation and that a change was planned; if not, disconnect it from the safety network and inform operations and the process safety owner.",
+        "Keep the controller's key switch in RUN except during approved changes, keep the safety network separate from control and IT networks, and allow TriStation (UDP 1502) only from the SIS engineering workstation.",
+        "Compare the safety controller's program and configuration with the last approved backup, and recapture to confirm only the approved workstation talks to it.",
     ),
     "replay": (
         "Find the host injecting the extra responses",
@@ -1734,6 +1770,7 @@ _DEFAULT_STEPS = (
 
 _REMEDIATION_OWNER: Dict[str, str] = {
     "mitm": "OT network engineer, incident response",
+    "sis": "Process safety / SIS engineer, incident response",
     "replay": "OT network engineer, incident response",
     "restart": "Controls engineer, operations",
     "value_anomaly": "Controls engineer, operations",
@@ -1779,6 +1816,7 @@ _SAFETY_PROTOCOL_CHANGE = (
 )
 _OT_SAFETY_NOTE: Dict[str, str] = {
     "mitm": "Isolating the impostor's port is normally safe, but first confirm it is not a legitimate failover partner (VRRP/HSRP, NIC teaming); expect a short communication drop while ARP caches refresh.",
+    "sis": "Do not restart, reload, or bypass a safety controller without the process safety owner: a restart can trip the plant, and a bypass removes its protection.",
     "replay": _SAFETY_SUSPECT_VALUES,
     "value_anomaly": _SAFETY_SUSPECT_VALUES,
     "restart": _SAFETY_CONTROL_PATH,
@@ -1801,6 +1839,14 @@ _OT_SIGNIFICANCE: Dict[str, str] = {
         "allows real-time observation, modification, or replay of any command or process "
         "value.  This bypasses application-layer authentication and is one of the most "
         "serious network-layer threats to OT data integrity and process safety."
+    ),
+    "sis": (
+        "Safety instrumented systems (SIS) such as Schneider Electric Triconex take the process to a "
+        "safe state when it moves outside safe limits.  TriStation is the Triconex engineering "
+        "protocol, used to read and change the controller's safety program.  In the 2017 "
+        "TRITON/TRISIS incident, attackers used it from a compromised engineering workstation against "
+        "a Triconex SIS.  Engineering sessions with a safety controller should be rare, planned, and "
+        "come only from the designated SIS workstation."
     ),
     "replay": (
         "A Modbus server answers each request exactly once.  A second answer to the same "
@@ -1917,6 +1963,13 @@ _OT_SIGNIFICANCE: Dict[str, str] = {
 }
 
 _AUDITOR_GUIDANCE: Dict[str, List[str]] = {
+    "sis": [
+        "Confirm the source is the designated SIS engineering workstation and that it is used only for safety-system work.",
+        "Match the session to an approved SIS change (management-of-change record) or a planned diagnostic.",
+        "Check the controller's key switch position, and compare its program and configuration with the last approved backup.",
+        "Confirm the safety network is separated from the control and IT networks, with no other route to the controller.",
+        "If the session cannot be explained, involve the process safety owner and treat it as a possible intrusion.",
+    ],
     "dos": [
         "Ask operations whether HMIs lost communication or alarms fired during the window.",
         "Identify the flooding host's switch port and owner.",
@@ -1993,6 +2046,7 @@ _AUDITOR_GUIDANCE: Dict[str, List[str]] = {
 }
 
 _BENIGN_EXPLANATION: Dict[str, str] = {
+    "sis": "This finding would be benign if the source is the designated SIS engineering workstation and the session matches an approved, documented change or diagnostic.",
     "dos": "This finding would be benign only if an approved load or penetration test was running against the device at that time.",
     "mitm": "This finding would be benign only if the second MAC belongs to a legitimate failover partner (VRRP/HSRP, NIC teaming) or a replacement device that took over the IP — none of which sends unsolicited ARP replies to other hosts or relays the original host's traffic.",
     "replay": "This finding would be benign if a protocol gateway or redundant server pair legitimately answers for the device, or if the capture merged two mirror sources that duplicated frames (TCP retransmissions are already excluded).",
@@ -2085,6 +2139,13 @@ _WIRESHARK_GUIDE: List[Tuple[Tuple[str, ...], str, List[str]]] = [
          "Compare the Ethernet source MAC (eth.src) against the ARP sender MAC (arp.src.hw_mac) — when they disagree, that's a MITM toolkit's signature.",
          "Right-click any suspicious ARP frame → Conversation Filter → Ethernet to see all traffic that flowed through that MAC during the spoof window.",
          "Filter eth.addr == <impostor MAC> (named in the finding) and compare the eth.src of the victim IP's packets before, during, and after the attack window — during interception they come from the impostor.",
+     ]),
+    (("tristation", "triconex"),
+     "udp.port == 1502",
+     [
+         "Wireshark has no built-in TriStation dissector, so the payload shows as data. Use Statistics → Conversations → UDP with this filter to list every host that talked to the safety controller, and how much.",
+         "Compare each session's start and end time with approved SIS change records — engineering sessions with a safety controller should be rare and planned.",
+         "Use Statistics → Endpoints → Ethernet to confirm the source MAC belongs to the designated SIS engineering workstation.",
      ]),
     (("register value anomaly",),
      "modbus",
@@ -3038,6 +3099,8 @@ def protocol_family_from_row(row: Dict[str, str]) -> str:
         return "ARP"
     if "icmp" in protocol_text.lower():
         return "ICMP"
+    if frame_protocols.endswith(("udp", "udp:data")) and "1502" in (row.get("udp.srcport"), row.get("udp.dstport")):
+        return "Triconex TriStation"
     if protocol_text:
         return protocol_text
     return "Unknown"
@@ -3051,7 +3114,10 @@ def select_pcaps_from_folder(folder: Path, exclude_filenames: Optional[Sequence[
         key=lambda item: (str(item.parent), item.name.lower()),
     )
     if not pcaps:
-        print("[!] No pcap files were found.")
+        if exclude and any(is_capture_file(path) for path in folder.rglob("*")):
+            print(f"[!] No new capture files in {folder} — every capture there is already in this session.")
+        else:
+            print(f"[!] No capture files were found in {folder}.")
         return []
     current_parent: Optional[Path] = None
     for index, path in enumerate(pcaps, start=1):
@@ -3119,7 +3185,7 @@ def discovery_questions() -> List[Tuple[str, str]]:
         ("expected_protocols",
          "Expected OT protocols — enter any that apply, comma-separated\n"
          "    OT:  modbus  bacnet  dnp3  iec61850  iec104  mqtt  opcua  enip  s7\n"
-         "         omron   srtp    umas  melsec    historian  ignition  nodered  physical\n"
+         "         omron   srtp    umas  melsec    historian  ignition  nodered  physical  tristation\n"
          "    IoT: zigbee  coap  zwave\n"
          "    A/V: voip  video  camera  cctv"),
         ("known_hmis", "Known HMI or engineering workstation IPs/hostnames (optional)"),
@@ -3164,6 +3230,7 @@ _CATEGORY_PREFIX_MAP: Dict[str, str] = {
     "EtherNet/IP":                       "ENIP",
     "Siemens S7 / PROFINET":             "S7",
     "Omron FINS":                        "FINS",
+    "Safety Instrumented Systems":       "SIS",
     "GE SRTP":                           "GESRTP",
     "Schneider UMAS":                    "UMAS",
     "Mitsubishi MELSEC":                 "MELSEC",
@@ -3424,6 +3491,61 @@ class OTPcapAnalyzer:
         # TCP connections whose SYN was seen: endpoint pair -> server endpoint.
         self._tcp_servers: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Tuple[str, int]] = {}
         self._host_address_cache: Dict[str, bool] = {}
+        # (detector, new findings, reason it was skipped) for the current protocol pass.
+        self._detector_results: List[Tuple[str, int, str]] = []
+        # Files written during this run, with what each is for (end-of-run summary).
+        self.artifacts_written: List[Tuple[Path, str]] = []
+
+    def _note_artifact(self, path: Path, description: str, label: str, detail: str = "") -> None:
+        """Remember a written file for the end-of-run summary and announce it."""
+        self.artifacts_written = [item for item in self.artifacts_written if item[0] != path]
+        self.artifacts_written.append((path, description))
+        print(colorize(f"[✓] {label}: {path.name}{detail}", "SUCCESS"))
+
+    def _detector_done(self, name: str, before: int) -> None:
+        """Record one protocol detector's result; print it only with --verbose."""
+        assert self.session is not None
+        if any(entry[0] == name for entry in self._detector_results):
+            return
+        added = len(self.session.findings) - before
+        self._detector_results.append((name, added, ""))
+        if VERBOSE:
+            print(colorize(f"[✓] {name} complete. New findings added: {added}", "SUCCESS"))
+
+    def _detector_skipped(self, name: str, reason: str) -> None:
+        self._detector_results.append((name, 0, reason))
+        if VERBOSE:
+            print(colorize(f"[i] {name} skipped — {reason}.", "INFO"))
+
+    def _detector_summary(self) -> str:
+        ran = [entry for entry in self._detector_results if not entry[2]]
+        hits = sorted((entry for entry in ran if entry[1]), key=lambda entry: -entry[1])
+        found = ("findings from " + ", ".join(f"{name} ({count})" for name, count, _ in hits)) if hits else "no findings"
+        return f"{len(ran)} detectors ran — {found}."
+
+    def _print_coverage(self) -> None:
+        """Say how much of the traffic was identified, and list what was not."""
+        coverage = self.traffic_coverage()
+        total, identified = coverage["total_packets"], coverage["identified_packets"]
+        if not total:
+            return
+        line = f"Traffic identified: {identified:,} of {total:,} packets ({format_share(identified, total)})."
+        unidentified = coverage["unidentified"]
+        if not unidentified:
+            self._log_ts(f"[i] {line}")
+            return
+        if total - identified < total / 100:
+            self._log_ts(f"[i] {line} {len(unidentified)} small flow{'s' if len(unidentified) != 1 else ''} "
+                         "not identified — listed in the report.")
+            return
+        self._log_ts(colorize(f"[!] {line} Not identified by OTscope or tshark:", SEVERITY_MEDIUM))
+        for connection in unidentified[:5]:
+            print(f"        {self._flow_text(connection)}")
+        if len(unidentified) > 5:
+            print(f"        (+{len(unidentified) - 5} more flows)")
+        if identified < total / 2:
+            print(colorize("    Most of the traffic could not be identified, so a low risk score here does not "
+                           "mean the capture is benign.", SEVERITY_MEDIUM))
 
     TCP_ORIENTATION_CAP = 500_000
     EVIDENCE_CAP = 50
@@ -3497,7 +3619,7 @@ class OTPcapAnalyzer:
         self._stamp_provenance()
         session_path = Path(self.session.session_file)
         session_path.write_text(pretty_json(session_to_dict(self.session)), encoding="utf-8")
-        print(colorize(f"[✓] Session saved to {session_path}", "SUCCESS"))
+        self._note_artifact(session_path, "Session — resume it or add captures later", "Session saved")
 
     def _checkpoint_save_silent(self) -> None:
         """Atomic quiet save used between files in long analysis runs.
@@ -3787,10 +3909,13 @@ class OTPcapAnalyzer:
                     first_seen=timestamp,
                     last_seen=timestamp,
                     source_pcaps=[pcap_name],
+                    labelled_packets=0,
                 )
         connection = self.session.connections[key]
         if connection.protocol in self._GENERIC_PROTOCOL_LABELS and label not in self._GENERIC_PROTOCOL_LABELS:
             connection.protocol = label
+        if connection.labelled_packets is not None and label not in self._GENERIC_PROTOCOL_LABELS:
+            connection.labelled_packets += 1
         connection.packet_count += 1
         if timestamp and (connection.first_seen is None or timestamp < connection.first_seen):
             connection.first_seen = timestamp
@@ -3997,8 +4122,8 @@ class OTPcapAnalyzer:
             "flows": flow_keys,
         }
         path.write_text(pretty_json(payload), encoding="utf-8")
-        print(colorize(f"[✓] Baseline saved to {path} "
-                       f"({len(device_profiles):,} devices, {len(flow_keys):,} flows)", "SUCCESS"))
+        self._note_artifact(path, "Baseline — compare future captures against it", "Baseline saved",
+                            f" ({len(device_profiles):,} devices, {len(flow_keys):,} flows)")
 
     def _load_baseline(self, path: Path) -> Dict[str, Any]:
         """Load a baseline JSON from disk and validate its shape."""
@@ -4922,6 +5047,8 @@ class OTPcapAnalyzer:
                 role = "Physical Security Device"
             elif 3956 in served:
                 role = "Machine-Vision Camera"
+            elif 1502 in served and 1502 not in used:
+                role = "Controller / Safety System (SIS)"
             elif ot_served and ot_served <= used:
                 # Peer protocols (same port in both directions, e.g. BACnet):
                 # ports cannot tell client from server, so use traffic direction.
@@ -5780,14 +5907,54 @@ class OTPcapAnalyzer:
                     f"intrusion::write-burst::{source_ip}", tags=["write_volume"])
         return 0
 
-    def check_unknown(self, pcaps: Sequence[Path]) -> int:
-        """Flag OT-adjacent traffic to service ports with no known protocol."""
+    def traffic_coverage(self) -> Dict[str, Any]:
+        """How much of the session's IP traffic OTscope could identify.
+
+        A flow is identified when its service port is one OTscope knows, or when
+        tshark named its protocol on at least a tenth of its packets — a few
+        heuristic guesses on random or encrypted payloads (which can "look like"
+        RTCP) do not identify a flow.  Returns packet totals and the unidentified
+        flows as dicts, largest first.
+        """
         assert self.session is not None
         known_ports = set(KNOWN_OT_PORTS) | IT_PORTS | IT_INDICATOR_PORTS | _SERVICE_PORT_HINTS
+        total = identified = 0
+        unidentified: List[Dict[str, Any]] = []
+        for key, connection in self.session.connections.items():
+            total += connection.packet_count
+            named = connection.protocol not in self._GENERIC_PROTOCOL_LABELS and (
+                connection.labelled_packets is None or connection.labelled_packets * 10 >= connection.packet_count)
+            if named or connection.destination_port in known_ports:
+                identified += connection.packet_count
+                continue
+            parts = key.split("|")
+            unidentified.append({
+                "key": key,
+                "transport": parts[2] if len(parts) == 4 else connection.protocol,
+                "client": connection.source_ip,
+                "server": connection.destination_ip,
+                "port": connection.destination_port,
+                "packets": connection.packet_count,
+                "pcaps": list(connection.source_pcaps),
+            })
+        unidentified.sort(key=lambda flow: flow["packets"], reverse=True)
+        return {"total_packets": total, "identified_packets": identified, "unidentified": unidentified}
+
+    @staticmethod
+    def _flow_text(flow: Dict[str, Any]) -> str:
+        return (f"{flow['transport']} {flow['client']} → {flow['server']} port {flow['port']} — "
+                f"{flow['packets']:,} packets")
+
+    def check_unknown(self, pcaps: Sequence[Path]) -> int:
+        """Flag OT-adjacent traffic to service ports with no known protocol, then
+        any other traffic nothing could identify."""
+        assert self.session is not None
+        known_ports = set(KNOWN_OT_PORTS) | IT_PORTS | IT_INDICATOR_PORTS | _SERVICE_PORT_HINTS
+        reported: set = set()
         grouped_links: Dict[int, List[str]] = defaultdict(list)
         grouped_pcaps: Dict[int, set[str]] = defaultdict(set)
         grouped_ips: Dict[int, set[str]] = defaultdict(set)
-        for connection in self.session.connections.values():
+        for conn_key, connection in self.session.connections.items():
             port = connection.destination_port
             # Dynamic-range ports (>= 49152) are never registered services.
             if port in known_ports or port == 0 or port >= 49152:
@@ -5795,6 +5962,7 @@ class OTPcapAnalyzer:
             source_device = self.session.devices.get(connection.source_ip)
             destination_device = self.session.devices.get(connection.destination_ip)
             if (source_device and self._likely_ot_device(source_device)) or (destination_device and self._likely_ot_device(destination_device)):
+                reported.add(conn_key)
                 grouped_links[port].append(
                     f"{connection.source_ip} -> {connection.destination_ip} | port {port} | packets {connection.packet_count}"
                 )
@@ -5814,6 +5982,30 @@ class OTPcapAnalyzer:
                 sorted(grouped_pcaps[port]),
                 f"unknown::{port}",
                 tags=["unknown_traffic", f"port_{port}"],
+            )
+        # Everything else nothing could identify: without this, a capture of
+        # an unknown protocol between unclassified hosts reads as clean.
+        coverage = self.traffic_coverage()
+        rest = [flow for flow in coverage["unidentified"] if flow["key"] not in reported]
+        if rest:
+            packets = sum(flow["packets"] for flow in rest)
+            share = packets / max(coverage["total_packets"], 1)
+            self.add_finding(
+                SEVERITY_LOW if share >= 0.25 else SEVERITY_INFO,
+                "Unknown and Unclassified Traffic",
+                "Traffic not identified by OTscope",
+                f"{packets:,} packets ({format_share(packets, coverage['total_packets'])} of the traffic) in "
+                f"{len(rest)} flow{'s' if len(rest) != 1 else ''} used protocols that neither OTscope nor tshark "
+                "could identify, so the analysis could not assess them — the risk score says nothing about "
+                "this traffic. Identify each service with the device owner.",
+                [self._flow_text(flow) for flow in rest[:12]]
+                + ([f"(+{len(rest) - 12} more unidentified flows)"] if len(rest) > 12 else []),
+                sorted({flow["client"] for flow in rest})[:50],
+                sorted({flow["server"] for flow in rest})[:50],
+                "Unidentified",
+                sorted({pcap for flow in rest for pcap in flow["pcaps"]}),
+                "unknown::unidentified",
+                tags=["unknown_traffic", "coverage"],
             )
         return 0
 
@@ -5865,6 +6057,7 @@ class OTPcapAnalyzer:
         "5353,5355,137,138,1900,67,68,"
         # Omron FINS also runs over UDP/9600
         "9600,"
+        "1502,"  # Triconex TriStation (safety controllers)
         # SIP over UDP, GigE Vision control (GVCP)
         "5060,3956} || "
         "dnp3 || mms || goose || sv || opcua || s7comm || pn_dcp || rtsp || "
@@ -6078,6 +6271,8 @@ class OTPcapAnalyzer:
         # ---- Vendor-specific OT protocol accumulators ----------------
         # Each holds rows_seen flag, pcap set, and a sample list for evidence.
         fins:     Dict[str, Any] = {"rows_seen": False, "pcap_names": set(), "samples": []}
+        # Triconex TriStation sessions per (engineering host, safety controller).
+        tristation: Dict[Tuple[str, str], Dict[str, Any]] = {}
         gertp:    Dict[str, Any] = {"rows_seen": False, "pcap_names": set(), "samples": []}
         melsec:   Dict[str, Any] = {"rows_seen": False, "pcap_names": set(), "samples": []}
         pi_srv:   Dict[str, Any] = {"rows_seen": False, "pcap_names": set(), "samples": []}
@@ -6121,15 +6316,11 @@ class OTPcapAnalyzer:
         arp_requests_seen: Dict[Tuple[str, str], bool] = {}
 
         # ---- single streaming pass ------------------------------------
-        print(colorize(
-            f"\n[...] Combined protocol analysis pass across {len(pcaps)} file(s) "
-            "(single tshark read — all protocol checks run in parallel)...",
-            bold=True,
-        ))
+        self._detector_results = []
         total_files = len(pcaps)
         for idx, pcap in enumerate(pcaps, start=1):
             size_h = human_size(pcap.stat().st_size) if pcap.exists() else "?"
-            self._log_ts(f"    [{idx}/{total_files}] {pcap.name} ({size_h}) — streaming protocol pass …")
+            self._log_ts(f"    [{idx}/{total_files}] {pcap.name} ({size_h}) …")
             row_count = 0
             try:
                 for row in iter_tshark_rows(self._COMBINED_PROTO_FILTER, BASE_PACKET_FIELDS, pcap):
@@ -6757,6 +6948,24 @@ class OTPcapAnalyzer:
                                 f"fins::write::{src}::{dst}", tags=["write", "fins"],
                             )
 
+                    # ---- TRICONEX TRISTATION (UDP 1502) -----------------
+                    # Engineering protocol of Triconex safety instrumented
+                    # systems.  tshark has no dissector, so sessions are
+                    # recognised by port and reported per host pair.
+                    if _l7 and _transport == "UDP" and (dport == 1502 or sport == 1502):
+                        session_ts = tristation.setdefault((client, server), {
+                            "packets": 0, "to_controller": 0, "first": None, "last": None, "pcaps": set()})
+                        session_ts["packets"] += 1
+                        session_ts["to_controller"] += 1 if to_server else 0
+                        session_ts["pcaps"].add(pn)
+                        try:
+                            when = float(_ts_e)
+                        except ValueError:
+                            when = None
+                        if when is not None:
+                            session_ts["first"] = when if session_ts["first"] is None else min(session_ts["first"], when)
+                            session_ts["last"] = when if session_ts["last"] is None else max(session_ts["last"], when)
+
                     # ---- GE-SRTP (TCP 18245) ----------------------------
                     # GE Service Request Transport Protocol used by GE
                     # PACSystems (RX3i, 90-30) PLCs.  Cleartext, no auth.
@@ -7332,7 +7541,8 @@ class OTPcapAnalyzer:
                                         (pn, arp_src_mac, arp_src_ip, arp_dst_ip)
                                     )
 
-                print(f"        → {row_count} matching rows", flush=True)
+                if VERBOSE:
+                    print(f"        → {row_count:,} rows matched the protocol filter", flush=True)
             except TSharkError as exc:
                 print(colorize(f"[!] tshark error on {pcap.name}: {exc}", SEVERITY_HIGH))
             # Per-file checkpoint so a crash during the streaming pass
@@ -7524,7 +7734,7 @@ class OTPcapAnalyzer:
                     "modbus::value-anomaly",
                     tags=["modbus", "value_anomaly"],
                 )
-        print(colorize(f"[✓] Modbus TCP complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("Modbus TCP", before)
 
         # BACnet
         before = len(self.session.findings)
@@ -7539,7 +7749,7 @@ class OTPcapAnalyzer:
                     "Who-Is broadcast volume greatly exceeded I-Am responses.",
                     [f"Who-Is count: {bn['who_is']} | I-Am count: {bn['i_am']}"],
                     [], [], "BACnet/IP", sorted(bn["pcap_names"]), "bacnet::storm", tags=["recon", "bacnet"])
-        print(colorize(f"[✓] BACnet/IP complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("BACnet/IP", before)
 
         # DNP3
         before = len(self.session.findings)
@@ -7616,7 +7826,7 @@ class OTPcapAnalyzer:
                         f"dnp3::{restart_kind.replace(' ', '-')}::{src_d}::{dst_d}",
                         tags=["dnp3", "restart", "intrusion"],
                     )
-        print(colorize(f"[✓] DNP3 complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("DNP3", before)
 
         # IEC 61850
         before = len(self.session.findings)
@@ -7635,7 +7845,7 @@ class OTPcapAnalyzer:
                             [f"Source MAC {src_mac} stNum values: {values[:10]}"],
                             [], [], "IEC 61850 GOOSE", sorted(i61["pcap_names"]),
                             f"iec61850::stnum::{src_mac}", tags=["intrusion", "iec61850"])
-        print(colorize(f"[✓] IEC 61850 / GOOSE / MMS complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("IEC 61850 / GOOSE / MMS", before)
 
         # IEC 104
         before = len(self.session.findings)
@@ -7644,7 +7854,7 @@ class OTPcapAnalyzer:
                 self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected IEC 60870-5-104 traffic not observed",
                     "IEC 60870-5-104 was expected but no traffic was observed on TCP/2404.",
                     ["No TCP/2404 packets matched."], [], [], "IEC 60870-5-104", pcap_name_list, "absence::iec104")
-        print(colorize(f"[✓] IEC 60870-5-104 complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("IEC 60870-5-104", before)
 
         # MQTT
         before = len(self.session.findings)
@@ -7673,7 +7883,7 @@ class OTPcapAnalyzer:
                         "share the ID and keep evicting each other, which is also how a client ID is hijacked.",
                         [f"CONNECT intervals (s): {intervals[:10]}"], [src], [], "MQTT",
                         sorted(mq["pcap_names"]), f"mqtt::reconnect::{src}::{client_id}", tags=["mqtt"])
-        print(colorize(f"[✓] MQTT complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("MQTT", before)
 
         # OPC-UA
         before = len(self.session.findings)
@@ -7706,7 +7916,7 @@ class OTPcapAnalyzer:
                         [f"Browse requests: {count} | Read requests: {opc['read_counts'][src]}"],
                         [src], [], "OPC-UA", sorted(opc["pcap_names"]),
                         f"opcua::recon::{src}", tags=["discovery", "opcua"])
-        print(colorize(f"[✓] OPC-UA complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("OPC-UA", before)
 
         # EtherNet/IP
         before = len(self.session.findings)
@@ -7715,7 +7925,7 @@ class OTPcapAnalyzer:
                 self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected EtherNet/IP traffic not observed",
                     "EtherNet/IP / CIP was declared as expected, but no TCP/44818 or UDP/2222 traffic was observed.",
                     ["No EtherNet/IP packets matched."], [], [], "EtherNet/IP", pcap_name_list, "absence::enip")
-        print(colorize(f"[✓] EtherNet/IP and CIP complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("EtherNet/IP and CIP", before)
 
         # Siemens
         before = len(self.session.findings)
@@ -7724,7 +7934,7 @@ class OTPcapAnalyzer:
                 self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected Siemens traffic not observed",
                     "Siemens / PROFINET was declared as expected, but no relevant traffic was observed.",
                     ["No S7/PROFINET packets matched."], [], [], "Siemens S7 / PROFINET", pcap_name_list, "absence::siemens")
-        print(colorize(f"[✓] Siemens S7comm and PROFINET complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("Siemens S7comm and PROFINET", before)
 
         # Physical Security
         before = len(self.session.findings)
@@ -7748,7 +7958,7 @@ class OTPcapAnalyzer:
                     [st["sample"] for st in camera_streams.values() if st["sample"]][:10],
                     viewers[:20], [camera], "RTSP", sorted(camera_pcaps),
                     f"rtsp::noauth::{camera}", tags=["noauth", "camera"])
-        print(colorize(f"[✓] Physical Security Protocols complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("Physical Security Protocols", before)
 
         # Omron FINS
         before = len(self.session.findings)
@@ -7767,7 +7977,42 @@ class OTPcapAnalyzer:
             self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected Omron FINS traffic not observed",
                 "Omron FINS (TCP/UDP 9600) was declared as expected, but no traffic was observed on that port.",
                 ["No TCP/UDP 9600 packets matched."], [], [], "Omron FINS", pcap_name_list, "absence::fins")
-        print(colorize(f"[✓] Omron FINS complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("Omron FINS", before)
+
+        # Triconex TriStation (safety instrumented systems)
+        before = len(self.session.findings)
+        declared_hosts = {item.strip().lower() for item in
+                          re.split(r"[,;\s]+", self.session.environment_answers.get("known_hmis", "")) if item.strip()}
+        for (eng_host, controller), info in sorted(tristation.items(), key=lambda item: -item[1]["packets"]):
+            first, last = info["first"] or 0.0, info["last"] or 0.0
+            declared = eng_host.lower() in declared_hosts
+            # An undeclared host talking to a safety controller is CRITICAL until
+            # the site confirms it; a declared engineering workstation is HIGH.
+            self.add_finding(
+                SEVERITY_HIGH if declared else SEVERITY_CRITICAL, "Safety Instrumented Systems",
+                "Triconex TriStation safety-controller traffic observed",
+                f"{eng_host} exchanged {info['packets']:,} TriStation packets with safety controller {controller} "
+                f"on UDP 1502 over {human_duration(last - first)}, from {format_epoch(first)} to {format_epoch(last)}. "
+                "TriStation is the engineering protocol of Schneider Electric Triconex safety instrumented systems — "
+                "it can read and change the safety logic. "
+                + ("The source is listed as a known engineering workstation; confirm the session was a planned SIS change."
+                   if declared else "The source is not listed as a known engineering workstation, so this is "
+                   "reported as CRITICAL until the site confirms the session."),
+                [f"Safety controller: {controller} — TriStation (UDP 1502)",
+                 f"Engineering host: {eng_host}" + (" (declared engineering workstation)" if declared else ""),
+                 f"{info['packets']:,} packets ({info['to_controller']:,} sent to the controller) in "
+                 f"{', '.join(sorted(info['pcaps']))}",
+                 f"Session window: {format_epoch(first)} – {format_epoch(last)} ({human_duration(last - first)}) — "
+                 f"Wireshark: udp.port == 1502 && frame.time_epoch >= {first:.6f} && frame.time_epoch <= {last:.6f}"],
+                [eng_host], [controller], "Triconex TriStation", sorted(info["pcaps"]),
+                f"tristation::{eng_host}::{controller}", tags=["sis", "tristation"],
+                first_seen=f"{first:.6f}", last_seen=f"{last:.6f}",
+            )
+        if not tristation and self._expected_protocol(["tristation", "triconex"]):
+            self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected Triconex TriStation traffic not observed",
+                "Triconex TriStation (UDP 1502) was declared as expected, but no traffic was observed on that port.",
+                ["No UDP 1502 packets matched."], [], [], "Triconex TriStation", pcap_name_list, "absence::tristation")
+        self._detector_done("Triconex TriStation", before)
 
         # GE SRTP
         before = len(self.session.findings)
@@ -7786,7 +8031,7 @@ class OTPcapAnalyzer:
             self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected GE SRTP traffic not observed",
                 "GE SRTP (TCP 18245) was declared as expected, but no traffic was observed on that port.",
                 ["No TCP 18245 packets matched."], [], [], "GE SRTP", pcap_name_list, "absence::srtp")
-        print(colorize(f"[✓] GE SRTP complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("GE SRTP", before)
 
         # Schneider UMAS (Modbus function code 90)
         before = len(self.session.findings)
@@ -7809,7 +8054,7 @@ class OTPcapAnalyzer:
                 "Schneider UMAS was declared as expected, but no Modbus function code 90 traffic was observed. UMAS "
                 "only appears while an engineering session is open, so absence is normal outside maintenance work.",
                 ["No Modbus function code 90 packets matched."], [], [], "Schneider UMAS", pcap_name_list, "absence::umas")
-        print(colorize(f"[✓] Schneider UMAS complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("Schneider UMAS", before)
 
         # Mitsubishi MELSEC
         before = len(self.session.findings)
@@ -7828,7 +8073,7 @@ class OTPcapAnalyzer:
             self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected Mitsubishi MELSEC traffic not observed",
                 "Mitsubishi MELSEC SLMP (TCP 5007) was declared as expected, but no traffic was observed on that port.",
                 ["No TCP 5007 packets matched."], [], [], "Mitsubishi MELSEC", pcap_name_list, "absence::melsec")
-        print(colorize(f"[✓] Mitsubishi MELSEC complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("Mitsubishi MELSEC", before)
 
         # OSIsoft PI Server
         before = len(self.session.findings)
@@ -7848,7 +8093,7 @@ class OTPcapAnalyzer:
             self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected OSIsoft PI historian traffic not observed",
                 "A PI historian was declared as expected, but no traffic was observed on TCP 5450 or 5457.",
                 ["No TCP 5450/5457 packets matched."], [], [], "OSIsoft PI", pcap_name_list, "absence::pi_srv")
-        print(colorize(f"[✓] OSIsoft PI Server complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("OSIsoft PI Server", before)
 
         # Ignition Gateway
         before = len(self.session.findings)
@@ -7868,7 +8113,7 @@ class OTPcapAnalyzer:
             self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected Ignition Gateway traffic not observed",
                 "Ignition was declared as expected, but no traffic was observed on TCP 62541 or 8060.",
                 ["No TCP 62541/8060 packets matched."], [], [], "Ignition Gateway", pcap_name_list, "absence::ignition")
-        print(colorize(f"[✓] Ignition Gateway complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("Ignition Gateway", before)
 
         # Node-RED
         before = len(self.session.findings)
@@ -7904,7 +8149,7 @@ class OTPcapAnalyzer:
             self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected Node-RED traffic not observed",
                 "Node-RED (TCP 1880) was declared as expected, but no traffic was observed on that port.",
                 ["No TCP 1880 packets matched."], [], [], "Node-RED", pcap_name_list, "absence::nodered")
-        print(colorize(f"[✓] Node-RED complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("Node-RED", before)
 
         # Audio/Video streaming
         before = len(self.session.findings)
@@ -8084,7 +8329,7 @@ class OTPcapAnalyzer:
                 "Audio/video streaming was declared as expected, but no SIP, RTP, RTSP, MPEG-TS, RTMP, or "
                 "media-like UDP streams were observed in the capture.",
                 ["No A/V signaling or streaming rows matched."], [], [], "A/V Streaming", pcap_name_list, "absence::av_media")
-        print(colorize(f"[✓] Audio/Video streaming complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("Audio/Video streaming", before)
 
         # Zigbee
         before = len(self.session.findings)
@@ -8129,7 +8374,7 @@ class OTPcapAnalyzer:
             self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected Zigbee traffic not observed",
                 "Zigbee / IEEE 802.15.4 was declared as expected, but no matching frames were observed.",
                 ["No zbee_nwk / zbee_aps / wpan packets matched."], [], [], "Zigbee", pcap_name_list, "absence::zigbee")
-        print(colorize(f"[✓] Zigbee complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("Zigbee", before)
 
         # CoAP
         before = len(self.session.findings)
@@ -8168,7 +8413,7 @@ class OTPcapAnalyzer:
             self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected CoAP traffic not observed",
                 "CoAP (UDP 5683/5684) was declared as expected, but no matching traffic was observed.",
                 ["No CoAP packets matched."], [], [], "CoAP", pcap_name_list, "absence::coap")
-        print(colorize(f"[✓] CoAP complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("CoAP", before)
 
         # Z-Wave — dedicated pass (cannot share the combined filter with wpan/zbee_nwk
         # because the zwave tshark dissector conflicts with the wpan dissector and
@@ -8193,7 +8438,7 @@ class OTPcapAnalyzer:
                 _zwave_dissector_available = False
                 break  # no point trying remaining pcaps
         if not _zwave_dissector_available:
-            print(colorize("[i] Z-Wave dissector not available in this tshark build — skipping Z-Wave detection.", "INFO"))
+            self._detector_skipped("Z-Wave", "the Z-Wave dissector is not in this tshark build")
         elif zwave["rows_seen"]:
             self.add_finding(
                 SEVERITY_MEDIUM, "Z-Wave",
@@ -8210,7 +8455,7 @@ class OTPcapAnalyzer:
             self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected Z-Wave traffic not observed",
                 "Z-Wave was declared as expected, but no matching frames were observed.",
                 ["No Z-Wave packets matched."], [], [], "Z-Wave", pcap_name_list, "absence::zwave")
-        print(colorize(f"[✓] Z-Wave complete. New findings added: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("Z-Wave", before)
 
         # Store hygiene TCP state for check_network_hygiene to consume
         self._hygiene_tcp_state: Dict[str, Any] = hyg
@@ -8260,7 +8505,7 @@ class OTPcapAnalyzer:
                 f"beacon::{bsrc}::{bdst}::{bport}",
                 tags=["beacon", "c2", "intrusion"] + (["public"] if dst_public else []),
             )
-        print(colorize(f"[✓] Beaconing analysis complete. New findings: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("Beaconing analysis", before)
 
         # ---- DNS finalization ---------------------------------------
         before = len(self.session.findings)
@@ -8335,7 +8580,7 @@ class OTPcapAnalyzer:
                 f"dns::entropy::{src2}::{hashlib.sha1(qname.encode()).hexdigest()[:10]}",
                 tags=["dga", "dns_tunneling", "intrusion"],
             )
-        print(colorize(f"[✓] DNS analysis complete. New findings: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("DNS analysis", before)
 
         # ---- SNMP depth finalization --------------------------------
         before = len(self.session.findings)
@@ -8380,7 +8625,7 @@ class OTPcapAnalyzer:
                     f"snmp::community::{community}",
                     tags=["credential_exposure", "snmp"],
                 )
-        print(colorize(f"[✓] SNMP depth analysis complete. New findings: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("SNMP depth analysis", before)
 
         # ---- TLS inspection finalization ----------------------------
         before = len(self.session.findings)
@@ -8449,7 +8694,7 @@ class OTPcapAnalyzer:
                 f"tls::ja3::{src2}::{dst2}::{ja3}",
                 tags=["intrusion", "tls", "c2", "offensive_tool"],
             )
-        print(colorize(f"[✓] TLS inspection complete. New findings: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("TLS inspection", before)
 
         # ---- NTP / Capture integrity finalization -------------------
         before = len(self.session.findings)
@@ -8518,7 +8763,7 @@ class OTPcapAnalyzer:
                     f"ntp::multi-server::{src_n}",
                     tags=["time-sync"],
                 )
-        print(colorize(f"[✓] NTP / capture-integrity complete. New findings: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("NTP / capture-integrity", before)
 
         # ---- IT-noise-on-OT finalization ----------------------------
         before = len(self.session.findings)
@@ -8610,7 +8855,7 @@ class OTPcapAnalyzer:
                 f"intrusion::icmp-unreach::{dst_icmp}",
                 tags=["recon", "icmp"],
             )
-        print(colorize(f"[✓] IT-noise / DHCP / ICMP-sweep complete. New findings: {len(self.session.findings) - before}", "SUCCESS"))
+        self._detector_done("IT-noise / DHCP / ICMP-sweep", before)
 
     def run_optional_checks(self, pcaps: Sequence[Path]) -> None:
         """Run the analysis categories after inventory without per-check prompts."""
@@ -8632,13 +8877,17 @@ class OTPcapAnalyzer:
         # Phase 1: single combined tshark pass for all protocol checks
         eta_s = per_step_eta.get("streaming")
         eta_text = f" (est {self._format_duration(eta_s)})" if eta_s else ""
-        self._log_ts(f"[…] Streaming protocol pass starting{eta_text}")
+        self._log_ts(f"[…] Protocol checks across {len(pcaps)} file(s){eta_text}")
         t0 = time.time()
         self._run_streaming_protocol_checks(pcaps)
         elapsed = time.time() - t0
         self._log_ts(colorize(
-            f"[✓] Streaming protocol pass complete. Took {self._format_duration(elapsed)}.",
+            f"[✓] Protocol checks complete ({self._format_duration(elapsed)}): {self._detector_summary()}",
             "SUCCESS"))
+        skipped = [f"{name} ({reason})" for name, _, reason in self._detector_results if reason]
+        if skipped:
+            self._log_ts(f"    Not checked: {'; '.join(skipped)}.")
+        self._print_coverage()
 
         # Phase 2: separate passes / session-data checks
         remaining: Dict[str, Callable[[Sequence[Path]], int]] = {
@@ -8653,7 +8902,8 @@ class OTPcapAnalyzer:
                 continue
             eta_s = per_step_eta.get(key)
             eta_text = f" (est {self._format_duration(eta_s)})" if eta_s else ""
-            self._log_ts(f"\n[…] {name}: {description}{eta_text}")
+            print()
+            self._log_ts(f"[…] {name}: {description}{eta_text}")
             # Network Hygiene specifically: surface what the slow part is so
             # the user knows what they're waiting on.  RDAP/PTR lookups
             # dominate when there are many distinct public IPs.
@@ -8676,8 +8926,8 @@ class OTPcapAnalyzer:
             elapsed = time.time() - t0
             after = len(self.session.findings)
             self._log_ts(colorize(
-                f"[✓] {name} complete. Took {self._format_duration(elapsed)}. "
-                f"New findings added: {after - before}", "SUCCESS"))
+                f"[✓] {name} complete ({self._format_duration(elapsed)}) — "
+                f"{after - before} new finding{'s' if after - before != 1 else ''}.", "SUCCESS"))
 
     def compute_per_device_risk(self, top_n: int = 15) -> List[Dict[str, Any]]:
         """Aggregate severity-weighted risk per device.
@@ -8850,7 +9100,8 @@ class OTPcapAnalyzer:
         report_date = datetime.now().strftime("%Y%m%d")
         folder = Path(self.session.folder)
         slug = safe_slug(self.session.site)
-        summary_path = folder / f"OTscope_Purdue_Summary_{slug}_{report_date}.svg"
+        summary_path, paired_detail_path = _versioned_paths(
+            folder, [f"OTscope_Purdue_Summary_{slug}_{report_date}", f"OTscope_Purdue_Detail_{slug}_{report_date}"], "svg")
         detail_path: Optional[Path] = None
 
         # ── severity → display colour ──────────────────────────────────────
@@ -8995,7 +9246,7 @@ class OTPcapAnalyzer:
         )
         svg_lines.append('</svg>')
         summary_path.write_text("\n".join(svg_lines), encoding="utf-8")
-        print(colorize(f"[✓] Purdue Summary SVG: {summary_path}", "SUCCESS"))
+        self._note_artifact(summary_path, "Network diagram — open in a web browser", "Purdue summary diagram written")
 
         # ── DETAIL SVG (≤50 devices only) ─────────────────────────────────
         n_total = len(self.session.devices)
@@ -9003,7 +9254,7 @@ class OTPcapAnalyzer:
             print(f"[i] Purdue Detail SVG skipped ({n_total:,} devices > 50 limit).")
             return summary_path, None
 
-        detail_path = folder / f"OTscope_Purdue_Detail_{slug}_{report_date}.svg"
+        detail_path = paired_detail_path
 
         # Assign grid positions for devices within each layer
         DW = 1100       # device-area width
@@ -9219,7 +9470,7 @@ class OTPcapAnalyzer:
 
         d_lines.append('</svg>')
         detail_path.write_text("\n".join(d_lines), encoding="utf-8")
-        print(colorize(f"[✓] Purdue Detail SVG: {detail_path}", "SUCCESS"))
+        self._note_artifact(detail_path, "Per-device network diagram", "Purdue detail diagram written")
 
         return summary_path, detail_path
 
@@ -9239,6 +9490,7 @@ class OTPcapAnalyzer:
                          if issue["category"] not in NON_SCORING_CATEGORIES]
         issue_ids = report_issue_ids(report_issues)
         remediation_plan = build_remediation_plan(report_issues, issue_ids)
+        coverage = self.traffic_coverage()
         try:
             from docx import Document
             from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -9444,6 +9696,19 @@ class OTPcapAnalyzer:
                 f"Risk Score: {risk['score']} ({risk['band']}{band_note}).  "
                 f"Finding breakdown: {sev_line}."
             )
+            if coverage["total_packets"]:
+                coverage_p = document.add_paragraph(
+                    f"Traffic coverage: OTscope identified "
+                    f"{format_share(coverage['identified_packets'], coverage['total_packets'])} of "
+                    f"{coverage['total_packets']:,} packets."
+                    + ("  Not identified: " + "; ".join(self._flow_text(c) for c in coverage["unidentified"][:3]) + "."
+                       if coverage["unidentified"] else "")
+                )
+                if coverage["identified_packets"] < coverage["total_packets"] / 2:
+                    coverage_p.add_run(
+                        "  Most of the traffic could not be identified, so a low score does not mean the "
+                        "capture is benign."
+                    ).bold = True
             if top_asset_text:
                 document.add_paragraph(f"Top affected assets: {top_asset_text}.")
             if highest_finding:
@@ -10110,7 +10375,7 @@ class OTPcapAnalyzer:
 
             _color_header_text()
             document.save(report_path)
-            print(colorize(f"[✓] Word report generated: {report_path}", "SUCCESS"))
+            self._note_artifact(report_path, "Word report — start with the Remediation Plan", "Word report written")
             # Always generate companion artifacts alongside the Word report.
             try:
                 self.generate_json_report()
@@ -10132,6 +10397,10 @@ class OTPcapAnalyzer:
                 "",
                 f"Overall Risk Score: {risk['score']} ({risk['band']})"
                 + (f" — {risk['band_reason']}" if risk.get("band_reason") else ""),
+                f"Traffic coverage: {format_share(coverage['identified_packets'], coverage['total_packets'])} of "
+                f"{coverage['total_packets']:,} packets identified"
+                + ("; not identified: " + "; ".join(self._flow_text(c) for c in coverage["unidentified"][:3])
+                   if coverage["unidentified"] else ""),
                 "",
                 "Remediation Plan:",
             ]
@@ -10249,6 +10518,7 @@ class OTPcapAnalyzer:
                     fallback_text.append(f"  - {tid}: {cnt} finding(s)")
             fallback_text.extend(["", "Network Map:", network_map])
             fallback_path.write_text("\n".join(fallback_text), encoding="utf-8")
+            self.artifacts_written.append((fallback_path, "Plain-text report (Word generation failed)"))
             print(colorize(f"[!] Word report generation failed ({exc}). Plain-text report saved to {fallback_path}", SEVERITY_HIGH))
             return fallback_path
 
@@ -10267,6 +10537,7 @@ class OTPcapAnalyzer:
         report_issues = [issue for issue in aggregated_report_issues(self.session)
                          if issue["category"] not in NON_SCORING_CATEGORIES]
         issue_ids = report_issue_ids(report_issues)
+        coverage = self.traffic_coverage()
         report_data: Dict[str, Any] = {
             "tool": TOOL_NAME,
             "version": VERSION,
@@ -10289,11 +10560,21 @@ class OTPcapAnalyzer:
                 )
             ],
             "remediation_plan": build_remediation_plan(report_issues, issue_ids),
+            "traffic_coverage": {
+                "total_packets": coverage["total_packets"],
+                "identified_packets": coverage["identified_packets"],
+                "identified_percent": round(100.0 * coverage["identified_packets"] / coverage["total_packets"], 1)
+                                      if coverage["total_packets"] else None,
+                "unidentified_flows": [
+                    {name: flow[name] for name in ("transport", "client", "server", "port", "packets")}
+                    for flow in coverage["unidentified"][:25]
+                ],
+            },
             "connections_count": len(self.session.connections),
             "correlation_summary": correlation_summary_lines(self.session),
         }
         report_path.write_text(pretty_json(report_data), encoding="utf-8")
-        print(colorize(f"[✓] JSON report generated: {report_path}", "SUCCESS"))
+        self._note_artifact(report_path, "Findings, devices, and remediation plan (machine-readable)", "JSON report written")
         return report_path
 
     def export_device_inventory_csv(self) -> Path:
@@ -10355,9 +10636,8 @@ class OTPcapAnalyzer:
                 " | ".join(d.evidence),
             ])
         inventory_path.write_text(buf.getvalue(), encoding="utf-8")
-        print(colorize(
-            f"[✓] Device inventory CSV addendum: {inventory_path} ({len(all_devices):,} devices)",
-            "SUCCESS"))
+        self._note_artifact(inventory_path, "Full device list", "Device inventory written",
+                            f" ({len(all_devices):,} devices)")
         return inventory_path
 
     def export_flow_allowlist(self) -> Path:
@@ -10398,7 +10678,8 @@ class OTPcapAnalyzer:
             # default action is ALLOW; asset owner edits before enforcement
             writer.writerow([pkts, s, d, p, proto, sr, dr, "ALLOW"])
         allowlist_path.write_text(buf.getvalue(), encoding="utf-8")
-        print(colorize(f"[✓] Flow allowlist CSV generated: {allowlist_path} ({len(rows)} flows)", "SUCCESS"))
+        self._note_artifact(allowlist_path, "Observed flows, for firewall and segmentation review", "Flow allowlist written",
+                            f" ({len(rows):,} flow{'s' if len(rows) != 1 else ''})")
         return allowlist_path
 
     def analyze_pcaps(self, pcaps: Sequence[Path]) -> None:
@@ -10430,7 +10711,13 @@ class OTPcapAnalyzer:
         summary = self.compute_risk_summary()
         print_header("Risk Summary")
         print(colorize(risk_banner(summary["band"]), SEVERITY_CRITICAL if summary["band"] in {"HIGH", "SEVERE"} else SEVERITY_MEDIUM, bold=True))
-        print(f"    Score {summary['score']}" + (f" — band {summary['band_reason']}" if summary.get("band_reason") else ""))
+        print(f"    Score {summary['score']}" + (f" — band {summary['band_reason']}" if summary.get("band_reason") else "")
+              + ("" if self.session.findings else " — no findings."))
+        coverage = self.traffic_coverage()
+        if coverage["total_packets"] and coverage["identified_packets"] < coverage["total_packets"] / 2:
+            print(colorize(
+                f"    [!] Only {format_share(coverage['identified_packets'], coverage['total_packets'])} of the "
+                "traffic was identified, so this score does not mean the capture is benign.", SEVERITY_MEDIUM))
         for item in summary["top_contributors"]:
             print(f"    - [{item['severity']}] {item['title']} (weight {item['weight']})")
         # Print top-5 riskiest devices for quick triage
@@ -10497,27 +10784,152 @@ def print_network_safety_banner() -> None:
     print()
 
 
-def available_session_files(folder: Path) -> List[Path]:
-    """Return session files in a folder."""
-    return sorted(folder.glob("*.otpa_session"))
+def saved_sessions(folder: Path) -> List[Path]:
+    """Session files in a folder, most recently updated first."""
+    try:
+        return sorted(folder.glob("*.otpa_session"), key=lambda item: item.stat().st_mtime, reverse=True)
+    except OSError:
+        return []
+
+
+def describe_session_file(path: Path) -> str:
+    """One line describing a saved session: site, captures, findings, last update."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return path.stem
+    details = [f"updated {datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M')}"]
+    # Sessions of flood-scale captures can be large; describe those by date only.
+    if stat.st_size <= 20 * 1024 * 1024:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            captures = len(payload.get("processed_pcaps") or {})
+            findings = len(payload.get("findings") or [])
+            details = [f"site {payload.get('site') or '—'}",
+                       f"{captures} capture{'s' if captures != 1 else ''}",
+                       f"{findings} finding{'s' if findings != 1 else ''}"] + details
+        except (OSError, ValueError):
+            pass
+    return f"{path.stem} — {', '.join(details)}"
+
+
+def default_session_folder(config: Dict[str, Any]) -> Path:
+    """Where saved sessions are: output\\ next to the script, else the last capture folder."""
+    if _OUTPUT_ROOT.is_dir():
+        return _OUTPUT_ROOT
+    return Path(config.get("last_pcap_folder") or ".").expanduser()
+
+
+def unique_session_name(folder: Path, name: str) -> str:
+    """First of name_2, name_3, … that has no session file in folder."""
+    base = safe_slug(name)
+    index = 2
+    while (folder / f"{base}_{index}.otpa_session").exists():
+        index += 1
+    return f"{base}_{index}"
 
 
 def choose_session_file(folder: Path) -> Optional[Path]:
-    """Prompt the user to choose a saved session file."""
-    sessions = available_session_files(folder)
-    if not sessions:
-        print("[!] No session state files were found in that folder.")
-        return None
-    for index, path in enumerate(sessions, start=1):
-        print(f"    {index}. {path.name}")
-    answer = prompt_input("Select session number")
+    """List saved sessions; pick one by number or name, or look in another folder."""
+    while True:
+        sessions = saved_sessions(folder)
+        if sessions:
+            print(f"\nSaved sessions in {folder}:")
+            for index, path in enumerate(sessions, start=1):
+                print(f"    {index}. {describe_session_file(path)}")
+            answer = prompt_input("Select a session (number or name), or enter another folder to look in")
+        else:
+            print(f"[!] No saved sessions in {folder}.")
+            answer = prompt_input("Folder containing the session file (blank to cancel)")
+        if not answer:
+            return None
+        if answer.isdigit() and sessions:
+            if 1 <= int(answer) <= len(sessions):
+                return sessions[int(answer) - 1]
+            print(f"[!] Choose a number from 1 to {len(sessions)}.")
+            continue
+        named = [path for path in sessions if answer.lower() in (path.stem.lower(), path.name.lower())]
+        if named:
+            return named[0]
+        candidate = Path(answer).expanduser()
+        if candidate.is_file() and candidate.suffix == ".otpa_session":
+            return candidate
+        if candidate.is_dir():
+            folder = candidate
+            continue
+        print(f"[!] '{answer}' is not a listed session or a folder.")
+
+
+def default_capture_folder(session: SessionState, config: Dict[str, Any]) -> Path:
+    """Folder the session's captures came from, else pcaps\\, else the last capture folder."""
+    for processed in session.processed_pcaps.values():
+        parent = Path(processed.path).parent
+        if parent.is_dir():
+            return parent
+    if _PCAPS_ROOT.is_dir():
+        return _PCAPS_ROOT
+    return Path(config.get("last_pcap_folder") or ".").expanduser()
+
+
+def open_with_default_app(path: Path) -> None:
+    """Open a local file with the operating system's default application."""
     try:
-        selection = int(answer)
-    except ValueError:
-        return None
-    if 1 <= selection <= len(sessions):
-        return sessions[selection - 1]
-    return None
+        if sys.platform.startswith("win"):
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+    except Exception as exc:  # noqa: BLE001 — opening is a convenience only
+        print(colorize(f"[!] Could not open {path.name}: {exc}", SEVERITY_MEDIUM))
+
+
+_ARTIFACT_ORDER = {".docx": 0, ".txt": 0, ".json": 1, ".svg": 2, ".csv": 3, ".otpa_session": 4, ".otpa_baseline": 5}
+
+
+def print_run_summary(analyzer: "OTPcapAnalyzer") -> None:
+    """End-of-run summary: findings, traffic coverage, first actions, and the files written."""
+    session = analyzer.session
+    if session is None:
+        return
+    risk = analyzer.compute_risk_summary()
+    scoring = [finding for finding in session.findings if finding.category not in NON_SCORING_CATEGORIES]
+    counts = Counter(finding.severity for finding in scoring)
+    ordered = sorted(counts, key=lambda severity: SEVERITY_ORDER.get(severity, 0), reverse=True)
+    print_header("Summary")
+    print(f"Risk: {risk['band']} (score {risk['score']}) — "
+          + (" · ".join(f"{counts[severity]} {severity}" for severity in ordered) or "no findings"))
+    coverage = analyzer.traffic_coverage()
+    if coverage["total_packets"]:
+        line = (f"Traffic identified: {format_share(coverage['identified_packets'], coverage['total_packets'])} "
+                f"of {coverage['total_packets']:,} packets")
+        if coverage["identified_packets"] < coverage["total_packets"] / 2:
+            print(colorize(line + " — most of this capture could not be assessed.", SEVERITY_MEDIUM))
+        else:
+            print(line)
+    issues = [issue for issue in aggregated_report_issues(session) if issue["category"] not in NON_SCORING_CATEGORIES]
+    plan = build_remediation_plan(issues, report_issue_ids(issues))
+    if plan:
+        print("What to do first (from the Remediation Plan):")
+        for index, row in enumerate(plan[:3], start=1):
+            ids = ", ".join(item["id"] for item in row["findings"][:4] if item["id"])
+            print(f"  {index}. {row['priority_label']} — {row['action']}" + (f" ({ids})" if ids else ""))
+    written = sorted(analyzer.artifacts_written,
+                     key=lambda item: _ARTIFACT_ORDER.get(item[0].suffix.lower(), 9))
+    if written:
+        folders = {path.parent for path, _ in written}
+        if len(folders) == 1:
+            print(f"Files written to {next(iter(folders))}:")
+            width = max(len(path.name) for path, _ in written)
+            for path, description in written:
+                print(f"  {path.name:<{width}}  {description}")
+        else:
+            print("Files written:")
+            for path, description in written:
+                print(f"  {path}  — {description}")
+    reports = [path for path, _ in written if path.suffix.lower() == ".docx"]
+    if reports and not NON_INTERACTIVE and prompt_yes_no("Open the Word report now?", True):
+        open_with_default_app(reports[-1])
 
 
 def warn_if_pcaps_changed(session: SessionState) -> None:
@@ -10596,7 +11008,9 @@ def _print_pcap_subfolders() -> None:
 
 def startup_menu() -> str:
     """Prompt for the startup session path."""
-    answer = prompt_input("Start a NEW session, RESUME an existing session, or ADD pcaps to an existing session? [N/R/A]", "N")
+    saved = len(saved_sessions(_OUTPUT_ROOT)) if _OUTPUT_ROOT.is_dir() else 0
+    saved_text = f" ({saved} saved)" if saved else ""
+    answer = prompt_input(f"Start a NEW session, RESUME a saved session{saved_text}, or ADD captures to one? [N/R/A]", "N")
     answer = answer.strip().lower()
     if answer.startswith("r"):
         return "resume"
@@ -10647,8 +11061,11 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--format", dest="report_format",
         choices=["word", "json", "both"], default="word",
-        help="Report format produced at the end of a --scan run (default: word).",
+        help=("Report produced at the end of a --scan run: word (default — the Word report plus JSON and "
+              "diagrams) or json (JSON and diagrams only). 'both' is the same as word."),
     )
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print every protocol detector's result and per-file match counts.")
     parser.add_argument(
         "--technical-appendix", dest="technical_appendix",
         action="store_true", default=False,
@@ -10676,15 +11093,16 @@ def prompt_report_generation(
     fmt: Optional[str] = None,
     technical_appendix: bool = False,
 ) -> None:
-    """Ask which report format(s) to produce and generate them.
+    """Ask which report to produce and generate it.
 
-    When *fmt* is provided (``'word'``, ``'json'``, or ``'both'``) the format
-    prompt is skipped and that format is used directly.  In NON_INTERACTIVE
-    mode the generation prompt is also skipped.
+    The Word report always brings the JSON report and the Purdue diagrams with
+    it; JSON writes those two without the Word document.  When *fmt* is given
+    (``'word'``, ``'json'``, or ``'both'`` — an alias of word) the prompt is
+    skipped.  In NON_INTERACTIVE mode the prompt is also skipped.
     """
     if fmt is None and not NON_INTERACTIVE:
         fmt = prompt_input(
-            f"{prompt_text} — format: Word / JSON / Both / Skip [W/J/B/S]", "W"
+            f"{prompt_text} [W] Word report (+ JSON and diagrams) / [J] JSON and diagrams only / [S] skip", "W"
         ).strip().lower()
         if fmt in {"s", "skip", "n", "no"}:
             return
@@ -10716,6 +11134,9 @@ def scan_flow(analyzer: OTPcapAnalyzer, config: Dict[str, Any], args: argparse.N
     default_site = _SCRIPT_DIR.name if folder.resolve() == _PCAPS_ROOT.resolve() else folder.name
     site = getattr(args, "site", None) or default_site or "unknown-site"
     session_name = safe_slug(f"{site}_{datetime.now().strftime('%Y%m%d')}")
+    out_folder = _OUTPUT_ROOT if _OUTPUT_ROOT.is_dir() else folder
+    if (out_folder / f"{session_name}.otpa_session").exists():
+        session_name = unique_session_name(out_folder, session_name)
 
     env_answers: Dict[str, str] = {key: "" for key, _ in discovery_questions()}
     if getattr(args, "env", None):
@@ -10726,8 +11147,8 @@ def scan_flow(analyzer: OTPcapAnalyzer, config: Dict[str, Any], args: argparse.N
     print(f"[>] Scan mode — {len(selected_pcaps)} pcap(s) in '{folder}'")
     print(f"[>] Assessor: {assessor}   Site: {site}   Session: {session_name}")
     print(f"[>] Report format: {getattr(args, 'report_format', 'word')}")
+    print(f"[>] Results will be written to {out_folder}")
 
-    out_folder = _OUTPUT_ROOT if _OUTPUT_ROOT.is_dir() else folder
     analyzer.create_session(out_folder, session_name, site, assessor, env_answers)
     config["last_pcap_folder"] = str(folder)
     config["last_assessor_name"] = assessor
@@ -10741,6 +11162,7 @@ def scan_flow(analyzer: OTPcapAnalyzer, config: Dict[str, Any], args: argparse.N
         fmt=getattr(args, "report_format", "word"),
         technical_appendix=getattr(args, "technical_appendix", False),
     )
+    print_run_summary(analyzer)
 
 
 def new_session_flow(
@@ -10769,28 +11191,50 @@ def new_session_flow(
         raise SystemExit("No pcap files selected.")
     assessor = prompt_input("Assessor name", assessor_hint or config.get("last_assessor_name") or None)
     site = prompt_input("Site/post name", site_hint or config.get("last_site_name") or None)
-    session_name = prompt_input("Session name", safe_slug(f"{site}_{datetime.now().strftime('%Y%m%d')}"))
-    existing_env: Dict[str, str] = {}
-    if env_hint:
-        existing_env["environment_type"] = env_hint
-    env_answers = ask_environment_questions(existing_env)
     out_folder = _OUTPUT_ROOT if _OUTPUT_ROOT.is_dir() else folder
-    analyzer.create_session(out_folder, session_name, site, assessor, env_answers)
+    session_name = prompt_input("Session name", safe_slug(f"{site}_{datetime.now().strftime('%Y%m%d')}"))
     config["last_pcap_folder"] = str(folder)
     config["last_assessor_name"] = assessor
     config["last_site_name"] = site
     save_config(config)
+    existing = out_folder / f"{safe_slug(session_name)}.otpa_session"
+    if existing.exists():
+        print(colorize(f"[!] A session with this name already exists: {describe_session_file(existing)}",
+                       SEVERITY_MEDIUM))
+        free_name = unique_session_name(out_folder, session_name)
+        choice = prompt_input(f"Add these captures to it, use a new name ({free_name}), or overwrite it? [A/N/O]",
+                              "N").strip().lower()
+        if choice.startswith("a"):
+            session = analyzer.load_session(existing)
+            new_pcaps = [path for path in selected_pcaps if path.name not in session.processed_pcaps]
+            if new_pcaps:
+                print(f"[>] Results will be written to {out_folder}")
+                print_header("Analysis Start")
+                analyzer.analyze_pcaps(new_pcaps)
+            else:
+                print("[i] Those captures are already in this session — nothing new to analyze.")
+            prompt_report_generation(analyzer, "Generate updated report now?", technical_appendix=technical_appendix)
+            print_run_summary(analyzer)
+            return
+        if not choice.startswith("o"):
+            session_name = free_name
+            print(f"[>] Using session name {session_name}.")
+    existing_env: Dict[str, str] = {}
+    if env_hint:
+        existing_env["environment_type"] = env_hint
+    env_answers = ask_environment_questions(existing_env)
+    analyzer.create_session(out_folder, session_name, site, assessor, env_answers)
+    print(f"[>] Results will be written to {out_folder}")
     print_header("Analysis Start")
     analyzer.analyze_pcaps(selected_pcaps)
     prompt_report_generation(analyzer, "Generate report now?", technical_appendix=technical_appendix)
+    print_run_summary(analyzer)
 
 
 def resume_flow(analyzer: OTPcapAnalyzer, config: Dict[str, Any], session_path: Optional[Path] = None, technical_appendix: bool = False) -> None:
     """Resume or inspect an existing session."""
     if session_path is None:
-        folder_text = prompt_input("Folder containing the session file", config.get("last_pcap_folder") or None)
-        folder = Path(folder_text).expanduser()
-        session_path = choose_session_file(folder)
+        session_path = choose_session_file(default_session_folder(config))
         if session_path is None:
             raise SystemExit("No session selected.")
     session = analyzer.load_session(session_path)
@@ -10802,12 +11246,14 @@ def resume_flow(analyzer: OTPcapAnalyzer, config: Dict[str, Any], session_path: 
             existing_paths = [Path(item.path) for item in session.processed_pcaps.values() if Path(item.path).exists()]
             analyzer.analyze_pcaps(existing_paths)
             prompt_report_generation(analyzer, "Generate updated report now?", technical_appendix=technical_appendix)
+            print_run_summary(analyzer)
             return
         if answer.startswith("a"):
             add_pcaps_flow(analyzer, config, session_path, technical_appendix=technical_appendix)
             return
         if answer.startswith("g"):
             prompt_report_generation(analyzer, "Generate report?", technical_appendix=technical_appendix)
+            print_run_summary(analyzer)
             return
         if answer.startswith("f"):
             for finding in sorted(session.findings, key=lambda item: (SEVERITY_ORDER.get(item.severity, 0), item.title), reverse=True):
@@ -10822,20 +11268,23 @@ def resume_flow(analyzer: OTPcapAnalyzer, config: Dict[str, Any], session_path: 
 def add_pcaps_flow(analyzer: OTPcapAnalyzer, config: Dict[str, Any], session_path: Optional[Path] = None, technical_appendix: bool = False) -> None:
     """Add new pcaps to an existing session without reprocessing old ones."""
     if session_path is None:
-        folder_text = prompt_input("Folder containing the session file", config.get("last_pcap_folder") or None)
-        folder = Path(folder_text).expanduser()
-        session_path = choose_session_file(folder)
+        session_path = choose_session_file(default_session_folder(config))
         if session_path is None:
             raise SystemExit("No session selected.")
     session = analyzer.load_session(session_path)
-    folder = Path(session.folder)
-    exclude = sorted(session.processed_pcaps.keys())
-    print_header("Add Pcaps")
-    selected_pcaps = select_pcaps_from_folder(folder, exclude_filenames=exclude)
+    session_summary(session)
+    print_header("Add Captures")
+    capture_folder = resolve_pcap_folder(prompt_input("Capture folder", str(default_capture_folder(session, config))))
+    if not capture_folder.is_dir():
+        raise SystemExit(f"Folder not found: {capture_folder}")
+    selected_pcaps = select_pcaps_from_folder(capture_folder, exclude_filenames=sorted(session.processed_pcaps.keys()))
     if not selected_pcaps:
-        raise SystemExit("No new pcaps selected.")
+        raise SystemExit("No new captures selected.")
+    config["last_pcap_folder"] = str(capture_folder)
+    save_config(config)
     analyzer.analyze_pcaps(selected_pcaps)
     prompt_report_generation(analyzer, "Regenerate report now?", technical_appendix=technical_appendix)
+    print_run_summary(analyzer)
 
 
 def report_only_flow(analyzer: OTPcapAnalyzer, session_path: Path, technical_appendix: bool = False) -> None:
@@ -10843,14 +11292,17 @@ def report_only_flow(analyzer: OTPcapAnalyzer, session_path: Path, technical_app
     session = analyzer.load_session(session_path)
     session_summary(session)
     prompt_report_generation(analyzer, "Generate report?", technical_appendix=technical_appendix)
+    print_run_summary(analyzer)
 
 
 def run_application(args: argparse.Namespace) -> None:
     """Run the application according to CLI arguments and prompts."""
-    global CURRENT_ANALYZER, OFFLINE_MODE, NON_INTERACTIVE
+    global CURRENT_ANALYZER, OFFLINE_MODE, NON_INTERACTIVE, VERBOSE
     if args.version:
         print(f"{TOOL_NAME} v{VERSION}")
         return
+    if getattr(args, "verbose", False):
+        VERBOSE = True
     if getattr(args, "offline", False):
         OFFLINE_MODE = True
     if getattr(args, "scan", None):
