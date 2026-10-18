@@ -502,6 +502,46 @@ def unidentified_udp() -> Net:
     return n
 
 
+def _tcp_exchange(n: Net, client: str, server: str, port: int, count: int, start: float, cport: int = 50500) -> None:
+    """A TCP session with opaque request/reply payloads (port-based detection only)."""
+    s = n.session(client, cport, server, port).open(start)
+    for i in range(count):
+        s.c2s(bytes(n.rng.randrange(256) for _ in range(24)), start + 1 + i)
+        s.s2c(bytes(n.rng.randrange(256) for _ in range(64)), start + 1.01 + i)
+        s.ack_c(start + 1.2 + i)
+
+
+def ot_protocol_catalog() -> Net:
+    """Catalog protocols OTscope recognizes without detailed checks: Unitronics PCOM
+    (framed, decoded by tshark), CODESYS (port only), KNX/IP, GE EGD, DLMS/COSEM,
+    openSAFETY, EtherCAT frames without IP, and frames of an unregistered EtherType."""
+    n = Net(seed=25)
+    pcom = n.session("10.15.0.5", 51000, "10.15.0.40", 20256).open(n.t0)
+    ask, reply = b"/00IDED\r", b"/A00IDV100A1\r"
+    for i in range(60):
+        pcom.c2s(bytes([i, 0, 0x65, 0]) + len(ask).to_bytes(2, "little") + ask, n.t0 + 1 + i)
+        pcom.s2c(bytes([i, 0, 0x65, 0]) + len(reply).to_bytes(2, "little") + reply, n.t0 + 1.01 + i)
+    _tcp_exchange(n, "10.15.0.6", "10.15.0.41", 11740, 40, n.t0 + 2)
+    _tcp_exchange(n, "10.15.0.7", "10.15.0.42", 4059, 30, n.t0 + 3, cport=50600)
+    _udp_exchange(n, "10.15.0.20", "10.15.0.21", 3671, 40, n.t0 + 4)
+    _udp_exchange(n, "10.15.0.30", "10.15.0.31", 18246, 40, n.t0 + 5)
+    _udp_exchange(n, "10.15.0.8", "10.15.0.43", 9877, 40, n.t0 + 6)
+    for i in range(300):
+        n.emit(n.t0 + 7 + i * 0.002, "00:01:05:11:22:33", "ff:ff:ff:ff:ff:ff", 0x88A4,
+               bytes([0x0E, 0x10]) + bytes(n.rng.randrange(256) for _ in range(40)))
+    for i in range(30):
+        n.emit(n.t0 + 8 + i * 0.5, "02:00:00:00:aa:01", "ff:ff:ff:ff:ff:ff", 0x88B5, bytes(46))
+    return n
+
+
+def custom_protocol_config() -> Net:
+    """An engineering host talks to a controller on TCP 5555, a port only the site's
+    config file (custom_ot_protocols) describes."""
+    n = Net(seed=26)
+    _tcp_exchange(n, "10.16.0.5", "10.16.0.50", 5555, 40, n.t0 + 1)
+    return n
+
+
 SCENARIOS = {
     "benign_modbus_hmi": benign_modbus_hmi,
     "benign_scada_master": benign_scada_master,
@@ -518,4 +558,6 @@ SCENARIOS = {
     "multi_capture_out_of_order": multi_capture_out_of_order,
     "tristation_sis": tristation_sis,
     "unidentified_udp": unidentified_udp,
+    "ot_protocol_catalog": ot_protocol_catalog,
+    "custom_protocol_config": custom_protocol_config,
 }

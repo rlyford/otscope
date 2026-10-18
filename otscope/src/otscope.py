@@ -72,7 +72,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 
 TOOL_NAME = "OTscope"
-VERSION = "2.8.3"
+VERSION = "2.8.4"
 __author__ = "Ryan Lyford"
 __copyright__ = "© 2026 Ryan Lyford. All rights reserved."
 
@@ -183,12 +183,11 @@ KNOWN_OT_PORTS = {
     62541: "Ignition OPC UA server",
     8060: "Ignition gateway network",
     1880: "Node-RED",
-    1502: "Triconex TriStation (safety controllers)",
 }
 
 # Ports whose server side is a field device (PLC / RTU / IED) rather than an
 # OT server, broker, or historian.  Used for role inference.
-CONTROLLER_PORTS = {102, 502, 2222, 2404, 20000, 44818, 47808, 34962, 34963, 34964, 9600, 18245, 5007, 1502}
+CONTROLLER_PORTS = {102, 502, 2222, 2404, 20000, 44818, 47808, 34962, 34963, 34964, 9600, 18245, 5007}
 
 # 1935 RTMP, 5060/5061 SIP, 8000 Hikvision DVR / HTTP-alt, 37777 Dahua DVR —
 # A/V endpoints are IT-class gear, not OT devices.  NTP and SNMP are neutral
@@ -208,6 +207,339 @@ _SERVICE_PORT_HINTS = set(KNOWN_OT_PORTS) | IT_PORTS | IT_INDICATOR_PORTS | {
 
 # Periodic-by-design traffic that must never be scored as C2 beaconing.
 _BEACON_EXEMPT_PORTS = {53, 123, 137, 138, 161, 162, 514, 1900, 3702, 5353, 5355}
+
+# ----------------------------------------------------------------------
+# OT protocol catalog
+# ----------------------------------------------------------------------
+# Industrial protocols OTscope recognizes but has no detailed checks for.
+# A protocol is identified by its tshark decoder where tshark has one, by
+# port when tshark shows only raw data, or by EtherType when it has no IP
+# layer.  Every row gets the same treatment: a presence finding per host
+# pair (per protocol without IP), the role of the device serving it,
+# coverage credit as "recognized but not assessed", and the "expected but
+# not seen" check.  Ports come from tshark's own registrations where it has
+# a decoder, and from vendor documentation otherwise.  Sites add their own
+# rows in the config file under "custom_ot_protocols".
+# ----------------------------------------------------------------------
+@dataclass(frozen=True)
+class OTProtocol:
+    """One catalog protocol."""
+
+    key: str
+    name: str
+    vendor: str
+    risk: str                          # a key of OT_RISK_CLASSES
+    what: str                          # completes "<name> is ..."
+    ports: Tuple[str, ...] = ()        # "tcp/20256", "udp/1502"
+    ethertypes: Tuple[int, ...] = ()   # for protocols without an IP layer
+    decoders: Tuple[str, ...] = ()     # tshark protocol names in frame.protocols
+    l2_decoders: Tuple[str, ...] = ()  # decoders trusted only on frames without IP
+    role: str = ""                     # role of the device that answers on the port
+    keywords: Tuple[str, ...] = ()     # matched against the "expected protocols" answer
+    wireshark: str = ""                # display filter
+
+
+# Risk class: (report category, severity, finding tag, title).  The tag picks
+# the narrative family (why it matters, steps, owner) in _NARRATIVE_RULES.
+OT_RISK_CLASSES: Dict[str, Tuple[str, str, str, str]] = {
+    "safety_engineering": ("Safety Instrumented Systems", SEVERITY_CRITICAL, "sis", "{name} safety-controller traffic observed"),
+    "safety_io": ("Safety Instrumented Systems", SEVERITY_MEDIUM, "safety_io", "{name} traffic observed"),
+    "programming": ("Controller Programming Protocols", SEVERITY_HIGH, "prog_protocol", "{name} traffic observed"),
+    "control": ("Other OT Protocols", SEVERITY_MEDIUM, "unassessed", "{name} traffic observed"),
+    "building": ("Other OT Protocols", SEVERITY_MEDIUM, "building", "{name} traffic observed"),
+    "metering": ("Other OT Protocols", SEVERITY_LOW, "metering", "{name} traffic observed"),
+    "industrial_ethernet": ("Other OT Protocols", SEVERITY_LOW, "unassessed", "{name} traffic observed"),
+}
+
+_CONTROLLER = "Controller / PLC / RTU"
+OT_PROTOCOLS: List[OTProtocol] = [
+    # Safety systems
+    OTProtocol("tristation", "Triconex TriStation", "Schneider Electric (Triconex)", "safety_engineering",
+               "the engineering protocol of Triconex safety instrumented systems — it can read and change the safety logic",
+               ports=("udp/1502",), role="Controller / Safety System (SIS)", keywords=("tristation", "triconex"),
+               wireshark="udp.port == 1502"),
+    OTProtocol("opensafety", "openSAFETY", "Ethernet POWERLINK Standardization Group", "safety_io",
+               "a safety protocol that carries safety-critical signals between safety controllers and safe I/O devices",
+               ports=("udp/8755", "udp/9877"), decoders=("opensafety", "opensafety_udp"),
+               role="Controller / Safety System (SIS)", keywords=("opensafety",), wireshark="opensafety || opensafety_udp"),
+    OTProtocol("cipsafety", "CIP Safety", "ODVA", "safety_io",
+               "the safety extension of EtherNet/IP that carries safety-critical signals between safety controllers and "
+               "safe I/O devices",
+               decoders=("cipsafety",), keywords=("cip safety", "cipsafety", "guardlogix"), wireshark="cipsafety"),
+    # Controller programming and engineering
+    OTProtocol("pcom", "Unitronics PCOM", "Unitronics", "programming",
+               "the protocol Unitronics PLCs use for programming, HMIs, and remote access — it can read and write "
+               "controller memory",
+               ports=("tcp/20256",), decoders=("pcomtcp",), role=_CONTROLLER, keywords=("pcom", "unitronics"),
+               wireshark="pcomtcp || tcp.port == 20256"),
+    OTProtocol("ads", "Beckhoff ADS", "Beckhoff", "programming",
+               "the TwinCAT protocol used to program Beckhoff controllers and to read or write their variables",
+               ports=("tcp/48898", "udp/48899"), decoders=("ams",), role=_CONTROLLER,
+               keywords=("beckhoff", "twincat"), wireshark="ams || tcp.port == 48898 || udp.port == 48899"),
+    OTProtocol("codesys", "CODESYS", "CODESYS Group", "programming",
+               "the runtime protocol of CODESYS-based controllers (used by many PLC brands) for programming, online "
+               "changes, and variable access",
+               ports=("tcp/11740", "tcp/1217", "tcp/1200", "tcp/2455", "udp/1740"), role=_CONTROLLER,
+               keywords=("codesys",), wireshark="tcp.port in {11740,1217,1200,2455} || udp.port == 1740"),
+    OTProtocol("pcworx", "Phoenix Contact PCWorx", "Phoenix Contact", "programming",
+               "the engineering protocol used to program and monitor Phoenix Contact PLCs",
+               ports=("tcp/1962",), role=_CONTROLLER, keywords=("pcworx",), wireshark="tcp.port == 1962"),
+    OTProtocol("proconos", "ProConOS", "Phoenix Contact (KW-Software)", "programming",
+               "the engineering protocol used to program and monitor ProConOS-based PLCs",
+               ports=("tcp/20547",), role=_CONTROLLER, keywords=("proconos",), wireshark="tcp.port == 20547"),
+    OTProtocol("crimson", "Red Lion Crimson", "Red Lion", "programming",
+               "the configuration protocol of Red Lion HMIs and data stations (Crimson 3), which can download a new "
+               "configuration",
+               ports=("tcp/789",), role="HMI / Engineering Workstation", keywords=("crimson", "red lion"),
+               wireshark="tcp.port == 789"),
+    # Control and telemetry
+    OTProtocol("hartip", "HART-IP", "FieldComm Group", "control",
+               "used to read and configure HART field instruments through gateways and multiplexers",
+               ports=("tcp/5094", "udp/5094"), decoders=("hart_ip",), role="OT Device", keywords=("hart",),
+               wireshark="hart_ip"),
+    OTProtocol("ffhse", "FOUNDATION Fieldbus HSE", "FieldComm Group", "control",
+               "the Ethernet backbone of FOUNDATION Fieldbus process control systems",
+               ports=("tcp/1090", "udp/1089", "udp/1090", "udp/1091", "udp/3622"), decoders=("ff",), role="OT Device",
+               keywords=("foundation fieldbus", "fieldbus hse"), wireshark="ff"),
+    OTProtocol("egd", "GE Ethernet Global Data", "GE", "control",
+               "a producer/consumer protocol GE controllers, including turbine controls, use to share live process data",
+               ports=("udp/18246",), decoders=("egd",), role=_CONTROLLER, keywords=("egd", "ethernet global data"),
+               wireshark="egd"),
+    OTProtocol("synchrophasor", "IEEE C37.118 Synchrophasor", "IEEE", "control",
+               "used by phasor measurement units (PMUs) to stream grid measurements to phasor data concentrators",
+               ports=("tcp/4712", "udp/4713"), decoders=("synphasor",), role="OT Device",
+               keywords=("synchrophasor", "c37.118"), wireshark="synphasor"),
+    OTProtocol("kingfisher", "Kingfisher", "Kingfisher (CSE-Semaphore)", "control",
+               "the telemetry and control protocol of Kingfisher RTUs, common in water and utility SCADA",
+               ports=("tcp/473", "udp/473", "tcp/4058", "udp/4058"), decoders=("kf",), role=_CONTROLLER,
+               keywords=("kingfisher",), wireshark="kf"),
+    OTProtocol("elcom", "ELCOM-90", "Power utilities", "control",
+               "a control-center data exchange protocol used by power utilities",
+               ports=("tcp/5997",), decoders=("elcom",), role="OT Server / Gateway", keywords=("elcom",),
+               wireshark="elcom"),
+    OTProtocol("modbus_udp", "Modbus over UDP", "Modbus Organization", "control",
+               "Modbus carried over UDP instead of TCP — OTscope's Modbus checks read TCP only, so its reads and writes "
+               "were not checked",
+               ports=("udp/502",), decoders=("mbudp",), role=_CONTROLLER, keywords=("modbus/udp", "modbus udp"),
+               wireshark="mbudp"),
+    # Building automation
+    OTProtocol("knx", "KNX/IP", "KNX Association", "building",
+               "the IP interface and routing protocol of KNX building automation (lighting, HVAC, blinds, access)",
+               ports=("tcp/3671", "udp/3671"), decoders=("kip",), role="OT Server / Gateway", keywords=("knx",),
+               wireshark="kip"),
+    OTProtocol("lonworks", "LonWorks/IP", "LonMark International", "building",
+               "LonWorks building and industrial control traffic carried over IP",
+               ports=("udp/1628", "udp/1629"), decoders=("cnip",), role="OT Server / Gateway",
+               keywords=("lonworks", "lontalk"), wireshark="cnip"),
+    OTProtocol("fox", "Niagara Fox", "Tridium", "building",
+               "the protocol of Tridium Niagara building automation stations (JACEs and supervisors), including "
+               "configuration changes",
+               ports=("tcp/1911", "tcp/4911"), role="OT Server / Gateway", keywords=("niagara", "tridium"),
+               wireshark="tcp.port in {1911,4911}"),
+    # Metering
+    OTProtocol("dlms", "DLMS/COSEM", "DLMS User Association", "metering",
+               "the IEC 62056 protocol for reading, configuring, and controlling electricity, gas, and water meters",
+               ports=("tcp/4059", "udp/4059"), decoders=("dlms",), role="OT Device", keywords=("dlms", "cosem"),
+               wireshark="dlms"),
+    OTProtocol("c1222", "ANSI C12.22", "ANSI", "metering",
+               "the protocol for communicating with smart meters over networks, including meter configuration and control",
+               ports=("tcp/1153", "udp/1153"), decoders=("c1222",), role="OT Device", keywords=("c12.22", "ansi c12"),
+               wireshark="c1222"),
+    # Industrial Ethernet, mostly without an IP layer
+    OTProtocol("ethercat", "EtherCAT", "EtherCAT Technology Group", "industrial_ethernet",
+               "a real-time industrial Ethernet fieldbus for motion control and I/O",
+               ports=("udp/34980", "tcp/34980"), ethertypes=(0x88A4,), decoders=("ecatf", "ecat"),
+               keywords=("ethercat",), wireshark="ecatf || ecat"),
+    OTProtocol("powerlink", "Ethernet POWERLINK", "Ethernet POWERLINK Standardization Group", "industrial_ethernet",
+               "a real-time industrial Ethernet protocol for motion control and I/O",
+               ports=("udp/3819",), ethertypes=(0x88AB, 0x3E3F), decoders=("epl",), l2_decoders=("epl_v1",),
+               keywords=("powerlink",), wireshark="epl || epl_v1"),
+    OTProtocol("sercos", "SERCOS III", "sercos International", "industrial_ethernet",
+               "a real-time industrial Ethernet protocol for motion control",
+               ethertypes=(0x88CD,), l2_decoders=("siii",), keywords=("sercos",), wireshark="siii"),
+    OTProtocol("profinet_io", "PROFINET IO (real-time)", "PROFIBUS & PROFINET International", "industrial_ethernet",
+               "the cyclic real-time I/O exchange between PROFINET controllers and their devices",
+               ethertypes=(0x8892,), l2_decoders=("pn_io",), keywords=("profinet io", "profinet rt"), wireshark="pn_io"),
+    OTProtocol("hsr_prp", "HSR/PRP redundancy", "IEC 62439-3", "industrial_ethernet",
+               "the seamless-redundancy protocol used in substations and critical control networks",
+               ethertypes=(0x892F, 0x88FB), l2_decoders=("hsr", "hsr_prp_supervision"), keywords=("hsr", "prp"),
+               wireshark="hsr || hsr_prp_supervision"),
+    OTProtocol("mrp", "PROFINET MRP", "IEC 62439-2", "industrial_ethernet",
+               "the media redundancy protocol for industrial ring networks",
+               ethertypes=(0x88E3,), l2_decoders=("pn_mrp",), keywords=("mrp",), wireshark="pn_mrp"),
+]
+
+# Ports analyzed by OTscope's own protocol checks.  Catalog rows add their
+# ports to KNOWN_OT_PORTS below; site additions may not claim these.
+_CHECKED_OT_PORTS = frozenset(KNOWN_OT_PORTS)
+
+_OT_BY_KEY: Dict[str, OTProtocol] = {}
+_OT_BY_NAME: Dict[str, OTProtocol] = {}
+_OT_BY_PORT: Dict[str, OTProtocol] = {}
+_OT_BY_DECODER: Dict[str, OTProtocol] = {}      # trusted on any frame
+_OT_BY_L2_DECODER: Dict[str, OTProtocol] = {}   # trusted on frames without IP
+_OT_BY_ETHERTYPE: Dict[int, OTProtocol] = {}
+
+
+def _index_ot_protocol(protocol: OTProtocol) -> None:
+    """Add a catalog row to the lookups and to the port maps used for roles and flow orientation."""
+    _OT_BY_KEY[protocol.key] = protocol
+    _OT_BY_NAME[protocol.name] = protocol
+    for spec in protocol.ports:
+        _OT_BY_PORT.setdefault(spec, protocol)
+        port = int(spec.split("/", 1)[1])
+        KNOWN_OT_PORTS.setdefault(port, protocol.name)
+        _SERVICE_PORT_HINTS.add(port)
+        if protocol.role.startswith("Controller"):
+            CONTROLLER_PORTS.add(port)
+    for decoder in protocol.decoders:
+        _OT_BY_DECODER.setdefault(decoder, protocol)
+        _OT_BY_L2_DECODER.setdefault(decoder, protocol)
+    for decoder in protocol.l2_decoders:
+        _OT_BY_L2_DECODER.setdefault(decoder, protocol)
+    for ethertype in protocol.ethertypes:
+        _OT_BY_ETHERTYPE.setdefault(ethertype, protocol)
+
+
+for _protocol in OT_PROTOCOLS:
+    _index_ot_protocol(_protocol)
+
+
+def ot_protocol_for_row(row: Dict[str, str]) -> Optional[OTProtocol]:
+    """Catalog protocol of an IP packet: by tshark decoder, else by port when tshark found no application layer."""
+    layers = (row.get("frame.protocols") or "").lower().split(":")
+    if "icmp" in layers or "icmpv6" in layers:
+        return None
+    for layer in reversed(layers):
+        if layer in _OT_BY_DECODER:
+            return _OT_BY_DECODER[layer]
+    if layers[-1] not in ("tcp", "udp", "data"):
+        return None
+    transport = "tcp" if row.get("tcp.srcport") else "udp" if row.get("udp.srcport") else ""
+    for port in (row_destination_port(row), row_source_port(row)):
+        protocol = _OT_BY_PORT.get(f"{transport}/{port}")
+        if protocol is not None:
+            return protocol
+    return None
+
+
+def ot_protocol_for_frame(layers: Sequence[str], ethertype: str) -> Optional[OTProtocol]:
+    """Catalog protocol of a frame with no IP layer: by tshark decoder, else by EtherType."""
+    for layer in reversed(layers):
+        if layer in _OT_BY_L2_DECODER:
+            return _OT_BY_L2_DECODER[layer]
+    try:
+        return _OT_BY_ETHERTYPE.get(int(ethertype, 16))
+    except (TypeError, ValueError):
+        return None
+
+
+def catalog_role_for_ports(served: Iterable[int]) -> str:
+    """Role of a device that answers on a catalog protocol's port; safety rows come first."""
+    served_ports = set(served)
+    for protocol in OT_PROTOCOLS:
+        if protocol.role and any(int(spec.split("/", 1)[1]) in served_ports - _CHECKED_OT_PORTS
+                                 for spec in protocol.ports):
+            return protocol.role
+    return ""
+
+
+def catalog_wireshark_guide(protocol: OTProtocol) -> Tuple[str, List[str]]:
+    """Wireshark filter and investigation steps for a catalog protocol."""
+    if not protocol.ports and not protocol.decoders:
+        return protocol.wireshark, [
+            "Use Statistics → Endpoints → Ethernet with this filter to list the devices (MAC addresses) that sent it.",
+            "Confirm the capture point is expected to see this field network; industrial Ethernet visible from a "
+            "control or IT network suggests missing separation.",
+        ]
+    steps = [
+        "Use Statistics → Conversations with this filter to list every host that used the protocol and how much "
+        "traffic each exchanged.",
+        "Compare those hosts with the site's asset list and communication matrix — each should be expected to use "
+        "this protocol.",
+        "Match each session's start and end time with approved change records; programming and safety-system "
+        "sessions should be planned." if protocol.risk in ("safety_engineering", "programming") else
+        "Look for hosts outside the expected zone (IT or remote-access subnets) using the protocol.",
+    ]
+    if not protocol.decoders:
+        steps.append("Wireshark has no decoder for this protocol, so the payload shows as data — review the hosts, "
+                     "timing, and volume.")
+    return protocol.wireshark, steps
+
+
+_ROLE_FOR_RISK = {
+    "safety_engineering": "Controller / Safety System (SIS)",
+    "safety_io": "Controller / Safety System (SIS)",
+    "programming": _CONTROLLER,
+    "control": _CONTROLLER,
+    "building": "OT Server / Gateway",
+    "metering": "OT Device",
+    "industrial_ethernet": "",
+}
+
+
+def _custom_protocol(entry: Any) -> OTProtocol:
+    """Build a catalog row from one config entry, or raise ValueError saying what is wrong."""
+    if not isinstance(entry, dict):
+        raise ValueError('each entry must be an object such as {"name": "...", "ports": ["tcp/5555"]}')
+    name = str(entry.get("name") or "").strip()
+    if not name:
+        raise ValueError('"name" is missing')
+    if name in _OT_BY_NAME:
+        raise ValueError(f"a protocol named {name!r} already exists")
+    risk = str(entry.get("risk") or "control").strip().lower()
+    if risk not in OT_RISK_CLASSES:
+        raise ValueError(f'"risk" must be one of: {", ".join(OT_RISK_CLASSES)}')
+    ports: List[str] = []
+    for spec in entry.get("ports") or []:
+        match = re.fullmatch(r"(tcp|udp)/(\d{1,5})", str(spec).strip().lower())
+        if not match or not 0 < int(match.group(2)) < 65536:
+            raise ValueError(f'port {spec!r} should look like "tcp/5555" or "udp/5555"')
+        number = int(match.group(2))
+        if number in _CHECKED_OT_PORTS:
+            raise ValueError(f"port {number} is already analyzed by OTscope's {KNOWN_OT_PORTS[number]} checks")
+        if f"{match.group(1)}/{number}" in _OT_BY_PORT:
+            raise ValueError(f"{match.group(1)}/{number} already belongs to {_OT_BY_PORT[f'{match.group(1)}/{number}'].name}")
+        ports.append(f"{match.group(1)}/{number}")
+    ethertypes: List[int] = []
+    for value in entry.get("ethertypes") or []:
+        try:
+            ethertypes.append(int(str(value), 16))
+        except ValueError:
+            raise ValueError(f'EtherType {value!r} should be hexadecimal, like "0x88b5"') from None
+    if not ports and not ethertypes:
+        raise ValueError('give at least one port ("tcp/5555") or EtherType ("0x88b5")')
+    port_filter = " || ".join(f"{spec.split('/')[0]}.port == {spec.split('/')[1]}" for spec in ports)
+    ether_filter = " || ".join(f"eth.type == 0x{value:04x}" for value in ethertypes)
+    return OTProtocol(
+        key=f"custom_{safe_slug(name).lower()}", name=name, vendor=str(entry.get("vendor") or "site-specific"),
+        risk=risk, what=str(entry.get("description") or "a site-specific protocol listed in the OTscope config file"),
+        ports=tuple(ports), ethertypes=tuple(ethertypes), role=str(entry.get("role") or _ROLE_FOR_RISK[risk]),
+        keywords=tuple(str(word).lower() for word in (entry.get("keywords") or [name.lower()])),
+        wireshark=" || ".join(part for part in (port_filter, ether_filter) if part),
+    )
+
+
+def register_custom_protocols(config: Dict[str, Any]) -> int:
+    """Add the site-specific protocols listed under "custom_ot_protocols" in the config file."""
+    entries = config.get("custom_ot_protocols") or []
+    if not isinstance(entries, list):
+        print(colorize(f'[!] Ignored "custom_ot_protocols" in {CONFIG_PATH}: it must be a list.', SEVERITY_MEDIUM))
+        return 0
+    added = 0
+    for index, entry in enumerate(entries, start=1):
+        try:
+            protocol = _custom_protocol(entry)
+        except ValueError as exc:
+            print(colorize(f"[!] Skipped custom_ot_protocols entry {index} in {CONFIG_PATH}: {exc}.", SEVERITY_MEDIUM))
+            continue
+        OT_PROTOCOLS.append(protocol)
+        _index_ot_protocol(protocol)
+        added += 1
+    if added:
+        print(colorize(f"[i] Loaded {added} site-specific OT protocol{'s' if added != 1 else ''} from {CONFIG_PATH}.",
+                       "INFO"))
+    return added
 
 CAPTURE_SUFFIXES = (".pcap", ".pcapng", ".cap", ".pcap.gz", ".pcapng.gz", ".cap.gz")
 
@@ -564,6 +896,7 @@ CHECK_ORDER: List[Tuple[str, str, str]] = [
     ("artifact_extraction", "Artifact Extraction", "Extracts model names, passwords, project files, firmware names, flag-like strings, and defensive clues from protocol and payload content."),
     ("network_hygiene", "Network Hygiene and Segmentation", "Highlights OT/IT crossings, public IPs, DNS, ARP anomalies, IPv6, and VLAN anomalies."),
     ("intrusion", "Intrusion Indicators", "Looks for behavioral patterns such as scanning, bursts, and lateral movement."),
+    ("ot_protocols", "Other OT Protocols", "Reports OT protocols OTscope recognizes but has no detailed checks for: safety, programming, control, building automation, metering, and industrial Ethernet."),
     ("unknown", "Unknown and Unclassified Traffic", "Flags unexplained services on OT devices and any traffic OTscope cannot identify."),
 ]
 
@@ -758,8 +1091,14 @@ ADVISORY_MAP: List[Tuple[Tuple[str, ...], List[str]]] = [
         ["Modbus Organization: MODBUS/TCP Security Protocol Specification (TLS on TCP 802)", "NIST SP 800-82r3 (Guide to OT Security)"]),
     (("dnp3 disable spontaneous", "dnp3 cold restart", "dnp3 warm restart"),
         ["IEEE 1815-2012 (DNP3 Secure Authentication v5)", "NIST SP 800-82r3 (Guide to OT Security)"]),
-    (("tristation", "triconex", "safety instrumented"),
+    (("tristation", "triconex"),
         ["CISA MAR-17-352-01 (HatMan — safety system targeted malware)", "IEC 61511 (functional safety — safety instrumented systems)", "NIST SP 800-82r3 (Guide to OT Security)"]),
+    (("opensafety", "cip safety"),
+        ["IEC 61784-3 (functional safety communication profiles)", "IEC 61511 (functional safety — safety instrumented systems)"]),
+    (("unitronics", "pcom"),
+        ["CISA AA23-335A (IRGC-affiliated actors exploit Unitronics PLCs)", "NIST SP 800-82r3 (Guide to OT Security)"]),
+    (("catalog",),
+        ["NIST SP 800-82r3 (Guide to OT Security)"]),
     (("omron fins", "fins write", "fins cleartext"),
         ["Omron cybersecurity advisories", "NIST SP 800-82r3 (Guide to OT Security)"]),
     (("ge srtp", "ge-srtp"),
@@ -1114,9 +1453,27 @@ def format_share(part: int, total: int) -> str:
     if total <= 0:
         return "n/a"
     share = 100.0 * part / total
+    if 0.0 < share < 1.0:
+        return "<1%"
     if 99.0 < share < 100.0:
         return f"{share:.1f}%"
     return f"{share:.0f}%"
+
+
+def coverage_parts(coverage: Dict[str, Any]) -> List[str]:
+    """The coverage buckets as phrases: "97% assessed", "2% recognized but not assessed (…)", "1% not identified"."""
+    total = coverage["total"]
+    if not total:
+        return ["no traffic"]
+    parts = [f"{format_share(coverage['assessed'], total)} assessed"]
+    if coverage["not_assessed"]:
+        names = ", ".join(f"{name} {count:,}" for name, count in coverage["recognized"][:4])
+        more = len(coverage["recognized"]) - 4
+        parts.append(f"{format_share(coverage['not_assessed'], total)} recognized but not assessed ({names}"
+                     + (f", +{more} more" if more > 0 else "") + ")")
+    if coverage["unidentified_total"]:
+        parts.append(f"{format_share(coverage['unidentified_total'], total)} not identified")
+    return parts
 
 
 RISK_BANDS = ["MINIMAL", "LOW", "MODERATE", "HIGH", "SEVERE"]
@@ -1315,31 +1672,37 @@ def session_from_dict(payload: Dict[str, Any]) -> SessionState:
 
 
 def load_config() -> Dict[str, Any]:
-    """Load the persisted config file."""
+    """Load the persisted config file, filling in defaults for missing keys.
+
+    A file that cannot be read is reported and left untouched for this run,
+    so a hand-edit with a typo (for example in "custom_ot_protocols") is not
+    overwritten with defaults.
+    """
+    defaults: Dict[str, Any] = {
+        "last_pcap_folder": "",
+        "last_assessor_name": "",
+        "last_site_name": "",
+        "write_burst_count": DEFAULT_WRITE_BURST_COUNT,
+        "write_burst_seconds": DEFAULT_WRITE_BURST_SECONDS,
+        "polling_anomaly_multiplier": DEFAULT_POLLING_ANOMALY_MULTIPLIER,
+    }
     if not CONFIG_PATH.exists():
-        return {
-            "last_pcap_folder": "",
-            "last_assessor_name": "",
-            "last_site_name": "",
-            "write_burst_count": DEFAULT_WRITE_BURST_COUNT,
-            "write_burst_seconds": DEFAULT_WRITE_BURST_SECONDS,
-            "polling_anomaly_multiplier": DEFAULT_POLLING_ANOMALY_MULTIPLIER,
-        }
+        return defaults
     try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {
-            "last_pcap_folder": "",
-            "last_assessor_name": "",
-            "last_site_name": "",
-            "write_burst_count": DEFAULT_WRITE_BURST_COUNT,
-            "write_burst_seconds": DEFAULT_WRITE_BURST_SECONDS,
-            "polling_anomaly_multiplier": DEFAULT_POLLING_ANOMALY_MULTIPLIER,
-        }
+        loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError("the file is not a JSON object")
+        return {**defaults, **loaded}
+    except (json.JSONDecodeError, OSError, ValueError) as exc:
+        print(colorize(f"[!] Could not read {CONFIG_PATH} ({exc}); using defaults and leaving the file unchanged.",
+                       SEVERITY_MEDIUM))
+        return {**defaults, "_unreadable": True}
 
 
 def save_config(config: Dict[str, Any]) -> None:
-    """Persist the config file."""
+    """Persist the config file (unless it could not be read — see load_config)."""
+    if config.get("_unreadable"):
+        return
     try:
         CONFIG_PATH.write_text(pretty_json(config), encoding="utf-8")
     except OSError as exc:
@@ -1495,6 +1858,11 @@ _NARRATIVE_RULES: List[Tuple[str, Tuple[str, ...], Tuple[str, ...]]] = [
     ("mitm", ("adversary-in-the-middle", "arp ", "arp-", "multiple mac", "gratuitous arp", "claims multiple ips"),
      ("mitm", "arp_spoof", "mac_conflict")),
     ("sis", ("tristation", "triconex", "safety instrumented"), ("sis", "tristation")),
+    ("safety_io", (), ("safety_io",)),
+    ("engineering", (), ("prog_protocol",)),
+    ("unassessed", (), ("unassessed",)),
+    ("building", (), ("building",)),
+    ("metering", (), ("metering",)),
     ("replay", ("duplicate or unsolicited", "replay"), ("replay",)),
     ("restart", ("cold restart", "warm restart", "plc stop", "disable spontaneous", "stop/start"), ("restart", "suppression")),
     ("value_anomaly", ("register value anomaly",), ("value_anomaly",)),
@@ -1547,6 +1915,10 @@ def narrative_family(finding: "Finding") -> str:
 _WHY_THIS_MATTERS: Dict[str, str] = {
     "mitm": "This finding matters because a host that can rewrite ARP mappings sits invisibly between OT devices and can read, alter, or drop any command or process value that passes through it.",
     "sis": "This finding matters because a safety instrumented system is the last automated layer that keeps the process from harming people or equipment, and its engineering protocol can read and change the safety logic.",
+    "safety_io": "This finding matters because safety traffic carries the signals that bring a machine or process to a safe state, and it relies on the safety network being isolated.",
+    "unassessed": "This finding matters because OTscope recognizes this industrial protocol but does not check its contents, so commands, writes, or configuration changes it carried were not assessed.",
+    "building": "This finding matters because building automation protocols control HVAC, lighting, and access systems, rarely authenticate, and are often reachable from IT networks.",
+    "metering": "This finding matters because metering protocols carry consumption data and, on many meters, configuration and control commands.",
     "replay": "This finding matters because injected or replayed responses let an attacker show operators false process values while the real process changes.",
     "restart": "This finding matters because stopping, restarting, or silencing a controller has immediate operational impact and can hide follow-on manipulation.",
     "value_anomaly": "This finding matters because sudden jumps in reported values can mean the values were spoofed rather than measured.",
@@ -1587,8 +1959,32 @@ _REMEDIATION_STEPS: Dict[str, Tuple[str, str, str, str]] = {
     "sis": (
         "Confirm who is talking to the safety controller",
         "Confirm the host is the approved SIS engineering workstation and that a change was planned; if not, disconnect it from the safety network and inform operations and the process safety owner.",
-        "Keep the controller's key switch in RUN except during approved changes, keep the safety network separate from control and IT networks, and allow TriStation (UDP 1502) only from the SIS engineering workstation.",
+        "Keep the controller's key switch in RUN except during approved changes, keep the safety network separate from control and IT networks, and allow its engineering protocol only from the SIS engineering workstation.",
         "Compare the safety controller's program and configuration with the last approved backup, and recapture to confirm only the approved workstation talks to it.",
+    ),
+    "safety_io": (
+        "Confirm the safety network is isolated",
+        "Confirm the hosts exchanging safety traffic are only the safety controller and its safe devices.",
+        "Keep safety communication on a dedicated network or VLAN with no route from control or IT networks, and limit engineering access to the safety controller.",
+        "Recapture from the control network and confirm the safety traffic is no longer visible there.",
+    ),
+    "unassessed": (
+        "Review who uses the unassessed OT protocol",
+        "Confirm with the site which systems use this protocol and that every host involved is expected to.",
+        "Restrict the protocol to the hosts that need it (firewall or switch ACL) and record it in the site's communication matrix.",
+        "Review the traffic with the Wireshark filter in this finding for writes or configuration changes, and recapture to confirm only the expected hosts use it.",
+    ),
+    "building": (
+        "Separate the building automation protocol",
+        "Confirm which building systems use this protocol and that only their controllers and the management station exchange it.",
+        "Keep building automation on its own network segment, block it at the OT boundary, and turn on the protocol's secure version where the devices support it.",
+        "Recapture and confirm the protocol stays inside the building automation segment.",
+    ),
+    "metering": (
+        "Confirm the metering traffic is expected",
+        "Confirm which meters and head-end or data-collection systems use this protocol and that the hosts involved are expected.",
+        "Keep metering traffic on its own network segment and enable the protocol's authentication and encryption where the meters support it.",
+        "Recapture and confirm only the head-end system talks to the meters.",
     ),
     "replay": (
         "Find the host injecting the extra responses",
@@ -1771,6 +2167,10 @@ _DEFAULT_STEPS = (
 _REMEDIATION_OWNER: Dict[str, str] = {
     "mitm": "OT network engineer, incident response",
     "sis": "Process safety / SIS engineer, incident response",
+    "safety_io": "Process safety / SIS engineer",
+    "unassessed": "Controls engineer",
+    "building": "Facilities / building automation",
+    "metering": "Metering / utility operations",
     "replay": "OT network engineer, incident response",
     "restart": "Controls engineer, operations",
     "value_anomaly": "Controls engineer, operations",
@@ -1817,6 +2217,8 @@ _SAFETY_PROTOCOL_CHANGE = (
 _OT_SAFETY_NOTE: Dict[str, str] = {
     "mitm": "Isolating the impostor's port is normally safe, but first confirm it is not a legitimate failover partner (VRRP/HSRP, NIC teaming); expect a short communication drop while ARP caches refresh.",
     "sis": "Do not restart, reload, or bypass a safety controller without the process safety owner: a restart can trip the plant, and a bypass removes its protection.",
+    "safety_io": "Do not block or reroute safety traffic without the process safety owner: interrupting it trips the machine or process to its safe state.",
+    "building": "Changing building automation access can interrupt HVAC or access control — agree the change with facilities first.",
     "replay": _SAFETY_SUSPECT_VALUES,
     "value_anomaly": _SAFETY_SUSPECT_VALUES,
     "restart": _SAFETY_CONTROL_PATH,
@@ -1841,12 +2243,34 @@ _OT_SIGNIFICANCE: Dict[str, str] = {
         "serious network-layer threats to OT data integrity and process safety."
     ),
     "sis": (
-        "Safety instrumented systems (SIS) such as Schneider Electric Triconex take the process to a "
-        "safe state when it moves outside safe limits.  TriStation is the Triconex engineering "
-        "protocol, used to read and change the controller's safety program.  In the 2017 "
-        "TRITON/TRISIS incident, attackers used it from a compromised engineering workstation against "
-        "a Triconex SIS.  Engineering sessions with a safety controller should be rare, planned, and "
-        "come only from the designated SIS workstation."
+        "Safety instrumented systems (SIS) take the process to a safe state when it moves outside safe "
+        "limits.  Their engineering protocols read and change the safety logic: in the 2017 TRITON/TRISIS "
+        "incident, attackers used Triconex's TriStation protocol from a compromised engineering workstation "
+        "against a safety controller.  Engineering sessions with a safety controller should be rare, "
+        "planned, and come only from the designated SIS workstation."
+    ),
+    "safety_io": (
+        "Safety communication protocols such as openSAFETY and CIP Safety carry safety-critical signals "
+        "(emergency stops, light curtains, safe I/O) between safety controllers and safe devices.  They "
+        "carry their own integrity checks, but they depend on the safety network being separate; seeing "
+        "them at a capture point that also carries control or IT traffic means that separation should be "
+        "confirmed."
+    ),
+    "unassessed": (
+        "Industrial protocols that OTscope recognizes but does not decode can still carry commands that "
+        "change the process.  Knowing which hosts use them, and whether that use is expected, is the "
+        "minimum review; their contents need a protocol-aware review in Wireshark or a dedicated tool."
+    ),
+    "building": (
+        "Building automation systems often share networks with, or sit beside, industrial control "
+        "systems.  Their protocols were designed for closed installations; when reachable from other "
+        "networks, an attacker can change conditions that processes, server rooms, or clean rooms depend "
+        "on, or use building controllers as a foothold."
+    ),
+    "metering": (
+        "Smart meters and their head-end systems read data and change meter settings over these "
+        "protocols.  Their security depends on the protocol's security features being configured; "
+        "without them, readings and commands can be observed or altered."
     ),
     "replay": (
         "A Modbus server answers each request exactly once.  A second answer to the same "
@@ -1963,6 +2387,29 @@ _OT_SIGNIFICANCE: Dict[str, str] = {
 }
 
 _AUDITOR_GUIDANCE: Dict[str, List[str]] = {
+    "safety_io": [
+        "Confirm which safety controller and safe devices exchange this traffic.",
+        "Check that the safety network is separated from the control and IT networks.",
+        "Review who can make engineering changes to the safety controller.",
+        "Confirm the safety design is documented and under management of change.",
+    ],
+    "unassessed": [
+        "Confirm the protocol and every host using it appear in the site's asset list and communication matrix.",
+        "Check whether the traffic crosses zone boundaries it should not.",
+        "Review the traffic in Wireshark for write or configuration operations.",
+        "Ask whether the protocol's secure options (authentication, encryption) are available and enabled.",
+    ],
+    "building": [
+        "Confirm the building automation devices are in the asset inventory.",
+        "Check whether the protocol is reachable from IT or remote-access networks.",
+        "Confirm default passwords on building controllers and supervisors have been changed.",
+        "Ask whether the protocol's secure version is available and enabled.",
+    ],
+    "metering": [
+        "Confirm the meters and head-end systems are in the asset inventory.",
+        "Check that the protocol's security features (authentication, encryption) are enabled.",
+        "Confirm metering traffic does not cross into control or IT networks unexpectedly.",
+    ],
     "sis": [
         "Confirm the source is the designated SIS engineering workstation and that it is used only for safety-system work.",
         "Match the session to an approved SIS change (management-of-change record) or a planned diagnostic.",
@@ -2046,6 +2493,10 @@ _AUDITOR_GUIDANCE: Dict[str, List[str]] = {
 }
 
 _BENIGN_EXPLANATION: Dict[str, str] = {
+    "safety_io": "This finding would be benign if the capture point is on the dedicated safety network itself and only the safety controller and its safe devices exchange this traffic.",
+    "unassessed": "This finding would be benign if the site confirms the protocol and every host using it are part of the approved design.",
+    "building": "This finding would be benign if the traffic stays inside a documented, dedicated building automation segment.",
+    "metering": "This finding would be benign if the traffic is between documented meters and the site's head-end system on a dedicated metering network.",
     "sis": "This finding would be benign if the source is the designated SIS engineering workstation and the session matches an approved, documented change or diagnostic.",
     "dos": "This finding would be benign only if an approved load or penetration test was running against the device at that time.",
     "mitm": "This finding would be benign only if the second MAC belongs to a legitimate failover partner (VRRP/HSRP, NIC teaming) or a replacement device that took over the IP — none of which sends unsolicited ARP replies to other hosts or relays the original host's traffic.",
@@ -2139,13 +2590,6 @@ _WIRESHARK_GUIDE: List[Tuple[Tuple[str, ...], str, List[str]]] = [
          "Compare the Ethernet source MAC (eth.src) against the ARP sender MAC (arp.src.hw_mac) — when they disagree, that's a MITM toolkit's signature.",
          "Right-click any suspicious ARP frame → Conversation Filter → Ethernet to see all traffic that flowed through that MAC during the spoof window.",
          "Filter eth.addr == <impostor MAC> (named in the finding) and compare the eth.src of the victim IP's packets before, during, and after the attack window — during interception they come from the impostor.",
-     ]),
-    (("tristation", "triconex"),
-     "udp.port == 1502",
-     [
-         "Wireshark has no built-in TriStation dissector, so the payload shows as data. Use Statistics → Conversations → UDP with this filter to list every host that talked to the safety controller, and how much.",
-         "Compare each session's start and end time with approved SIS change records — engineering sessions with a safety controller should be rare and planned.",
-         "Use Statistics → Endpoints → Ethernet to confirm the source MAC belongs to the designated SIS engineering workstation.",
      ]),
     (("register value anomaly",),
      "modbus",
@@ -2465,6 +2909,9 @@ _WIRESHARK_FALLBACK: Tuple[str, List[str]] = ("", [
 
 def wireshark_guide_for(finding: "Finding") -> Optional[Tuple[str, List[str]]]:
     """Return the specific (display_filter, steps) guide for a finding, or None."""
+    for tag in finding.tags:
+        if tag.startswith("catalog:") and tag[len("catalog:"):] in _OT_BY_KEY:
+            return catalog_wireshark_guide(_OT_BY_KEY[tag[len("catalog:"):]])
     haystack = " ".join([
         finding.title.lower(),
         " ".join(finding.tags).lower(),
@@ -2842,6 +3289,9 @@ BASE_PACKET_FIELDS = [
     "ipv6.dst",
     "eth.src",
     "eth.dst",
+    # EtherType of frames without IP (industrial Ethernet); vlan.etype when tagged.
+    "eth.type",
+    "vlan.etype",
     "vlan.id",
     "tcp.srcport",
     "tcp.dstport",
@@ -3054,6 +3504,9 @@ def condensed_string_samples(payload: bytes, minimum_length: int = 3, limit: int
 
 def protocol_family_from_row(row: Dict[str, str]) -> str:
     """Best-effort protocol family inference from a tshark row."""
+    catalog = ot_protocol_for_row(row)
+    if catalog is not None:
+        return catalog.name
     protocol_text = (row.get("_ws.col.Protocol") or "").strip()
     info_text = (row.get("_ws.col.Info") or "").strip().lower()
     frame_protocols = (row.get("frame.protocols") or "").lower()
@@ -3099,8 +3552,6 @@ def protocol_family_from_row(row: Dict[str, str]) -> str:
         return "ARP"
     if "icmp" in protocol_text.lower():
         return "ICMP"
-    if frame_protocols.endswith(("udp", "udp:data")) and "1502" in (row.get("udp.srcport"), row.get("udp.dstport")):
-        return "Triconex TriStation"
     if protocol_text:
         return protocol_text
     return "Unknown"
@@ -3185,7 +3636,9 @@ def discovery_questions() -> List[Tuple[str, str]]:
         ("expected_protocols",
          "Expected OT protocols — enter any that apply, comma-separated\n"
          "    OT:  modbus  bacnet  dnp3  iec61850  iec104  mqtt  opcua  enip  s7\n"
-         "         omron   srtp    umas  melsec    historian  ignition  nodered  physical  tristation\n"
+         "         omron   srtp    umas  melsec    historian  ignition  nodered  physical\n"
+         "    Other OT: tristation  opensafety  pcom  codesys  beckhoff  hart  egd  synchrophasor\n"
+         "              knx  lonworks  niagara  dlms  ethercat  powerlink  (all names: User Guide §5.1)\n"
          "    IoT: zigbee  coap  zwave\n"
          "    A/V: voip  video  camera  cctv"),
         ("known_hmis", "Known HMI or engineering workstation IPs/hostnames (optional)"),
@@ -3231,6 +3684,8 @@ _CATEGORY_PREFIX_MAP: Dict[str, str] = {
     "Siemens S7 / PROFINET":             "S7",
     "Omron FINS":                        "FINS",
     "Safety Instrumented Systems":       "SIS",
+    "Controller Programming Protocols":  "PROG",
+    "Other OT Protocols":                "OTPROTO",
     "GE SRTP":                           "GESRTP",
     "Schneider UMAS":                    "UMAS",
     "Mitsubishi MELSEC":                 "MELSEC",
@@ -3299,6 +3754,8 @@ def _finding_id_prefix(category: str) -> str:
 
 def detection_confidence_for_finding(finding: "Finding") -> str:
     """Estimate how confident the tool is that the detection is accurate."""
+    if "catalog" in finding.tags:
+        return "Medium (identified by port)" if "id_port" in finding.tags else "High"
     family = narrative_family(finding)
     title = finding.title.lower()
     if family in ("absence", "unknown"):
@@ -3318,6 +3775,8 @@ def maliciousness_confidence_for_finding(finding: "Finding") -> str:
     family = narrative_family(finding)
     if finding.severity == SEVERITY_INTRUSION:
         return "High"
+    if family in ("safety_io", "unassessed", "building", "metering"):
+        return "Low — presence only; requires site validation"
     if family == "mitm":
         return "High" if finding.severity == SEVERITY_CRITICAL else "Low / Medium — requires site validation"
     if family in ("replay", "c2", "dos"):
@@ -3524,27 +3983,30 @@ class OTPcapAnalyzer:
         return f"{len(ran)} detectors ran — {found}."
 
     def _print_coverage(self) -> None:
-        """Say how much of the traffic was identified, and list what was not."""
+        """Say how much of the traffic OTscope assessed, only recognized, or could not identify."""
         coverage = self.traffic_coverage()
-        total, identified = coverage["total_packets"], coverage["identified_packets"]
+        total = coverage["total"]
         if not total:
             return
-        line = f"Traffic identified: {identified:,} of {total:,} packets ({format_share(identified, total)})."
-        unidentified = coverage["unidentified"]
-        if not unidentified:
-            self._log_ts(f"[i] {line}")
+        line = f"Traffic coverage ({total:,} packets): {'; '.join(coverage_parts(coverage))}."
+        low_assessed = coverage["assessed"] < total / 2
+        many_unidentified = coverage["unidentified_total"] >= total / 100
+        if not low_assessed and not many_unidentified:
+            self._log_ts(f"[i] {line}" + (" Small unidentified flows are listed in the report."
+                                          if coverage["unidentified_total"] else ""))
             return
-        if total - identified < total / 100:
-            self._log_ts(f"[i] {line} {len(unidentified)} small flow{'s' if len(unidentified) != 1 else ''} "
-                         "not identified — listed in the report.")
-            return
-        self._log_ts(colorize(f"[!] {line} Not identified by OTscope or tshark:", SEVERITY_MEDIUM))
-        for connection in unidentified[:5]:
-            print(f"        {self._flow_text(connection)}")
-        if len(unidentified) > 5:
-            print(f"        (+{len(unidentified) - 5} more flows)")
-        if identified < total / 2:
-            print(colorize("    Most of the traffic could not be identified, so a low risk score here does not "
+        self._log_ts(colorize(f"[!] {line}", SEVERITY_MEDIUM))
+        if many_unidentified:
+            listed = ([self._flow_text(flow) for flow in coverage["unidentified"][:5]]
+                      + [self._frame_text(item) for item in coverage["unidentified_frames"][:3]])
+            print("    Not identified by OTscope or tshark:")
+            for text in listed:
+                print(f"        {text}")
+            more = len(coverage["unidentified"]) + len(coverage["unidentified_frames"]) - len(listed)
+            if more > 0:
+                print(f"        (+{more} more)")
+        if low_assessed:
+            print(colorize("    Most of the traffic was not assessed in detail, so a low risk score here does not "
                            "mean the capture is benign.", SEVERITY_MEDIUM))
 
     TCP_ORIENTATION_CAP = 500_000
@@ -3956,6 +4418,40 @@ class OTPcapAnalyzer:
             self._host_address_cache[ip_text] = cached
         return cached
 
+    # Frames without IP that OTscope checks itself, and layers that name no protocol.
+    _L2_CHECKED_LAYERS = {"goose", "sv", "pn_dcp"}
+    _L2_FRAMING_LAYERS = {"eth", "ethertype", "vlan", "llc", "data", "_ws.malformed", "_ws.short", "_ws.expert"}
+
+    def _note_non_ip_frame(self, row: Dict[str, str], pcap_name: str, timestamp: Optional[str]) -> None:
+        """Tally a frame with no IP layer (industrial Ethernet, L2 infrastructure) by protocol and sender MAC."""
+        assert self.session is not None
+        layers = (row.get("frame.protocols") or "").lower().split(":")
+        ethertype = (row.get("vlan.etype") or row.get("eth.type") or "").lower()
+        checked = next((layer for layer in layers if layer in self._L2_CHECKED_LAYERS), "")
+        protocol = None if checked else ot_protocol_for_frame(layers, ethertype)
+        named = [layer for layer in layers if layer and layer not in self._L2_FRAMING_LAYERS]
+        label = protocol.key if protocol else checked or (named[0] if named else f"ethertype {ethertype or '?'}")
+        stats = self.session.analysis_metadata.setdefault("non_ip", {})
+        entry = stats.get(label)
+        if entry is None:
+            if len(stats) >= 200:
+                return
+            entry = stats[label] = {"frames": 0, "ethertype": ethertype, "protocol": protocol.key if protocol else "",
+                                    "identified": bool(protocol or checked or named), "sources": {}, "pcaps": [],
+                                    "first": None, "last": None}
+        entry["frames"] += 1
+        mac = row.get("eth.src") or ""
+        if mac and (mac in entry["sources"] or len(entry["sources"]) < 50):
+            entry["sources"][mac] = entry["sources"].get(mac, 0) + 1
+        if pcap_name not in entry["pcaps"]:
+            entry["pcaps"].append(pcap_name)
+        try:
+            when = float(timestamp or "")
+        except ValueError:
+            return
+        entry["first"] = when if entry["first"] is None else min(entry["first"], when)
+        entry["last"] = when if entry["last"] is None else max(entry["last"], when)
+
     def _note_group_destination(self, ip_text: str, sender_ip: str, protocol: str) -> None:
         """Count traffic to a broadcast / multicast address (kept out of the device list)."""
         assert self.session is not None
@@ -4012,6 +4508,8 @@ class OTPcapAnalyzer:
                 self.session.duplicate_packets[fingerprint].append(pcap_name)
             return False
         self.packet_fingerprint_set.add(fingerprint)
+        if not source_ip and not destination_ip and not row.get("arp.opcode"):
+            self._note_non_ip_frame(row, pcap_name, timestamp)
         if row.get("arp.opcode"):
             self._register_arp_sender(row, pcap_name)
         host_ips = {ip for ip, mac in ((source_ip, ""), (destination_ip, row.get("eth.dst", "")))
@@ -5047,8 +5545,8 @@ class OTPcapAnalyzer:
                 role = "Physical Security Device"
             elif 3956 in served:
                 role = "Machine-Vision Camera"
-            elif 1502 in served and 1502 not in used:
-                role = "Controller / Safety System (SIS)"
+            elif (catalog_role := catalog_role_for_ports(served)):
+                role = catalog_role
             elif ot_served and ot_served <= used:
                 # Peer protocols (same port in both directions, e.g. BACnet):
                 # ports cannot tell client from server, so use traffic direction.
@@ -5908,24 +6406,33 @@ class OTPcapAnalyzer:
         return 0
 
     def traffic_coverage(self) -> Dict[str, Any]:
-        """How much of the session's IP traffic OTscope could identify.
+        """How much of the session's traffic OTscope assessed.
 
-        A flow is identified when its service port is one OTscope knows, or when
-        tshark named its protocol on at least a tenth of its packets — a few
-        heuristic guesses on random or encrypted payloads (which can "look like"
-        RTCP) do not identify a flow.  Returns packet totals and the unidentified
-        flows as dicts, largest first.
+        Every IP packet and every frame without IP lands in one bucket:
+          assessed     — a protocol OTscope checks, a known IT or infrastructure
+                         service port, or a protocol tshark named on at least a
+                         tenth of the flow's packets (a few heuristic guesses on
+                         random or encrypted payloads do not count);
+          not assessed — a catalog OT protocol: recognized and reported, but its
+                         contents are not checked;
+          unidentified — nothing recognized it.
         """
         assert self.session is not None
         known_ports = set(KNOWN_OT_PORTS) | IT_PORTS | IT_INDICATOR_PORTS | _SERVICE_PORT_HINTS
-        total = identified = 0
+        total = assessed = not_assessed = 0
+        recognized: Counter = Counter()
         unidentified: List[Dict[str, Any]] = []
         for key, connection in self.session.connections.items():
             total += connection.packet_count
+            protocol = self._catalog_protocol_for_flow(key, connection)
+            if protocol is not None:
+                not_assessed += connection.packet_count
+                recognized[protocol.name] += connection.packet_count
+                continue
             named = connection.protocol not in self._GENERIC_PROTOCOL_LABELS and (
                 connection.labelled_packets is None or connection.labelled_packets * 10 >= connection.packet_count)
             if named or connection.destination_port in known_ports:
-                identified += connection.packet_count
+                assessed += connection.packet_count
                 continue
             parts = key.split("|")
             unidentified.append({
@@ -5937,13 +6444,154 @@ class OTPcapAnalyzer:
                 "packets": connection.packet_count,
                 "pcaps": list(connection.source_pcaps),
             })
+        frames: List[Dict[str, Any]] = []
+        for label, entry in (self.session.analysis_metadata.get("non_ip") or {}).items():
+            total += entry["frames"]
+            protocol = _OT_BY_KEY.get(entry.get("protocol") or "")
+            if protocol is not None:
+                not_assessed += entry["frames"]
+                recognized[protocol.name] += entry["frames"]
+            elif entry.get("identified"):
+                assessed += entry["frames"]
+            else:
+                sources = entry.get("sources") or {}
+                frames.append({"key": f"non_ip::{label}", "ethertype": entry.get("ethertype") or "?",
+                               "frames": entry["frames"], "pcaps": list(entry.get("pcaps") or []),
+                               "sources": sorted(sources, key=lambda mac: -sources[mac])})
         unidentified.sort(key=lambda flow: flow["packets"], reverse=True)
-        return {"total_packets": total, "identified_packets": identified, "unidentified": unidentified}
+        frames.sort(key=lambda item: item["frames"], reverse=True)
+        return {"total": total, "assessed": assessed, "not_assessed": not_assessed,
+                "unidentified_total": total - assessed - not_assessed, "recognized": recognized.most_common(),
+                "unidentified": unidentified, "unidentified_frames": frames}
+
+    def _catalog_protocol_for_flow(self, key: str, connection: "ConnectionSummary") -> Optional[OTProtocol]:
+        """Catalog protocol of a flow: by its label, or by port for flows labelled before v2.8.4."""
+        protocol = _OT_BY_NAME.get(connection.protocol)
+        if protocol is not None:
+            if connection.labelled_packets is None or connection.labelled_packets * 10 >= connection.packet_count:
+                return protocol
+            return None
+        parts = key.split("|")
+        if connection.protocol in self._GENERIC_PROTOCOL_LABELS and len(parts) == 4:
+            return _OT_BY_PORT.get(f"{parts[2].lower()}/{connection.destination_port}")
+        return None
 
     @staticmethod
     def _flow_text(flow: Dict[str, Any]) -> str:
         return (f"{flow['transport']} {flow['client']} → {flow['server']} port {flow['port']} — "
                 f"{flow['packets']:,} packets")
+
+    @staticmethod
+    def _frame_text(item: Dict[str, Any]) -> str:
+        senders = ", ".join(item["sources"][:3]) + (f" (+{len(item['sources']) - 3} more)" if len(item["sources"]) > 3 else "")
+        return (f"Ethernet frames without IP, EtherType {item['ethertype']} — {item['frames']:,} frames"
+                + (f" from {senders}" if senders else ""))
+
+    def check_ot_protocols(self, pcaps: Sequence[Path]) -> int:
+        """Report catalog OT protocols: one finding per protocol and host pair, or per
+        protocol for frames without an IP layer, with the risk class's severity."""
+        assert self.session is not None
+        declared = {item.strip().lower() for item in
+                    re.split(r"[,;\s]+", self.session.environment_answers.get("known_hmis", "")) if item.strip()}
+        pairs: Dict[Tuple[str, str, str], List[Tuple[str, ConnectionSummary]]] = defaultdict(list)
+        for key, connection in self.session.connections.items():
+            protocol = self._catalog_protocol_for_flow(key, connection)
+            if protocol is not None:
+                pairs[(protocol.key, connection.source_ip, connection.destination_ip)].append((key, connection))
+        seen = {protocol_key for protocol_key, _, _ in pairs}
+        for (protocol_key, client, server), flows in sorted(
+                pairs.items(), key=lambda item: -sum(connection.packet_count for _, connection in item[1])):
+            self._report_ot_protocol_pair(_OT_BY_KEY[protocol_key], client, server, flows, client.lower() in declared)
+        for entry in (self.session.analysis_metadata.get("non_ip") or {}).values():
+            protocol = _OT_BY_KEY.get(entry.get("protocol") or "")
+            if protocol is not None:
+                seen.add(protocol.key)
+                self._report_ot_protocol_frames(protocol, entry)
+        for protocol in OT_PROTOCOLS:
+            if protocol.key in seen or not protocol.keywords or not self._expected_protocol(list(protocol.keywords)):
+                continue
+            where = ", ".join(list(protocol.ports) + [f"EtherType 0x{value:04X}" for value in protocol.ethertypes])
+            self.add_finding(
+                SEVERITY_MEDIUM, "Absence of Expected Traffic", f"Expected {protocol.name} traffic not observed",
+                f"{protocol.name} ({where}) was declared as expected, but no traffic was observed.",
+                [f"No {protocol.name} traffic matched ({where})."], [], [], protocol.name, [p.name for p in pcaps],
+                f"absence::catalog::{protocol.key}",
+            )
+        return 0
+
+    @staticmethod
+    def _epochs(values: Iterable[Optional[str]]) -> List[float]:
+        epochs = []
+        for value in values:
+            try:
+                epochs.append(float(value or ""))
+            except ValueError:
+                continue
+        return epochs
+
+    def _report_ot_protocol_pair(self, protocol: OTProtocol, client: str, server: str,
+                                 flows: List[Tuple[str, "ConnectionSummary"]], declared: bool) -> None:
+        """One finding for a catalog protocol between one client and one server."""
+        category, severity, tag, title = OT_RISK_CLASSES[protocol.risk]
+        if protocol.risk == "safety_engineering" and declared:
+            severity = SEVERITY_HIGH
+        packets = sum(connection.packet_count for _, connection in flows)
+        times = self._epochs(t for _, connection in flows for t in (connection.first_seen, connection.last_seen))
+        first, last = (min(times), max(times)) if times else (0.0, 0.0)
+        ports = sorted({f"{key.split('|')[2].lower()}/{connection.destination_port}" for key, connection in flows
+                        if len(key.split("|")) == 4})
+        pcaps = sorted({pcap for _, connection in flows for pcap in connection.source_pcaps})
+        identified_by = (f"tshark's {protocol.decoders[0]} decoder" if protocol.decoders
+                         else f"port ({', '.join(ports)}) — tshark has no decoder for it")
+        if protocol.risk == "safety_engineering":
+            closing = ("The source is listed as a known engineering workstation; confirm the session was a planned SIS change."
+                       if declared else "The source is not listed as a known engineering workstation, so this is "
+                       "reported as CRITICAL until the site confirms the session.")
+        else:
+            closing = ("OTscope recognizes this protocol but does not check its contents, so commands or changes it "
+                       "carried were not assessed.")
+        noun = "safety controller " if protocol.risk == "safety_engineering" else ""
+        self.add_finding(
+            severity, category, title.format(name=protocol.name),
+            f"{client} exchanged {packets:,} {protocol.name} packets with {noun}{server} ({', '.join(ports)}) over "
+            f"{human_duration(last - first)}, from {format_epoch(first)} to {format_epoch(last)}. "
+            f"{protocol.name} is {protocol.what}. {closing}",
+            [f"Server: {server} — {protocol.name} ({', '.join(ports)})" + (f", {protocol.role}" if protocol.role else ""),
+             f"Client: {client}" + (" (declared engineering workstation)" if declared else ""),
+             f"{packets:,} packets in {', '.join(pcaps)}",
+             f"Identified by {identified_by}; vendor: {protocol.vendor}",
+             f"Session window: {format_epoch(first)} – {format_epoch(last)} ({human_duration(last - first)}) — "
+             f"Wireshark: ({protocol.wireshark}) && ip.addr == {server} && frame.time_epoch >= {first:.6f} "
+             f"&& frame.time_epoch <= {last:.6f}"],
+            [client], [server], protocol.name, pcaps,
+            f"catalog::{protocol.key}::{client}::{server}",
+            tags=[tag, "catalog", f"catalog:{protocol.key}", "id_decoder" if protocol.decoders else "id_port"],
+            first_seen=f"{first:.6f}", last_seen=f"{last:.6f}",
+        )
+
+    def _report_ot_protocol_frames(self, protocol: OTProtocol, entry: Dict[str, Any]) -> None:
+        """One finding for a catalog protocol seen in frames without an IP layer."""
+        category, severity, tag, title = OT_RISK_CLASSES[protocol.risk]
+        sources = sorted((entry.get("sources") or {}).items(), key=lambda item: -item[1])
+        senders = [f"{mac} ({lookup_oui_vendor(mac)})" if lookup_oui_vendor(mac) else mac for mac, _ in sources[:8]]
+        first, last = entry.get("first") or 0.0, entry.get("last") or 0.0
+        frames = entry["frames"]
+        ethertypes = ", ".join(f"0x{value:04X}" for value in protocol.ethertypes) or entry.get("ethertype") or "?"
+        self.add_finding(
+            severity, category, title.format(name=protocol.name),
+            f"{frames:,} {protocol.name} frames without an IP layer were sent by {len(sources)} "
+            f"device{'s' if len(sources) != 1 else ''} between {format_epoch(first)} and {format_epoch(last)}. "
+            f"{protocol.name} is {protocol.what}. OTscope recognizes it but does not check its contents, and devices "
+            "without IP addresses do not appear in the device inventory.",
+            [f"Senders (MAC): {', '.join(senders) or '—'}" + (f" (+{len(sources) - 8} more)" if len(sources) > 8 else ""),
+             f"{frames:,} frames, EtherType {ethertypes}, in {', '.join(entry.get('pcaps') or [])}",
+             f"Wireshark: {protocol.wireshark}"],
+            [], [], protocol.name, list(entry.get("pcaps") or []),
+            f"catalog::{protocol.key}::no-ip",
+            tags=[tag, "catalog", f"catalog:{protocol.key}", "id_decoder" if (protocol.decoders or protocol.l2_decoders)
+                  else "id_ethertype", "no_ip"],
+            first_seen=f"{first:.6f}", last_seen=f"{last:.6f}",
+        )
 
     def check_unknown(self, pcaps: Sequence[Path]) -> int:
         """Flag OT-adjacent traffic to service ports with no known protocol, then
@@ -5987,23 +6635,25 @@ class OTPcapAnalyzer:
         # an unknown protocol between unclassified hosts reads as clean.
         coverage = self.traffic_coverage()
         rest = [flow for flow in coverage["unidentified"] if flow["key"] not in reported]
-        if rest:
-            packets = sum(flow["packets"] for flow in rest)
-            share = packets / max(coverage["total_packets"], 1)
+        frames = coverage["unidentified_frames"]
+        if rest or frames:
+            packets = sum(flow["packets"] for flow in rest) + sum(item["frames"] for item in frames)
+            share = packets / max(coverage["total"], 1)
+            count = len(rest) + len(frames)
+            evidence = [self._flow_text(flow) for flow in rest[:12]] + [self._frame_text(item) for item in frames[:6]]
             self.add_finding(
                 SEVERITY_LOW if share >= 0.25 else SEVERITY_INFO,
                 "Unknown and Unclassified Traffic",
                 "Traffic not identified by OTscope",
-                f"{packets:,} packets ({format_share(packets, coverage['total_packets'])} of the traffic) in "
-                f"{len(rest)} flow{'s' if len(rest) != 1 else ''} used protocols that neither OTscope nor tshark "
+                f"{packets:,} packets ({format_share(packets, coverage['total'])} of the traffic) in "
+                f"{count} flow{'s' if count != 1 else ''} used protocols that neither OTscope nor tshark "
                 "could identify, so the analysis could not assess them — the risk score says nothing about "
                 "this traffic. Identify each service with the device owner.",
-                [self._flow_text(flow) for flow in rest[:12]]
-                + ([f"(+{len(rest) - 12} more unidentified flows)"] if len(rest) > 12 else []),
+                evidence + ([f"(+{count - len(evidence)} more unidentified flows)"] if count > len(evidence) else []),
                 sorted({flow["client"] for flow in rest})[:50],
                 sorted({flow["server"] for flow in rest})[:50],
                 "Unidentified",
-                sorted({pcap for flow in rest for pcap in flow["pcaps"]}),
+                sorted({pcap for flow in rest for pcap in flow["pcaps"]} | {pcap for item in frames for pcap in item["pcaps"]}),
                 "unknown::unidentified",
                 tags=["unknown_traffic", "coverage"],
             )
@@ -6057,7 +6707,6 @@ class OTPcapAnalyzer:
         "5353,5355,137,138,1900,67,68,"
         # Omron FINS also runs over UDP/9600
         "9600,"
-        "1502,"  # Triconex TriStation (safety controllers)
         # SIP over UDP, GigE Vision control (GVCP)
         "5060,3956} || "
         "dnp3 || mms || goose || sv || opcua || s7comm || pn_dcp || rtsp || "
@@ -6271,8 +6920,6 @@ class OTPcapAnalyzer:
         # ---- Vendor-specific OT protocol accumulators ----------------
         # Each holds rows_seen flag, pcap set, and a sample list for evidence.
         fins:     Dict[str, Any] = {"rows_seen": False, "pcap_names": set(), "samples": []}
-        # Triconex TriStation sessions per (engineering host, safety controller).
-        tristation: Dict[Tuple[str, str], Dict[str, Any]] = {}
         gertp:    Dict[str, Any] = {"rows_seen": False, "pcap_names": set(), "samples": []}
         melsec:   Dict[str, Any] = {"rows_seen": False, "pcap_names": set(), "samples": []}
         pi_srv:   Dict[str, Any] = {"rows_seen": False, "pcap_names": set(), "samples": []}
@@ -6947,24 +7594,6 @@ class OTPcapAnalyzer:
                                 [ev], [src], [dst], "Omron FINS", [pn],
                                 f"fins::write::{src}::{dst}", tags=["write", "fins"],
                             )
-
-                    # ---- TRICONEX TRISTATION (UDP 1502) -----------------
-                    # Engineering protocol of Triconex safety instrumented
-                    # systems.  tshark has no dissector, so sessions are
-                    # recognised by port and reported per host pair.
-                    if _l7 and _transport == "UDP" and (dport == 1502 or sport == 1502):
-                        session_ts = tristation.setdefault((client, server), {
-                            "packets": 0, "to_controller": 0, "first": None, "last": None, "pcaps": set()})
-                        session_ts["packets"] += 1
-                        session_ts["to_controller"] += 1 if to_server else 0
-                        session_ts["pcaps"].add(pn)
-                        try:
-                            when = float(_ts_e)
-                        except ValueError:
-                            when = None
-                        if when is not None:
-                            session_ts["first"] = when if session_ts["first"] is None else min(session_ts["first"], when)
-                            session_ts["last"] = when if session_ts["last"] is None else max(session_ts["last"], when)
 
                     # ---- GE-SRTP (TCP 18245) ----------------------------
                     # GE Service Request Transport Protocol used by GE
@@ -7979,41 +8608,6 @@ class OTPcapAnalyzer:
                 ["No TCP/UDP 9600 packets matched."], [], [], "Omron FINS", pcap_name_list, "absence::fins")
         self._detector_done("Omron FINS", before)
 
-        # Triconex TriStation (safety instrumented systems)
-        before = len(self.session.findings)
-        declared_hosts = {item.strip().lower() for item in
-                          re.split(r"[,;\s]+", self.session.environment_answers.get("known_hmis", "")) if item.strip()}
-        for (eng_host, controller), info in sorted(tristation.items(), key=lambda item: -item[1]["packets"]):
-            first, last = info["first"] or 0.0, info["last"] or 0.0
-            declared = eng_host.lower() in declared_hosts
-            # An undeclared host talking to a safety controller is CRITICAL until
-            # the site confirms it; a declared engineering workstation is HIGH.
-            self.add_finding(
-                SEVERITY_HIGH if declared else SEVERITY_CRITICAL, "Safety Instrumented Systems",
-                "Triconex TriStation safety-controller traffic observed",
-                f"{eng_host} exchanged {info['packets']:,} TriStation packets with safety controller {controller} "
-                f"on UDP 1502 over {human_duration(last - first)}, from {format_epoch(first)} to {format_epoch(last)}. "
-                "TriStation is the engineering protocol of Schneider Electric Triconex safety instrumented systems — "
-                "it can read and change the safety logic. "
-                + ("The source is listed as a known engineering workstation; confirm the session was a planned SIS change."
-                   if declared else "The source is not listed as a known engineering workstation, so this is "
-                   "reported as CRITICAL until the site confirms the session."),
-                [f"Safety controller: {controller} — TriStation (UDP 1502)",
-                 f"Engineering host: {eng_host}" + (" (declared engineering workstation)" if declared else ""),
-                 f"{info['packets']:,} packets ({info['to_controller']:,} sent to the controller) in "
-                 f"{', '.join(sorted(info['pcaps']))}",
-                 f"Session window: {format_epoch(first)} – {format_epoch(last)} ({human_duration(last - first)}) — "
-                 f"Wireshark: udp.port == 1502 && frame.time_epoch >= {first:.6f} && frame.time_epoch <= {last:.6f}"],
-                [eng_host], [controller], "Triconex TriStation", sorted(info["pcaps"]),
-                f"tristation::{eng_host}::{controller}", tags=["sis", "tristation"],
-                first_seen=f"{first:.6f}", last_seen=f"{last:.6f}",
-            )
-        if not tristation and self._expected_protocol(["tristation", "triconex"]):
-            self.add_finding(SEVERITY_MEDIUM, "Absence of Expected Traffic", "Expected Triconex TriStation traffic not observed",
-                "Triconex TriStation (UDP 1502) was declared as expected, but no traffic was observed on that port.",
-                ["No UDP 1502 packets matched."], [], [], "Triconex TriStation", pcap_name_list, "absence::tristation")
-        self._detector_done("Triconex TriStation", before)
-
         # GE SRTP
         before = len(self.session.findings)
         if gertp["rows_seen"]:
@@ -8895,6 +9489,7 @@ class OTPcapAnalyzer:
             "artifact_extraction": self.check_artifact_extraction,
             "network_hygiene": self.check_network_hygiene,
             "intrusion": self.check_intrusion,
+            "ot_protocols": self.check_ot_protocols,
             "unknown": self.check_unknown,
         }
         for key, name, description in CHECK_ORDER[1:]:
@@ -9696,17 +10291,16 @@ class OTPcapAnalyzer:
                 f"Risk Score: {risk['score']} ({risk['band']}{band_note}).  "
                 f"Finding breakdown: {sev_line}."
             )
-            if coverage["total_packets"]:
+            if coverage["total"]:
+                not_identified = ([self._flow_text(flow) for flow in coverage["unidentified"][:3]]
+                                  + [self._frame_text(item) for item in coverage["unidentified_frames"][:2]])
                 coverage_p = document.add_paragraph(
-                    f"Traffic coverage: OTscope identified "
-                    f"{format_share(coverage['identified_packets'], coverage['total_packets'])} of "
-                    f"{coverage['total_packets']:,} packets."
-                    + ("  Not identified: " + "; ".join(self._flow_text(c) for c in coverage["unidentified"][:3]) + "."
-                       if coverage["unidentified"] else "")
+                    f"Traffic coverage ({coverage['total']:,} packets): {'; '.join(coverage_parts(coverage))}."
+                    + (f"  Not identified: {'; '.join(not_identified)}." if not_identified else "")
                 )
-                if coverage["identified_packets"] < coverage["total_packets"] / 2:
+                if coverage["assessed"] < coverage["total"] / 2:
                     coverage_p.add_run(
-                        "  Most of the traffic could not be identified, so a low score does not mean the "
+                        "  Most of the traffic was not assessed in detail, so a low score does not mean the "
                         "capture is benign."
                     ).bold = True
             if top_asset_text:
@@ -10397,10 +10991,10 @@ class OTPcapAnalyzer:
                 "",
                 f"Overall Risk Score: {risk['score']} ({risk['band']})"
                 + (f" — {risk['band_reason']}" if risk.get("band_reason") else ""),
-                f"Traffic coverage: {format_share(coverage['identified_packets'], coverage['total_packets'])} of "
-                f"{coverage['total_packets']:,} packets identified"
-                + ("; not identified: " + "; ".join(self._flow_text(c) for c in coverage["unidentified"][:3])
-                   if coverage["unidentified"] else ""),
+                f"Traffic coverage ({coverage['total']:,} packets): {'; '.join(coverage_parts(coverage))}"
+                + ("; not identified: " + "; ".join([self._flow_text(flow) for flow in coverage["unidentified"][:3]]
+                                                     + [self._frame_text(item) for item in coverage["unidentified_frames"][:2]])
+                   if coverage["unidentified_total"] else ""),
                 "",
                 "Remediation Plan:",
             ]
@@ -10561,13 +11155,23 @@ class OTPcapAnalyzer:
             ],
             "remediation_plan": build_remediation_plan(report_issues, issue_ids),
             "traffic_coverage": {
-                "total_packets": coverage["total_packets"],
-                "identified_packets": coverage["identified_packets"],
-                "identified_percent": round(100.0 * coverage["identified_packets"] / coverage["total_packets"], 1)
-                                      if coverage["total_packets"] else None,
+                "total_packets": coverage["total"],
+                "assessed_packets": coverage["assessed"],
+                "recognized_not_assessed_packets": coverage["not_assessed"],
+                "unidentified_packets": coverage["unidentified_total"],
+                "assessed_percent": round(100.0 * coverage["assessed"] / coverage["total"], 1)
+                                    if coverage["total"] else None,
+                "identified_percent": round(100.0 * (coverage["assessed"] + coverage["not_assessed"]) / coverage["total"], 1)
+                                      if coverage["total"] else None,
+                "recognized_not_assessed": [{"protocol": name, "packets": count}
+                                            for name, count in coverage["recognized"]],
                 "unidentified_flows": [
                     {name: flow[name] for name in ("transport", "client", "server", "port", "packets")}
                     for flow in coverage["unidentified"][:25]
+                ],
+                "unidentified_frames": [
+                    {"ethertype": item["ethertype"], "frames": item["frames"], "senders": item["sources"][:10]}
+                    for item in coverage["unidentified_frames"][:25]
                 ],
             },
             "connections_count": len(self.session.connections),
@@ -10714,10 +11318,10 @@ class OTPcapAnalyzer:
         print(f"    Score {summary['score']}" + (f" — band {summary['band_reason']}" if summary.get("band_reason") else "")
               + ("" if self.session.findings else " — no findings."))
         coverage = self.traffic_coverage()
-        if coverage["total_packets"] and coverage["identified_packets"] < coverage["total_packets"] / 2:
+        if coverage["total"] and coverage["assessed"] < coverage["total"] / 2:
             print(colorize(
-                f"    [!] Only {format_share(coverage['identified_packets'], coverage['total_packets'])} of the "
-                "traffic was identified, so this score does not mean the capture is benign.", SEVERITY_MEDIUM))
+                f"    [!] Only {format_share(coverage['assessed'], coverage['total'])} of the traffic was assessed "
+                "in detail, so this score does not mean the capture is benign.", SEVERITY_MEDIUM))
         for item in summary["top_contributors"]:
             print(f"    - [{item['severity']}] {item['title']} (weight {item['weight']})")
         # Print top-5 riskiest devices for quick triage
@@ -10900,11 +11504,10 @@ def print_run_summary(analyzer: "OTPcapAnalyzer") -> None:
     print(f"Risk: {risk['band']} (score {risk['score']}) — "
           + (" · ".join(f"{counts[severity]} {severity}" for severity in ordered) or "no findings"))
     coverage = analyzer.traffic_coverage()
-    if coverage["total_packets"]:
-        line = (f"Traffic identified: {format_share(coverage['identified_packets'], coverage['total_packets'])} "
-                f"of {coverage['total_packets']:,} packets")
-        if coverage["identified_packets"] < coverage["total_packets"] / 2:
-            print(colorize(line + " — most of this capture could not be assessed.", SEVERITY_MEDIUM))
+    if coverage["total"]:
+        line = f"Traffic coverage ({coverage['total']:,} packets): {'; '.join(coverage_parts(coverage))}"
+        if coverage["assessed"] < coverage["total"] / 2:
+            print(colorize(line + " — most of this capture was not assessed in detail.", SEVERITY_MEDIUM))
         else:
             print(line)
     issues = [issue for issue in aggregated_report_issues(session) if issue["category"] not in NON_SCORING_CATEGORIES]
@@ -11308,6 +11911,7 @@ def run_application(args: argparse.Namespace) -> None:
     if getattr(args, "scan", None):
         NON_INTERACTIVE = True
     config = load_config()
+    register_custom_protocols(config)
     analyzer = OTPcapAnalyzer(config)
     CURRENT_ANALYZER = analyzer
     signal.signal(signal.SIGINT, signal_handler)

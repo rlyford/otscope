@@ -90,7 +90,7 @@ OT/ICS protocols, attack patterns, and hygiene anomalies are detected in a singl
 - **GE SRTP (TCP 18245)** — presence, cleartext/no-auth, write indicators (GE PACSystems RX3i / 90-30).
 - **Schneider UMAS (Modbus function code 90)** — engineering sessions to Modicon M340/M580/Premium/Quantum PLCs.
 - **Mitsubishi MELSEC SLMP (TCP 5007)** — presence, cleartext/no-auth, remote run/stop/write indicators.
-- **Triconex TriStation (UDP 1502)** — sessions with Triconex safety controllers (safety instrumented systems), per host and controller; CRITICAL unless the host is a declared engineering workstation.
+- **Other OT protocols (catalog of 27)** — safety (Triconex TriStation, openSAFETY, CIP Safety), PLC programming (Unitronics PCOM, Beckhoff ADS, CODESYS, PCWorx, ProConOS, Red Lion Crimson), control and telemetry (HART-IP, FOUNDATION Fieldbus HSE, GE EGD, C37.118, Kingfisher, ELCOM, Modbus over UDP), building automation (KNX/IP, LonWorks/IP, Niagara Fox), metering (DLMS/COSEM, ANSI C12.22), and industrial Ethernet without IP (EtherCAT, POWERLINK, SERCOS III, PROFINET IO, HSR/PRP, MRP). Each is reported with a severity from its risk class — TriStation is CRITICAL unless the host is a declared engineering workstation — and sites can add their own in the config file (`custom_ot_protocols`).
 - **AVEVA / OSIsoft PI (TCP 5450 / 5457)** — historian traffic presence.
 - **Ignition Gateway (TCP 62541 / 8060)** — presence, gateway-network traffic without TLS.
 - **Node-RED (TCP 1880)** — editor/admin API reachable without authentication, flow deployment events.
@@ -116,7 +116,7 @@ OT/ICS protocols, attack patterns, and hygiene anomalies are detected in a singl
 - **EOL services** — IIS 5/6, Apache 1.x/2.0, OpenSSL 0.x, Boa, GoAhead, etc.
 - **Cleartext credential extraction** — FTP, Telnet, HTTP Basic, HTTP Form, SNMP, MQTT, POP3, IMAP.
 - **Baseline diff** — new device, new flow, new protocol, new port relative to a known-good snapshot.
-- **Unidentified traffic** — flows neither OTscope nor tshark could identify are listed with their share of the capture, so an unknown protocol never reads as clean.
+- **Traffic coverage** — every packet and frame is counted as assessed, recognized but not assessed, or not identified; unidentified flows and EtherTypes are listed, so an unknown protocol never reads as clean.
 
 Every finding auto-attaches MITRE ATT&CK for ICS technique IDs and CISA / NIST / IEC / vendor advisory references.
 
