@@ -19,6 +19,7 @@ It is designed for the case where you receive a pile of pcap files from a site y
 | **Scope** | Vulnerability detection AND active-intrusion detection. Both run on every analysis. |
 | **Input** | Multiple `.pcap` / `.pcapng` / `.cap` files (gzip-compressed is fine) merged into one unified session. Incremental — add new files later without re-analyzing the old ones. |
 | **Output** | Word report, JSON report, two CSVs, and Purdue-Model SVG diagrams. |
+| **Coverage** | Every run says how much of the capture it assessed; recognized-but-unchecked OT protocols and unidentified traffic are listed, never silently ignored. |
 | **Safety** | `--offline` hard-lock means the tool never leaks DNS / HTTPS for unknown-source pcaps. tshark always invoked with `-n`. |
 | **Performance** | Single combined tshark pass per file across all protocol checks (N protocols × M files becomes 1 × M). Calibrated per-step ETAs. Atomic session checkpointing — resume from any boundary. |
 | **Scale** | Handles flood-scale captures with 1M+ spoofed source IPs via per-finding emission caps + rollup findings. |
@@ -67,7 +68,7 @@ python3 otscope.py --report-only output/<site>_<YYYYMMDD>.otpa_session
 python3 otscope.py --offline
 ```
 
-On startup in interactive mode, OTscope prints a banner, the network-safety status, and prompts for: NEW session, RESUME, or ADD pcaps to an existing session. Use `--scan` to skip all prompts entirely.
+On startup in interactive mode, OTscope prints a banner, the network-safety status, and prompts for: NEW session, RESUME a saved session, or ADD captures to one (saved sessions are listed from `output\` — pick by number or name). Use `--scan` to skip all prompts entirely. Every run ends with a summary: findings by severity, how much of the traffic OTscope assessed (and what it only recognized or could not identify), the first actions from the Remediation Plan, and the files written. Add `--verbose` to list every protocol detector's result.
 
 ---
 
@@ -90,6 +91,7 @@ OT/ICS protocols, attack patterns, and hygiene anomalies are detected in a singl
 - **GE SRTP (TCP 18245)** — presence, cleartext/no-auth, write indicators (GE PACSystems RX3i / 90-30).
 - **Schneider UMAS (Modbus function code 90)** — engineering sessions to Modicon M340/M580/Premium/Quantum PLCs.
 - **Mitsubishi MELSEC SLMP (TCP 5007)** — presence, cleartext/no-auth, remote run/stop/write indicators.
+- **Other OT protocols (catalog of 27)** — safety (Triconex TriStation, openSAFETY, CIP Safety), PLC programming (Unitronics PCOM, Beckhoff ADS, CODESYS, PCWorx, ProConOS, Red Lion Crimson), control and telemetry (HART-IP, FOUNDATION Fieldbus HSE, GE EGD, C37.118, Kingfisher, ELCOM, Modbus over UDP), building automation (KNX/IP, LonWorks/IP, Niagara Fox), metering (DLMS/COSEM, ANSI C12.22), and industrial Ethernet without IP (EtherCAT, POWERLINK, SERCOS III, PROFINET IO, HSR/PRP, MRP). Each is reported with a severity from its risk class — TriStation is CRITICAL unless the host is a declared engineering workstation — and sites can add their own in the config file (`custom_ot_protocols`).
 - **AVEVA / OSIsoft PI (TCP 5450 / 5457)** — historian traffic presence.
 - **Ignition Gateway (TCP 62541 / 8060)** — presence, gateway-network traffic without TLS.
 - **Node-RED (TCP 1880)** — editor/admin API reachable without authentication, flow deployment events.
@@ -115,6 +117,7 @@ OT/ICS protocols, attack patterns, and hygiene anomalies are detected in a singl
 - **EOL services** — IIS 5/6, Apache 1.x/2.0, OpenSSL 0.x, Boa, GoAhead, etc.
 - **Cleartext credential extraction** — FTP, Telnet, HTTP Basic, HTTP Form, SNMP, MQTT, POP3, IMAP.
 - **Baseline diff** — new device, new flow, new protocol, new port relative to a known-good snapshot.
+- **Traffic coverage** — every packet and frame is counted as assessed, recognized but not assessed, or not identified; unidentified flows and EtherTypes are listed, so an unknown protocol never reads as clean.
 
 Every finding auto-attaches MITRE ATT&CK for ICS technique IDs and CISA / NIST / IEC / vendor advisory references.
 
@@ -126,8 +129,8 @@ Each session writes up to six artifacts to `output\` next to `otscope.py` (or th
 
 | Artifact | Filename Pattern | Purpose |
 |---|---|---|
-| Word report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.docx` | Human-readable deliverable. Executive Summary, Priority Findings by category, Suggested Controls, Network Interpretation, MITRE coverage, Device Inventory and Flow Allowlist summaries, Wireshark guides (Appendix A); timeline and full evidence with `--technical-appendix` (Appendix B). |
-| JSON report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.json` | SIEM / ticketing / scripting input. |
+| Word report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.docx` | Human-readable deliverable. Executive Summary, Remediation Plan (what to fix first, devices, likely owner), Priority Findings by category — each opening with what happened, why it matters, and numbered contain / fix / verify steps — Suggested Controls, Network Interpretation, MITRE coverage, Device Inventory and Flow Allowlist summaries, Wireshark guides (Appendix A); timeline and full evidence with `--technical-appendix` (Appendix B). |
+| JSON report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.json` | SIEM / ticketing / scripting input, including the remediation plan and each finding's report ID. |
 | Device Inventory CSV | `OT_Device_Inventory_<site>_<YYYYMMDD>.csv` | Full host list with MACs, roles, services used and answered, folded IPv6 addresses, and observations such as "impersonated by MAC …" (the Word report shows the top 15 by traffic). |
 | Flow Allowlist CSV | `OT_Flow_Allowlist_<site>_<YYYYMMDD>.csv` | Observed (client, server, service port, protocol) tuples for asset-owner segmentation review. |
 | Purdue Summary SVG | `OTscope_Purdue_Summary_<site>_<YYYYMMDD>.svg` | Visual layered architecture diagram (always written; readable at any network size). |
@@ -159,6 +162,7 @@ The complete operator manual is **[OTscope_User_Guide.md](/otscope/docs/OTscope_
 - Network-safety contract
 - The 6-question discovery questionnaire
 - Five-phase analysis pipeline (calibration, streaming, per-category, correlation, scoring)
+- OT protocol catalog, traffic coverage, and site-specific protocols
 - Word report structure and severity color coding
 - Purdue-Model SVG diagrams (Summary always, Detail for ≤50 devices)
 - Wireshark investigation workflow with `@<epoch>` tags and Observation Windows
@@ -241,7 +245,9 @@ Pull requests are welcome. Run the regression suite before submitting:
 python tests/run_regression.py
 ```
 
-Please ensure new detection logic includes:
+To recognize another OT protocol without detailed checks, add a row to `OT_PROTOCOLS` in `otscope.py` (port, EtherType, or tshark decoder; risk class; device role). The row brings its finding, device role, coverage credit, absence check, and Wireshark filter with it; add a scenario for it in `tests/scenarios.py`.
+
+For new detection logic, please include:
 
 - A dedicated finding title that doesn't collide with existing ones.
 - A scenario in `tests/scenarios.py` with a check in `tests/run_regression.py` (benign traffic that must stay quiet, and the behavior that must fire).

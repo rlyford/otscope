@@ -19,6 +19,7 @@ It is designed for the case where you receive a pile of pcap files from a site y
 | **Scope** | Vulnerability detection AND active-intrusion detection. Both run on every analysis. |
 | **Input** | Multiple `.pcap` / `.pcapng` / `.cap` files (gzip-compressed is fine) merged into one unified session. Incremental — add new files later without re-analyzing the old ones. |
 | **Output** | Word report, JSON report, two CSVs, and Purdue-Model SVG diagrams. |
+| **Coverage** | Every run says how much of the capture it assessed; recognized-but-unchecked OT protocols and unidentified traffic are listed, never silently ignored. |
 | **Safety** | `--offline` hard-lock means the tool never leaks DNS / HTTPS for unknown-source pcaps. tshark always invoked with `-n`. |
 | **Performance** | Single combined tshark pass per file across all protocol checks (N protocols × M files becomes 1 × M). Calibrated per-step ETAs. Atomic session checkpointing — resume from any boundary. |
 | **Scale** | Handles flood-scale captures with 1M+ spoofed source IPs via per-finding emission caps + rollup findings. |
@@ -67,7 +68,7 @@ python3 otscope.py --report-only output/<site>_<YYYYMMDD>.otpa_session
 python3 otscope.py --offline
 ```
 
-On startup in interactive mode, OTscope prints a banner, the network-safety status, and prompts for: NEW session, RESUME a saved session, or ADD captures to one (saved sessions are listed from `output\` — pick by number or name). Use `--scan` to skip all prompts entirely. Every run ends with a summary: findings by severity, how much of the traffic OTscope could identify, the first actions from the Remediation Plan, and the files written. Add `--verbose` to list every protocol detector's result.
+On startup in interactive mode, OTscope prints a banner, the network-safety status, and prompts for: NEW session, RESUME a saved session, or ADD captures to one (saved sessions are listed from `output\` — pick by number or name). Use `--scan` to skip all prompts entirely. Every run ends with a summary: findings by severity, how much of the traffic OTscope assessed (and what it only recognized or could not identify), the first actions from the Remediation Plan, and the files written. Add `--verbose` to list every protocol detector's result.
 
 ---
 
@@ -161,6 +162,7 @@ The complete operator manual is **[OTscope_User_Guide.md](/otscope/docs/OTscope_
 - Network-safety contract
 - The 6-question discovery questionnaire
 - Five-phase analysis pipeline (calibration, streaming, per-category, correlation, scoring)
+- OT protocol catalog, traffic coverage, and site-specific protocols
 - Word report structure and severity color coding
 - Purdue-Model SVG diagrams (Summary always, Detail for ≤50 devices)
 - Wireshark investigation workflow with `@<epoch>` tags and Observation Windows
@@ -243,7 +245,9 @@ Pull requests are welcome. Run the regression suite before submitting:
 python tests/run_regression.py
 ```
 
-Please ensure new detection logic includes:
+To recognize another OT protocol without detailed checks, add a row to `OT_PROTOCOLS` in `otscope.py` (port, EtherType, or tshark decoder; risk class; device role). The row brings its finding, device role, coverage credit, absence check, and Wireshark filter with it; add a scenario for it in `tests/scenarios.py`.
+
+For new detection logic, please include:
 
 - A dedicated finding title that doesn't collide with existing ones.
 - A scenario in `tests/scenarios.py` with a check in `tests/run_regression.py` (benign traffic that must stay quiet, and the behavior that must fire).

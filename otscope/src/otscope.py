@@ -1737,8 +1737,13 @@ def _workspace_readme_text() -> str:
         "       python otscope.py                 (interactive)\n"
         "       python otscope.py --scan pcaps    (non-interactive quick scan)\n"
         "       python otscope.py --offline       (hard-lock all outbound network calls)\n"
+        "  4. Each run ends with a summary: findings, how much of the traffic was\n"
+        "     assessed, the first actions to take, and the files written to output/.\n"
+        "     To continue later, run python otscope.py and choose R (resume) or\n"
+        "     A (add captures).\n"
         "\n"
-        "Nothing leaves this machine: analysis is fully offline and reports are\n"
+        "Analysis runs on this machine.  The only outbound calls are optional lookups\n"
+        "of public IP addresses (PTR/RDAP); --offline turns them off.  Reports are\n"
         "written to the output/ folder next to this file.\n"
     )
 
