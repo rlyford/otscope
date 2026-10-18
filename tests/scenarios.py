@@ -471,6 +471,37 @@ def multi_capture_out_of_order() -> Dict[str, Net]:
     return {"plant_a.pcap": later, "plant_b.pcap": earlier}
 
 
+def _udp_exchange(n: Net, client: str, server: str, port: int, count: int, start: float) -> None:
+    """Request/reply datagrams once a second with opaque payloads (port-based detection only)."""
+    for i in range(count):
+        payload = bytes(n.rng.randrange(256) for _ in range(32 + i % 40))
+        n.udp(start + i, client, 33279, server, port, payload)
+        n.udp(start + i + 0.01, server, port, client, 33279, payload * 3)
+
+
+def tristation_sis() -> Net:
+    """An HMI polls a PLC over Modbus while an undeclared host holds a seven-minute
+    session with a Triconex safety controller on UDP 1502 (TriStation)."""
+    n = Net(seed=23)
+    hmi, plc, eng, sis = "10.13.0.10", "10.13.0.20", "10.13.0.5", "10.13.0.50"
+    s = n.session(hmi, 50110, plc, 502).open(n.t0)
+    for i in range(60):
+        t = n.t0 + 1 + i * 2
+        s.c2s(modbus_request(i + 1, 3, 0, 4), t)
+        s.s2c(modbus_read_response(i + 1, 3, [10, 20, 30, 40]), t + 0.01)
+        s.ack_c(t + 0.2)
+    _udp_exchange(n, eng, sis, 1502, 420, n.t0 + 5)
+    return n
+
+
+def unidentified_udp() -> Net:
+    """Two hosts exchange 896 UDP datagrams on a port no OTscope detector or tshark
+    dissector covers — the shape of a capture of an unknown protocol."""
+    n = Net(seed=24)
+    _udp_exchange(n, "10.14.0.88", "10.14.0.2", 4000, 448, n.t0 + 1)
+    return n
+
+
 SCENARIOS = {
     "benign_modbus_hmi": benign_modbus_hmi,
     "benign_scada_master": benign_scada_master,
@@ -485,4 +516,6 @@ SCENARIOS = {
     "modbus_value_jump": modbus_value_jump,
     "attack_mitm_intercept": attack_mitm_intercept,
     "multi_capture_out_of_order": multi_capture_out_of_order,
+    "tristation_sis": tristation_sis,
+    "unidentified_udp": unidentified_udp,
 }

@@ -4,7 +4,7 @@
 
 Interactive multi-pcap OT/ICS traffic analysis with session persistence, role inference, attack-chain correlation, MITRE ATT&CK for ICS mapping, Wireshark investigation guidance, Purdue-Model architecture diagrams, and machine-readable artifacts.
 
-> **Version 2.8.2**  ·  October 2026
+> **Version 2.8.3**  ·  October 2026
 > Authored by Ryan Lyford  ·  © 2026 Ryan Lyford. All rights reserved.
 
 ---
@@ -124,17 +124,19 @@ On startup OTscope prints a banner, the network-safety status (see §4), and pro
 | Save current session as a baseline | `python3 otscope.py --session <file> --save-baseline /path/baseline.otpa_baseline` |
 | Compare current session to a baseline | `python3 otscope.py --session <file> --compare-baseline /path/baseline.otpa_baseline` |
 | Hard-lock all outbound network calls | `python3 otscope.py --offline` |
+| List every protocol detector's result | `python3 otscope.py --verbose` |
 | Print version | `python3 otscope.py --version` |
 
 ### 3.1 Session Lifecycle
 
 | Phase | What Happens |
 | --- | --- |
-| New | Pick a folder of pcaps, name the session, answer environment-discovery questions, run analysis. |
-| Active | Streaming + per-protocol passes generate findings; per-step ETAs print as you go. |
-| Resume | Reload an `.otpa_session` file, see findings counts, choose: Re-run / Add / Generate report / Review / Exit. |
-| Add | Process only NEW pcaps; cross-file correlation re-runs across the full set. |
-| Report | Word + JSON + CSV addenda + Purdue SVG diagrams regenerated from current session state. |
+| New | Pick a folder of pcaps, name the session, answer environment-discovery questions, run analysis. If a session with that name already exists, choose whether to add the captures to it, use a new name (the default), or overwrite it. |
+| Active | One protocol pass covers every detector and prints a one-line result (`--verbose` lists each detector), then reports how much of the traffic OTscope could identify and lists the largest flows it could not. Per-step ETAs print as you go. |
+| Resume | Pick from the saved sessions in `output\` (most recent first, with site, captures, findings, and last update — by number or name, or enter another folder), see findings counts, choose: Re-run / Add / Generate report / Review / Exit. |
+| Add | Pick a saved session, then choose captures from the folder its captures came from (captures already in the session are not listed). Only the NEW pcaps are processed; cross-file correlation re-runs across the full set. |
+| Report | Word + JSON + CSV addenda + Purdue SVG diagrams regenerated from current session state. Files from earlier runs are never overwritten (`_v2`, `_v3`, …). |
+| Summary | Every run ends with the risk band and findings by severity, how much traffic was identified, the first three actions from the Remediation Plan, and each file written with what it is for. Interactive runs offer to open the Word report. |
 
 ### 3.2 Non-Interactive Scan Mode (`--scan`)
 
@@ -147,9 +149,10 @@ Optional flags that combine with `--scan`:
 | `--assessor <name>` | Assessor name embedded in the report | `OTscope` |
 | `--site <name>` | Site name used in the report and filename slug | Folder name (the workspace folder's name when scanning the `pcaps\` drop folder itself) |
 | `--env <type>` | Environment type hint (e.g. `manufacturing`, `power`, `water`, `building-automation`, `scada`) | *(empty)* |
-| `--format word\|json\|both` | Report format(s) to generate | `word` |
+| `--format word\|json\|both` | `word`: the Word report plus JSON and Purdue diagrams; `json`: JSON and diagrams only (`both` is the same as `word`) | `word` |
 | `--technical-appendix` | Append Appendix B (raw evidence lines + per-pcap breakdown) to the Word report | *(omitted — concise report only)* |
 | `--offline` | Hard-lock all outbound network calls | *(unlocked)* |
+| `--verbose` | Print every protocol detector's result and per-file match counts | *(one summary line)* |
 
 Examples:
 
@@ -168,6 +171,8 @@ python3 otscope.py --scan /captures/site-a/ --assessor "Ryan" --site "Plant-A" \
 python otscope.py --scan C:\captures\site-a\ --assessor "Ryan" --site "Plant-A" `
     --env manufacturing --format both --offline
 ```
+
+If a session with the default name (`<site>_<YYYYMMDD>`) already exists, scan mode uses the next free name (`_2`, `_3`, …) instead of overwriting it.
 
 `--assessor` and `--site` also work in interactive mode (`--pcap` or no-arg) to pre-fill those prompts without skipping the rest of the questionnaire. `--env` pre-fills the environment-type discovery question in interactive mode.
 
@@ -265,6 +270,7 @@ Detectors read structured tshark fields — function codes, transaction IDs, TLS
 - EtherNet/IP / CIP — List Identity (device discovery), Forward Open, write services, reset, logic transfer, PCCC.
 - Siemens S7 / PROFINET — PLC Stop/Start, Write Variable, block download/upload, Read SZL, DCP Identify All / Set.
 - Omron FINS (TCP/UDP 9600), GE SRTP (TCP 18245), Mitsubishi MELSEC SLMP (TCP 5007) — presence (cleartext, no authentication) and write/control requests.
+- Triconex TriStation (UDP 1502) — sessions between a host and a Triconex safety controller (safety instrumented system), recognised by port because tshark has no TriStation dissector. One finding per host and controller with packet counts and the session window: CRITICAL unless the host is listed as a known engineering workstation (then HIGH). The controller is classified as *Controller / Safety System (SIS)*.
 - AVEVA / OSIsoft PI (TCP 5450 / 5457) — historian traffic presence.
 - Ignition Gateway (TCP 62541 / 8060) — presence; gateway-network traffic without TLS.
 - Node-RED (TCP 1880) — admin API reachable without authentication (requests to `/flows`, `/nodes`, `/settings`… with no Authorization header and no 401 reply), flow deployment events.
@@ -289,7 +295,7 @@ Detectors read structured tshark fields — function codes, transaction IDs, TLS
 Phase 2 covers the majority of detection. Three checks need their own pass: Cleartext / Legacy / Credential extraction (PAYLOAD fields are expensive), Artifact extraction (model names / firmware / project files), and Network Hygiene + Intrusion / Unknown (consume already-built session state, no tshark re-read).
 
 - **Cleartext / legacy** inventories legacy services by the port the server answered on, extracts credentials (FTP, Telnet logins reassembled across packets, HTTP Basic, HTTP form posts, SNMPv1/v2c communities, MQTT, POP3/IMAP), and reports authentication-failure bursts from the server's replies (FTP 530, HTTP 401, Telnet login failures).
-- **Unknown traffic** reports unclassified service ports on OT-adjacent devices; dynamic-range ports (≥49152) are never treated as services.
+- **Unknown traffic** reports unclassified service ports on OT-adjacent devices (dynamic-range ports ≥49152 are never treated as services), plus a *Traffic not identified by OTscope* finding for any other traffic that neither OTscope nor tshark could identify — LOW when it is at least a quarter of the traffic, otherwise INFO. A flow counts as identified when OTscope knows its service port or tshark named its protocol on at least a tenth of its packets, so a few heuristic guesses on random or encrypted payloads do not count. The same coverage numbers appear in the console after the protocol pass, in the Executive Summary, and in the JSON (`traffic_coverage`).
 
 ### 6.4 Phase 4 — Correlations
 
@@ -332,7 +338,7 @@ OTscope writes up to six report artifacts alongside the session file, named with
 | Artifact | Filename Pattern / Purpose |
 | --- | --- |
 | Word report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.docx` — the human-readable deliverable. |
-| JSON report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.json` — machine-readable findings (each with its report ID, e.g. `MODBUS-001`) + devices + risk + `remediation_plan` for SIEM/ticketing. |
+| JSON report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.json` — machine-readable findings (each with its report ID, e.g. `MODBUS-001`) + devices + risk + `remediation_plan` + `traffic_coverage` (packets identified, largest unidentified flows) for SIEM/ticketing. |
 | Device Inventory CSV | `OT_Device_Inventory_<site>_<YYYYMMDD>.csv` — full device list with per-device traffic, role, vendor, OS, VLAN, source pcaps, `is_critical_in_findings` flag, plus `client_ports` (services the device used), `ipv6_link_local` (folded IPv6 addresses), and `observations` (e.g. "impersonated by MAC …", "ARP cache poisoned by …"). |
 | Flow Allowlist CSV | `OT_Flow_Allowlist_<site>_<YYYYMMDD>.csv` — observed (client, server, service port, protocol) tuples sorted by frequency, with a default ALLOW action column for asset-owner review. |
 | Purdue Summary SVG | `OTscope_Purdue_Summary_<site>_<YYYYMMDD>.svg` — visual layered diagram (always written). |
@@ -346,7 +352,7 @@ The Word report is designed as an **auditor workpaper** for IT-oriented cybersec
 
 1. **Cover Page** — site, assessor, session name, generation time, risk score, and tool credit.
 2. **Table of Contents** — right-click → *Update Field* after opening to populate it.
-3. **Executive Summary** — risk score and band (with the reason when a confirmed intrusion raised it), finding breakdown by severity, top affected assets, the highest-severity finding with its narrative, attack-chain indicators, up to three immediate next steps (the first step of each top Remediation Plan row, with finding IDs), and the companion artifacts.
+3. **Executive Summary** — risk score and band (with the reason when a confirmed intrusion raised it), finding breakdown by severity, top affected assets, traffic coverage (how much of the traffic OTscope identified, the largest unidentified flows, and a warning when most of it was not identified), the highest-severity finding with its narrative, attack-chain indicators, up to three immediate next steps (the first step of each top Remediation Plan row, with finding IDs), and the companion artifacts.
 4. **Remediation Plan** — one row per fix, in priority order, with the devices involved, the findings it covers (by ID), and the likely owner (for example *Controls engineer* or *OT network engineer, incident response*). Findings that share a fix share a row, which takes the most urgent priority among them:
 
    | Priority | Severities |
@@ -599,6 +605,24 @@ When the Word report opens, work top-down for fastest triage:
 ## 14. Version History
 
 Running log of capabilities added in each release. Newest at the top.
+
+### Version 2.8.3 · October 2026
+
+Command-line usability release, driven by a review of the prompts and console output, and by a Triconex TriStation capture (`malware_exec.pcap`) that OTscope reported as MINIMAL risk with no findings.
+
+- **Safety-system traffic is detected.** Triconex TriStation (UDP 1502) sessions produce one finding per host and safety controller, CRITICAL unless the host is a declared engineering workstation (then HIGH). The finding gives packet counts, the session window, and safety-specific steps: confirm the workstation, keep the key switch in RUN, separate the safety network, and compare the program with the approved backup. The controller is classified as *Controller / Safety System (SIS)*. On the TriStation capture the result went from MINIMAL with no findings to MODERATE with one CRITICAL finding.
+- **Unidentified traffic is no longer silent.** OTscope says how much of the traffic it identified — in the console, the Executive Summary, and the JSON (`traffic_coverage`) — and reports a *Traffic not identified by OTscope* finding listing the flows nothing could identify. A low score with mostly unidentified traffic carries an explicit warning.
+- **Sessions:**
+  - Resume and Add list the saved sessions in `output\` (most recent first, with site, captures, findings, and last update; pick by number or name). Before, both looked in the pcap folder and found nothing.
+  - Add lists captures from the folder the session's captures came from; before, it searched the output folder and never found any.
+  - Starting a session whose name already exists asks whether to add the captures to it, use a new name (the default), or overwrite it; scan mode uses the next free name. Before, the earlier session was silently overwritten.
+  - Purdue diagrams are versioned like the other files (`_v2`, …) instead of overwriting the previous run's diagrams.
+- **Console output:**
+  - One line for the protocol pass ("27 detectors ran — findings from …") instead of one line per detector; `--verbose` restores the full list. Z-Wave no longer prints "skipping" and then "complete".
+  - No bare timestamp lines; consistent wording; each file written is announced by name.
+  - Every run ends with a summary: risk and findings by severity, traffic identified, the first three actions from the Remediation Plan, and the files written with what each is for. Interactive runs offer to open the Word report.
+  - The report prompt is Word (+ JSON and diagrams) / JSON and diagrams only / Skip. "Both" did the same as Word; `--format both` is kept as an alias.
+- **Regression suite** — 18 scenarios. New: `tristation_sis`, `unidentified_udp`, and `interactive_sessions` (drives the prompts through a new session, a same-name session, adding captures, and resuming).
 
 ### Version 2.8.2 · October 2026
 

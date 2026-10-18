@@ -67,7 +67,7 @@ python3 otscope.py --report-only output/<site>_<YYYYMMDD>.otpa_session
 python3 otscope.py --offline
 ```
 
-On startup in interactive mode, OTscope prints a banner, the network-safety status, and prompts for: NEW session, RESUME, or ADD pcaps to an existing session. Use `--scan` to skip all prompts entirely.
+On startup in interactive mode, OTscope prints a banner, the network-safety status, and prompts for: NEW session, RESUME a saved session, or ADD captures to one (saved sessions are listed from `output\` — pick by number or name). Use `--scan` to skip all prompts entirely. Every run ends with a summary: findings by severity, how much of the traffic OTscope could identify, the first actions from the Remediation Plan, and the files written. Add `--verbose` to list every protocol detector's result.
 
 ---
 
@@ -90,6 +90,7 @@ OT/ICS protocols, attack patterns, and hygiene anomalies are detected in a singl
 - **GE SRTP (TCP 18245)** — presence, cleartext/no-auth, write indicators (GE PACSystems RX3i / 90-30).
 - **Schneider UMAS (Modbus function code 90)** — engineering sessions to Modicon M340/M580/Premium/Quantum PLCs.
 - **Mitsubishi MELSEC SLMP (TCP 5007)** — presence, cleartext/no-auth, remote run/stop/write indicators.
+- **Triconex TriStation (UDP 1502)** — sessions with Triconex safety controllers (safety instrumented systems), per host and controller; CRITICAL unless the host is a declared engineering workstation.
 - **AVEVA / OSIsoft PI (TCP 5450 / 5457)** — historian traffic presence.
 - **Ignition Gateway (TCP 62541 / 8060)** — presence, gateway-network traffic without TLS.
 - **Node-RED (TCP 1880)** — editor/admin API reachable without authentication, flow deployment events.
@@ -115,6 +116,7 @@ OT/ICS protocols, attack patterns, and hygiene anomalies are detected in a singl
 - **EOL services** — IIS 5/6, Apache 1.x/2.0, OpenSSL 0.x, Boa, GoAhead, etc.
 - **Cleartext credential extraction** — FTP, Telnet, HTTP Basic, HTTP Form, SNMP, MQTT, POP3, IMAP.
 - **Baseline diff** — new device, new flow, new protocol, new port relative to a known-good snapshot.
+- **Unidentified traffic** — flows neither OTscope nor tshark could identify are listed with their share of the capture, so an unknown protocol never reads as clean.
 
 Every finding auto-attaches MITRE ATT&CK for ICS technique IDs and CISA / NIST / IEC / vendor advisory references.
 
