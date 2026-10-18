@@ -384,7 +384,9 @@ def check_tristation_sis(r: Result, out: RunOutput) -> None:
     r.check(bool(plan) and plan[0]["action"] == "Confirm who is talking to the safety controller"
             and plan[0]["priority"] == 1, "remediation plan does not open with the safety controller")
     forbid(r, out, "Traffic not identified by OTscope")
-    require_text(r, out, "TriStation is the Triconex engineering protocol")
+    require_text(r, out, "Triconex TriStation is the engineering protocol of Triconex safety instrumented systems")
+    recognized = {item["protocol"] for item in out.report.get("traffic_coverage", {}).get("recognized_not_assessed", [])}
+    r.check("Triconex TriStation" in recognized, f"TriStation not counted as recognized traffic: {recognized}")
 
 
 def check_unidentified_udp(r: Result, out: RunOutput) -> None:
@@ -394,8 +396,62 @@ def check_unidentified_udp(r: Result, out: RunOutput) -> None:
     flows = coverage.get("unidentified_flows", [])
     r.check(bool(flows) and flows[0].get("port") == 4000 and flows[0].get("packets") == 896,
             f"unidentified flows: {flows[:1]}")
-    r.check("Traffic identified: 0 of 896 packets" in out.log, "console does not report the unidentified traffic")
-    require_text(r, out, "Most of the traffic could not be identified")
+    r.check("Traffic coverage (896 packets): 0% assessed; 100% not identified" in out.log,
+            "console does not report the unidentified traffic")
+    require_text(r, out, "Most of the traffic was not assessed in detail")
+
+
+CATALOG_EXPECTED = [
+    # (title, severity, category, server or None for frames without IP)
+    ("Unitronics PCOM traffic observed", "HIGH", "Controller Programming Protocols", "10.15.0.40"),
+    ("CODESYS traffic observed", "HIGH", "Controller Programming Protocols", "10.15.0.41"),
+    ("DLMS/COSEM traffic observed", "LOW", "Other OT Protocols", "10.15.0.42"),
+    ("KNX/IP traffic observed", "MEDIUM", "Other OT Protocols", "10.15.0.21"),
+    ("GE Ethernet Global Data traffic observed", "MEDIUM", "Other OT Protocols", "10.15.0.31"),
+    ("openSAFETY traffic observed", "MEDIUM", "Safety Instrumented Systems", "10.15.0.43"),
+    ("EtherCAT traffic observed", "LOW", "Other OT Protocols", None),
+]
+
+
+def check_ot_protocol_catalog(r: Result, out: RunOutput) -> None:
+    for title, severity, category, server in CATALOG_EXPECTED:
+        hits = out.matching(title, dst=server, severity=severity)
+        r.check(bool(hits), f"missing {severity} '{title}'" + (f" to {server}" if server else ""))
+        if hits:
+            r.check(hits[0]["category"] == category, f"'{title}' filed under {hits[0]['category']}")
+    ethercat = out.matching("EtherCAT traffic observed")
+    r.check(bool(ethercat) and any("00:01:05:11:22:33" in line for line in ethercat[0]["evidence"]),
+            "EtherCAT finding does not name the sending MAC")
+    for ip, role in (("10.15.0.40", "Controller / PLC / RTU"), ("10.15.0.21", "OT Server / Gateway"),
+                     ("10.15.0.43", "Controller / Safety System (SIS)")):
+        r.check(out.device(ip).get("inferred_role") == role,
+                f"{ip} classified as {out.device(ip).get('inferred_role')!r}, expected {role!r}")
+    coverage = out.report.get("traffic_coverage", {})
+    recognized = {item["protocol"] for item in coverage.get("recognized_not_assessed", [])}
+    for name in ("Unitronics PCOM", "CODESYS", "DLMS/COSEM", "KNX/IP", "GE Ethernet Global Data", "openSAFETY", "EtherCAT"):
+        r.check(name in recognized, f"{name} not counted as recognized traffic")
+    r.check(not coverage.get("unidentified_flows"), f"IP flows left unidentified: {coverage.get('unidentified_flows')}")
+    r.check(any(item.get("ethertype") == "0x88b5" for item in coverage.get("unidentified_frames", [])),
+            "frames of the unregistered EtherType 0x88b5 not listed as unidentified")
+    require(r, out, "Traffic not identified by OTscope")
+    r.check("recognized but not assessed" in out.log, "console does not report recognized-but-unassessed traffic")
+    require_heading(r, out, "Controller Programming Protocols")
+
+
+CUSTOM_PROTOCOLS = {"custom_ot_protocols": [
+    {"name": "Acme DCS engineering", "ports": ["tcp/5555"], "risk": "programming", "vendor": "Acme"},
+    {"name": "Bad entry", "ports": ["tcp/502"]},
+]}
+
+
+def check_custom_protocol_config(r: Result, out: RunOutput) -> None:
+    require(r, out, "Acme DCS engineering traffic observed", src="10.16.0.5", dst="10.16.0.50", severity="HIGH")
+    r.check("Loaded 1 site-specific OT protocol" in out.log, "custom protocol from the config file not loaded")
+    r.check("Skipped custom_ot_protocols entry 2" in out.log and "already analyzed" in out.log,
+            "entry claiming the Modbus port was not rejected")
+    r.check(out.device("10.16.0.50").get("inferred_role") == "Controller / PLC / RTU",
+            f"custom-protocol server classified as {out.device('10.16.0.50').get('inferred_role')!r}")
+    forbid(r, out, "Traffic not identified by OTscope")
 
 
 CHECKS: Dict[str, Callable[[Result, RunOutput], None]] = {
@@ -416,7 +472,11 @@ CHECKS: Dict[str, Callable[[Result, RunOutput], None]] = {
     "multi_capture_out_of_order": check_multi_capture_out_of_order,
     "tristation_sis": check_tristation_sis,
     "unidentified_udp": check_unidentified_udp,
+    "ot_protocol_catalog": check_ot_protocol_catalog,
+    "custom_protocol_config": check_custom_protocol_config,
 }
+# Scenarios that run with their own ~/.ot_pcap_analyzer.conf.
+HOME_CONFIG: Dict[str, Dict[str, Any]] = {"custom_protocol_config": CUSTOM_PROTOCOLS}
 INTERACTIVE = "interactive_sessions"
 
 
@@ -520,7 +580,12 @@ def main() -> int:
                     captures.append(capture_dir / filename)
                     net.write(str(captures[-1]))
             site = SITES.get(name, name)
-            out = run_otscope(args.otscope, root / name, captures, name in LOOSE, site, home)
+            scenario_home = home
+            if name in HOME_CONFIG:
+                scenario_home = root / f"home_{name}"
+                scenario_home.mkdir()
+                (scenario_home / ".ot_pcap_analyzer.conf").write_text(json.dumps(HOME_CONFIG[name]), encoding="utf-8")
+            out = run_otscope(args.otscope, root / name, captures, name in LOOSE, site, scenario_home)
             expect_common(result, out)
             if out.report:
                 CHECKS[name](result, out)

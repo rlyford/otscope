@@ -4,7 +4,7 @@
 
 This repo contains **OTscope**, an offline OT/ICS packet-capture analysis tool.
 
-Primary file: `otscope/src/otscope.py` — an intentionally single-file Python application (~9,700 lines).
+Primary file: `otscope/src/otscope.py` — an intentionally single-file Python application (~12,000 lines).
 
 Supporting docs:
 - `otscope/README.md` — quick-start and feature overview
@@ -20,6 +20,7 @@ Supporting docs:
 - **Single-file design is intentional.** Do not split `otscope.py` into modules or packages.
 - The file is structured in clear sections: dataclasses → tshark interface → main analyzer class → protocol checkers → report builders → UI → utilities.
 - Session state is serialized to `.otpa_session` JSON files; output artifacts go in `output/` next to `otscope.py` (`otscope/src/output/` in this repo, contents gitignored).
+- OT protocols that need only presence detection are rows in the `OT_PROTOCOLS` catalog (port, EtherType, or tshark decoder; risk class; device role). Add a row rather than new detector code; sites add their own through `custom_ot_protocols` in the config file.
 
 ---
 
@@ -84,7 +85,7 @@ python tests/run_regression.py                      # all scenarios
 python tests/run_regression.py --only benign_modbus_hmi --keep   # one scenario, keep its workspace
 ```
 
-`tests/pcapgen.py` writes synthetic captures, `tests/scenarios.py` defines benign and attack scenarios, and `tests/run_regression.py` runs `otscope.py --scan --offline` on each in a temp workspace and checks the JSON / CSV / DOCX / SVG output. Run it after any detection change; add a scenario for new detection logic.
+`tests/pcapgen.py` writes synthetic captures, `tests/scenarios.py` defines benign and attack scenarios, and `tests/run_regression.py` runs `otscope.py --scan --offline` on each in a temp workspace and checks the JSON / CSV / DOCX / SVG output. Run it after any detection change; add a scenario for new detection logic. Scenarios can span several capture files (a builder returns `{file name: Net}`), drive the interactive prompts (`interactive_sessions`), or run with their own config file (`HOME_CONFIG`).
 
 ---
 
