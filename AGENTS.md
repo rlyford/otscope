@@ -8,7 +8,7 @@ This file is for Codex and other AGENTS.md-aware AI coding agents. `CLAUDE.md` i
 
 This repo contains **OTscope**, an offline OT/ICS packet-capture analysis tool.
 
-Primary file: `otscope/src/otscope.py` — an intentionally single-file Python application (~12,000 lines).
+Primary file: `otscope/src/otscope.py` — an intentionally single-file Python application (~12,700 lines).
 
 Supporting docs:
 - `otscope/README.md` — quick-start and feature overview
@@ -34,6 +34,7 @@ Supporting docs:
   - Utilities (IP classification, OUI lookup, risk scoring)
 - Session state is serialized to `.otpa_session` JSON files.
 - OT protocols that need only presence detection are rows in the `OT_PROTOCOLS` catalog (port, EtherType, or tshark decoder; risk class; device role). Add a row rather than new detector code; sites add their own through `custom_ot_protocols` in the config file.
+- Ping and SYN floods are counted per target in the streaming pass and followed up by `_finish_flood_checks`. Forged flood source addresses are removed from `session.devices` and `session.connections` and recorded in `analysis_metadata["spoofed_sources"]`; report code mentions them through `spoofed_sources_phrase()`.
 - Output artifacts go in `output/` next to `otscope.py` (`otscope/src/output/` in this repo; contents gitignored — never commit these).
 
 ---

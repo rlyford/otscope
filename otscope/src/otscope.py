@@ -72,7 +72,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 
 TOOL_NAME = "OTscope"
-VERSION = "2.8.4"
+VERSION = "2.8.5"
 __author__ = "Ryan Lyford"
 __copyright__ = "© 2026 Ryan Lyford. All rights reserved."
 
@@ -116,6 +116,12 @@ DEFAULT_WRITE_BURST_COUNT = 10
 DEFAULT_WRITE_BURST_SECONDS = 60
 DEFAULT_POLLING_ANOMALY_MULTIPLIER = 3.0
 LARGE_FILE_THRESHOLD_BYTES = 500 * 1024 * 1024
+# Floods: ICMP echo requests (pings) or TCP connection requests (SYN) aimed at one host.
+FLOOD_RATE_PER_SECOND = 50      # packets to one destination in one second
+FLOOD_MIN_SECONDS = 10          # how long that rate must last
+FLOOD_GAP_SECONDS = 2           # quieter seconds tolerated inside one flood
+FLOOD_DETAIL_TARGETS = 5        # largest floods given the follow-up read (senders, service check)
+SPOOF_MIN_SOURCES = 100         # distinct source addresses before a flood can count as forged
 
 SEVERITY_INFO = "INFO"
 SEVERITY_LOW = "LOW"
@@ -1002,6 +1008,7 @@ MITRE_ICS_MAP: List[Tuple[Tuple[str, ...], List[str]]] = [
     (("ws-discovery",),                        ["T0840"]),
     (("read device id",),                      ["T0888"]),                 # Remote System Information Discovery
     (("possible denial-of-service",),          ["T0814", "T0826"]),        # Denial of Service / Loss of Availability
+    (("flood against",),                       ["T0814"]),                 # Denial of Service (ping / SYN flood)
     (("write/control commands sent to many devices",),
                                                ["T0855"]),                 # Unauthorized Command Message
     (("beaconing pattern",),                   ["T0869"]),                 # Standard Application Layer Protocol
@@ -1073,6 +1080,12 @@ ADVISORY_MAP: List[Tuple[Tuple[str, ...], List[str]]] = [
         ["NIST SP 800-115 (Technical Guide to Information Security Testing)"]),
     (("masscan", "nmap", "zgrab", "ot protocol scanning", "register scanning", "icmp sweep", "icmp unreachable burst"),
         ["NIST SP 800-115 (Technical Guide to Information Security Testing)", "MITRE D3FEND D3-NTA (Network Traffic Analysis)"]),
+    (("flood against",),
+        ["NIST SP 800-82r3 (Guide to OT Security)"]),
+    (("syn flood", "connection flood"),
+        ["RFC 4987 (TCP SYN Flooding Attacks and Common Mitigations)"]),
+    (("spoofed",),
+        ["BCP 38 / RFC 2827 (Network Ingress Filtering against forged source addresses)"]),
     (("outdated web-server banner",),
         ["NIST SP 800-40r4 (Enterprise Patch Management)", "CISA BOD 22-01 (Known Exploited Vulnerabilities)"]),
     (("authentication failure burst", "bruteforce", "password spray"),
@@ -1446,6 +1459,45 @@ def human_duration(seconds: float) -> str:
     if days < 730:
         return f"{days:.0f} days"
     return f"{days / 365.25:.1f} years"
+
+
+def window_span_text(first: float, last: float) -> str:
+    """'2018-05-28 15:43:47 UTC to 15:44:46 UTC' (the date once when both ends share it)."""
+    start, end = format_epoch(first), format_epoch(last)
+    if start[:10] == end[:10]:
+        end = end[11:]
+    return f"{start} to {end}"
+
+
+def flood_windows(hot_seconds: Dict[int, int]) -> List[Tuple[int, int, int, int]]:
+    """Group the seconds that reached the flood rate into flood windows.
+
+    Returns (first second, last second, packets, peak per second) for each run
+    of such seconds (gaps of up to FLOOD_GAP_SECONDS allowed) lasting at least
+    FLOOD_MIN_SECONDS.
+    """
+    windows: List[Tuple[int, int, int, int]] = []
+    run: Optional[List[int]] = None
+    for second in sorted(hot_seconds):
+        count = hot_seconds[second]
+        if run is not None and second - run[1] <= FLOOD_GAP_SECONDS + 1:
+            run[1], run[2], run[3] = second, run[2] + count, max(run[3], count)
+            continue
+        if run is not None:
+            windows.append((run[0], run[1], run[2], run[3]))
+        run = [second, second, count, count]
+    if run is not None:
+        windows.append((run[0], run[1], run[2], run[3]))
+    return [window for window in windows if window[1] - window[0] + 1 >= FLOOD_MIN_SECONDS]
+
+
+def is_impossible_source(ip_text: str) -> bool:
+    """True for addresses no host can send from: 0.0.0.0/8, loopback, multicast, reserved, broadcast."""
+    if ":" in ip_text:
+        lowered = ip_text.lower()
+        return lowered.startswith("ff") or lowered in ("::", "::1")
+    head = ip_text.split(".", 1)[0]
+    return head.isdigit() and (int(head) in (0, 127) or int(head) >= 224)
 
 
 def format_share(part: int, total: int) -> str:
@@ -1871,7 +1923,7 @@ _NARRATIVE_RULES: List[Tuple[str, Tuple[str, ...], Tuple[str, ...]]] = [
     ("replay", ("duplicate or unsolicited", "replay"), ("replay",)),
     ("restart", ("cold restart", "warm restart", "plc stop", "disable spontaneous", "stop/start"), ("restart", "suppression")),
     ("value_anomaly", ("register value anomaly",), ("value_anomaly",)),
-    ("dos", ("denial-of-service",), ("dos",)),
+    ("dos", ("denial-of-service", "flood against"), ("dos",)),
     ("file_transfer", ("project file", "firmware", "ladder", "engineering file"), ("firmware_transfer",)),
     ("write", ("write", "operate", "control asdu", "control operation", "flow deployment", "set operation",
                "forward open", "logic transfer", "download"),
@@ -2596,6 +2648,14 @@ _WIRESHARK_GUIDE: List[Tuple[Tuple[str, ...], str, List[str]]] = [
          "Right-click any suspicious ARP frame → Conversation Filter → Ethernet to see all traffic that flowed through that MAC during the spoof window.",
          "Filter eth.addr == <impostor MAC> (named in the finding) and compare the eth.src of the victim IP's packets before, during, and after the attack window — during interception they come from the impostor.",
      ]),
+    (("flood against",),
+     "icmp.type == 8 || (tcp.flags.syn == 1 && tcp.flags.ack == 0)",
+     [
+         "Apply the filter in the finding's evidence (it names the target and the flood window), then open Statistics → I/O Graphs to see when the flood started, peaked and stopped.",
+         "Open Statistics → Endpoints → IPv4 with that filter applied: thousands of addresses that each sent one or two packets are forged. The Ethernet tab shows the MAC address that really sent them.",
+         "Filter eth.src == <sender MAC> (named in the finding) to see everything that host sent, including the ARP frames that give its real IP address, then find its switch port in the switch's MAC address table.",
+         "Filter ip.src == <target> && tcp.len > 0 and compare the I/O graph before, during and after the flood: a gap or a drop means the target stopped answering its clients.",
+     ]),
     (("register value anomaly",),
      "modbus",
      [
@@ -3313,6 +3373,8 @@ BASE_PACKET_FIELDS = [
     "tcp.flags",
     "tcp.window_size_value",
     "ip.ttl",
+    # ICMP message type (8 = echo request) for flood detection; empty on non-ICMP frames.
+    "icmp.type",
     "_ws.col.Protocol",
     "_ws.col.Info",
     # JA3 fingerprint — empty on non-TLS frames; used by JA3 known-bad check.
@@ -3761,6 +3823,8 @@ def detection_confidence_for_finding(finding: "Finding") -> str:
     """Estimate how confident the tool is that the detection is accurate."""
     if "catalog" in finding.tags:
         return "Medium (identified by port)" if "id_port" in finding.tags else "High"
+    if "flood" in finding.tags:
+        return "High"
     family = narrative_family(finding)
     title = finding.title.lower()
     if family in ("absence", "unknown"):
@@ -3833,6 +3897,23 @@ def benign_explanation_for_finding(finding: "Finding") -> str:
     return "This finding would be benign if confirmed by site personnel as representing authorized, expected communications during normal or approved maintenance operations."
 
 
+def spoofed_source_records(session: "SessionState") -> List[Dict[str, Any]]:
+    """Floods whose forged source addresses were set aside from the device inventory."""
+    return [record for record in (session.analysis_metadata.get("spoofed_sources") or [])
+            if isinstance(record, dict)]
+
+
+def spoofed_sources_phrase(session: "SessionState") -> Tuple[str, int]:
+    """("11,934 forged source addresses used in the ICMP flood against 10.0.0.5", 11934), or ("", 0)."""
+    records = spoofed_source_records(session)
+    total = sum(int(record.get("addresses") or 0) for record in records)
+    if not total:
+        return "", 0
+    floods = sorted({f"{record.get('flood') or 'flood'} against {record.get('target') or '?'}" for record in records})
+    return (f"{total:,} forged source address{'' if total == 1 else 'es'} used in the {' and the '.join(floods)}",
+            total)
+
+
 def build_network_interpretation_summary(session: "SessionState") -> List[str]:
     """Return a list of plain-English paragraphs interpreting observed network behavior."""
     paragraphs: List[str] = []
@@ -3872,6 +3953,16 @@ def build_network_interpretation_summary(session: "SessionState") -> List[str]:
             f"{resp_text}.  These hosts predominantly responded to requests on OT protocol "
             f"ports and appear to represent the field or control layer.  Validate physical "
             f"device identification with site staff."
+        )
+
+    spoofed_phrase, spoofed_total = spoofed_sources_phrase(session)
+    if spoofed_total:
+        sender_macs = {mac for record in spoofed_source_records(session) for mac in record.get("sender_macs") or []}
+        through = "the same MAC address" if len(sender_macs) <= 1 else f"{len(sender_macs)} MAC addresses"
+        paragraphs.append(
+            f"The {spoofed_phrase} sent one or two packets each, all through {through}, so they are not real "
+            "hosts.  They are left out of the device inventory, the Purdue diagrams and the flow allowlist; the "
+            "flood finding names the real sender."
         )
 
     if it_noise_on_ot:
@@ -5986,7 +6077,9 @@ class OTPcapAnalyzer:
         conn_iter = 0
         conn_log_every = max(50000, n_connections // 10) if n_connections else 0
         icmp_pairs: List[str] = []
-        icmp_ips: set = set()
+        icmp_pair_count = 0
+        icmp_ot: set = set()
+        icmp_peers: set = set()
         icmp_pcaps: set = set()
         ipv6_hosts: Dict[str, set] = defaultdict(set)
         ipv6_pcaps: set = set()
@@ -6013,9 +6106,12 @@ class OTPcapAnalyzer:
                     f"net::dns::{connection.source_ip}", [])
             if connection.protocol == "ICMP" and (self._likely_ot_device(source_device)
                                                  or self._likely_ot_device(destination_device)):
+                icmp_pair_count += 1
                 if len(icmp_pairs) < 40:
                     icmp_pairs.append(f"{connection.source_ip} <-> {connection.destination_ip} | packets: {connection.packet_count}")
-                icmp_ips.update((connection.source_ip, connection.destination_ip))
+                for end, device in ((connection.source_ip, source_device),
+                                    (connection.destination_ip, destination_device)):
+                    (icmp_ot if self._likely_ot_device(device) else icmp_peers).add(end)
                 icmp_pcaps.update(connection.source_pcaps)
             if source_device.inferred_role.startswith("Controller") and destination_device.inferred_role == "IT Device":
                 _capped_add("ot_to_it", SEVERITY_HIGH, "Direct OT-to-IT communication observed",
@@ -6025,12 +6121,19 @@ class OTPcapAnalyzer:
                     connection.source_pcaps,
                     f"net::ot-it::{connection.source_ip}::{connection.destination_ip}", ["boundary"])
         if icmp_pairs:
+            ot_text = f"{len(icmp_ot)} OT-adjacent device{'' if len(icmp_ot) == 1 else 's'}"
+            peer_text = (f" and {len(icmp_peers)} other host{'' if len(icmp_peers) == 1 else 's'}"
+                         if icmp_peers else "")
+            icmp_description = (
+                f"ICMP (ping) traffic involved {ot_text}{peer_text} in {icmp_pair_count} host "
+                f"pair{'' if icmp_pair_count == 1 else 's'}. Ping-based monitoring is common, but ICMP reachability "
+                "also lets anyone on the segment map live controllers.")
+            if any(record.get("flood") == "ICMP flood" for record in spoofed_source_records(self.session)):
+                icmp_description += " The ICMP flood and its forged source addresses are reported separately."
             self.add_finding(
                 SEVERITY_LOW, "Network Hygiene and Segmentation", "ICMP traffic involving OT devices",
-                f"ICMP was exchanged with {len(icmp_ips)} OT-adjacent host(s). Ping-based monitoring is common, but "
-                "ICMP reachability also lets anyone on the segment map live controllers.",
-                icmp_pairs, sorted(icmp_ips)[:30], [], "ICMP", sorted(icmp_pcaps),
-                "net::icmp-ot", tags=["icmp"],
+                icmp_description, icmp_pairs, sorted(icmp_ot | icmp_peers, key=_ip_sort_key)[:30], [], "ICMP",
+                sorted(icmp_pcaps), "net::icmp-ot", tags=["icmp"],
             )
         if ipv6_hosts:
             owner_of: Dict[str, DeviceRecord] = {}
@@ -6449,6 +6552,12 @@ class OTPcapAnalyzer:
                 "packets": connection.packet_count,
                 "pcaps": list(connection.source_pcaps),
             })
+        # Flood packets from forged source addresses were assessed by the flood
+        # check before their flows were set aside.
+        for record in spoofed_source_records(self.session):
+            packets = int(record.get("packets") or 0)
+            total += packets
+            assessed += packets
         frames: List[Dict[str, Any]] = []
         for label, entry in (self.session.analysis_metadata.get("non_ip") or {}).items():
             total += entry["frames"]
@@ -6872,6 +6981,16 @@ class OTPcapAnalyzer:
             "unreach_per_dst": Counter(),            # dst -> count
             "samples_per_src": defaultdict(list),    # src -> [evidence]
             "pcaps": set(),
+        }
+        # Flood accumulator.  Per (kind, destination): the current second and its
+        # packet count, every second that reached FLOOD_RATE_PER_SECOND, the
+        # Ethernet senders of those seconds' packets, and the files they came
+        # from.  Kind is "icmp" (echo request) or "syn" (TCP SYN without ACK).
+        flood: Dict[str, Any] = {
+            "current": {},                  # (kind, dst) -> [second, packets, pcap]
+            "hot": defaultdict(dict),       # (kind, dst) -> {second: packets}
+            "macs": defaultdict(Counter),   # (kind, dst) -> eth.src -> packets
+            "pcaps": defaultdict(set),      # (kind, dst) -> {pcap}
         }
         # NTP / capture-integrity accumulator
         ntp_state: Dict[str, Any] = {
@@ -8098,6 +8217,28 @@ class OTPcapAnalyzer:
                                     detail["labels"][label] += 1
                                 if label not in detail["samples"] and len(detail["samples"]) < 6:
                                     detail["samples"][label] = f"{ev} (eth {eth_src_row} -> {eth_dst_row})"
+
+                    # ---- FLOODS (echo / SYN packets per destination per second)
+                    flood_kind = ""
+                    if tcp_bits & 0x12 == 0x02:
+                        flood_kind = "syn"
+                    elif "icmp" in fp_layers and _int_field(row, "icmp.type") == 8:
+                        flood_kind = "icmp"
+                    if flood_kind and dst and _ts_e:
+                        try:
+                            flood_second = int(float(_ts_e))
+                        except ValueError:
+                            flood_second = -1
+                        if flood_second >= 0:
+                            flood_key = (flood_kind, dst)
+                            slot = flood["current"].get(flood_key)
+                            if slot is None or slot[0] != flood_second:
+                                if slot is not None:
+                                    self._flood_flush(flood, flood_key, slot)
+                                slot = flood["current"][flood_key] = [flood_second, 0, pn]
+                            slot[1] += 1
+                            if slot[1] > FLOOD_RATE_PER_SECOND and eth_src_row:
+                                flood["macs"][flood_key][eth_src_row] += 1
 
                     # ---- ARP SPOOFING / MAC-IP BINDING -------------------
                     arp_op = row.get("arp.opcode", "")
@@ -9456,6 +9597,552 @@ class OTPcapAnalyzer:
             )
         self._detector_done("IT-noise / DHCP / ICMP-sweep", before)
 
+        # ---- Flood finalization -------------------------------------
+        for flood_key, slot in list(flood["current"].items()):
+            self._flood_flush(flood, flood_key, slot)
+        before = len(self.session.findings)
+        self._finish_flood_checks(pcaps, flood, hyg)
+        self._detector_done("Flood detection", before)
+
+    # ------------------------------------------------------------------
+    # FLOOD DETECTION
+    # ------------------------------------------------------------------
+    # The streaming pass counts ICMP echo requests and TCP SYNs (without ACK)
+    # per destination per second.  A destination that received
+    # FLOOD_RATE_PER_SECOND or more for FLOOD_MIN_SECONDS was flooded.  For
+    # the largest floods one more filtered read of the files around the flood
+    # answers three questions:
+    #   * who sent it: many one-packet source addresses behind one or a few
+    #     MACs are forged, and the MAC belongs to the real sender;
+    #   * did the target keep answering: its data packets to its clients
+    #     before, during and after the flood;
+    #   * which source addresses exist only in the flood: they are set aside
+    #     from the device inventory, the diagrams and the flow list.
+    # ------------------------------------------------------------------
+
+    _FLOOD_FIELDS = [
+        "frame.time_epoch", "frame.protocols", "ip.src", "ip.dst", "ipv6.src", "ipv6.dst", "eth.src",
+        "icmp.type", "tcp.flags", "tcp.srcport", "tcp.dstport", "tcp.len", "udp.length",
+    ]
+    # kind -> (finding title, what the packets are, protocol, Wireshark match)
+    _FLOOD_KINDS: Dict[str, Tuple[str, str, str, str]] = {
+        "icmp": ("ICMP flood", "ICMP echo requests (pings)", "ICMP", "icmp.type == 8"),
+        "syn": ("TCP SYN flood", "TCP connection requests (SYN)", "TCP", "tcp.flags.syn == 1 && tcp.flags.ack == 0"),
+    }
+
+    @staticmethod
+    def _flood_flush(flood: Dict[str, Any], key: Tuple[str, str], slot: List[Any]) -> None:
+        """Keep a finished second of echo/SYN packets to one destination if it reached the flood rate."""
+        if slot[1] >= FLOOD_RATE_PER_SECOND:
+            hot = flood["hot"][key]
+            hot[slot[0]] = hot.get(slot[0], 0) + slot[1]
+            flood["pcaps"][key].add(slot[2])
+
+    def _pcap_time_span(self, name: str) -> Optional[Tuple[float, float]]:
+        """First and last packet time of a processed capture file, when known."""
+        assert self.session is not None
+        processed = self.session.processed_pcaps.get(name)
+        try:
+            return float(processed.start_time), float(processed.end_time)  # type: ignore[union-attr,arg-type]
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    def _finish_flood_checks(self, pcaps: Sequence[Path], flood: Dict[str, Any], hyg: Dict[str, Any]) -> None:
+        """Report the ping and SYN floods counted by the streaming pass."""
+        assert self.session is not None
+        candidates: List[Dict[str, Any]] = []
+        for (kind, target), hot in flood["hot"].items():
+            if is_group_address(target) or is_unspecified_address(target):
+                continue
+            windows = flood_windows(hot)
+            if not windows:
+                continue
+            main = max(windows, key=lambda window: window[2])
+            candidates.append({
+                "kind": kind, "target": target,
+                "windows": [(float(first), float(last + 1), packets) for first, last, packets, _ in windows],
+                "main": (float(main[0]), float(main[1] + 1)),
+                "hot_packets": sum(window[2] for window in windows),
+                "peak": max(window[3] for window in windows),
+                "macs": flood["macs"][(kind, target)],
+                "pcaps": sorted(flood["pcaps"][(kind, target)]),
+                "detailed": False,
+            })
+        if not candidates:
+            return
+        candidates.sort(key=lambda item: -item["hot_packets"])
+        detailed = candidates[:FLOOD_DETAIL_TARGETS]
+        self._log_ts("      Flood follow-up: " + ", ".join(
+            f"{self._FLOOD_KINDS[item['kind']][0]} against {item['target']}" for item in detailed) + " …")
+        others = self._read_flood_details(pcaps, detailed)
+        removed = self._set_aside_spoofed_sources(detailed, others, hyg)
+        for candidate in candidates:
+            self._report_flood(candidate, removed.get((candidate["target"], candidate["kind"]), {}), hyg)
+
+    def _read_flood_details(self, pcaps: Sequence[Path], detailed: List[Dict[str, Any]]) -> Dict[str, set]:
+        """One filtered read per capture file for the largest floods.
+
+        Fills each flood with its senders (per source address, and whether the
+        MAC is one of the flood's), the packets inside its windows, how many
+        SYNs went on to a completed handshake, and the target's data packets to
+        and from its clients before, during and after the main window.
+        Returns, per target, the sources that also sent it anything else.
+        """
+        by_target: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(dict)
+        for candidate in detailed:
+            first, last = candidate["main"]
+            senders: Counter = candidate["macs"]
+            total = sum(senders.values())
+            flood_macs: List[str] = []
+            covered = 0
+            for mac, count in senders.most_common(10):
+                if total and covered >= 0.9 * total:
+                    break
+                flood_macs.append(mac)
+                covered += count
+            if not flood_macs:
+                flood_macs = [""]       # the capture records no Ethernet addresses
+            candidate.update(
+                detailed=True, margin=min(600.0, max(60.0, last - first)), flood_macs=flood_macs,
+                sent=Counter(), mixed=set(), window_mixed=set(), window_sources=Counter(), in_window=0,
+                window_macs=Counter(), ports=Counter(),
+                syn_keys=set(), completed=set(), coverage=[None, None], seen=None, flood_span=None,
+                answers={phase: Counter() for phase in ("before", "during", "after")},
+                requests={phase: Counter() for phase in ("before", "during", "after")},
+            )
+            by_target[candidate["target"]][candidate["kind"]] = candidate
+        others: Dict[str, set] = defaultdict(set)
+        for pcap in pcaps:
+            span = self._pcap_time_span(pcap.name)
+            wanted = [candidate for candidate in detailed
+                      if span is None or (span[0] <= candidate["windows"][-1][1] + candidate["margin"]
+                                          and span[1] >= candidate["windows"][0][0] - candidate["margin"])]
+            if not wanted:
+                continue
+            for candidate in wanted:
+                if span is not None:
+                    low, high = candidate["coverage"]
+                    candidate["coverage"] = [span[0] if low is None else min(low, span[0]),
+                                             span[1] if high is None else max(high, span[1])]
+            targets = sorted({candidate["target"] for candidate in wanted}, key=_ip_sort_key)
+            parts = []
+            for field_name, family in (("ip.addr", [ip for ip in targets if ":" not in ip]),
+                                       ("ipv6.addr", [ip for ip in targets if ":" in ip])):
+                if family:
+                    parts.append(f"{field_name} in {{{' '.join(family)}}}")
+            try:
+                for row in iter_tshark_rows(" || ".join(parts), self._FLOOD_FIELDS, pcap):
+                    self._flood_detail_row(row, by_target, others)
+            except TSharkError as exc:
+                print(colorize(f"[!] tshark error on {pcap.name} during the flood follow-up: {exc}", SEVERITY_MEDIUM))
+        return others
+
+    def _flood_detail_row(self, row: Dict[str, str], by_target: Dict[str, Dict[str, Dict[str, Any]]],
+                          others: Dict[str, set]) -> None:
+        """Route one row of the flood follow-up read to the floods of its target."""
+        try:
+            ts = float(row.get("frame.time_epoch") or "")
+        except ValueError:
+            return
+        src, dst = row_source_ip(row), row_destination_ip(row)
+        if src == dst:
+            return
+        bits = _tcp_flag_bits(row)
+        carries_data = _int_field(row, "tcp.len", 0) > 0 or _int_field(row, "udp.length", 0) > 8
+        inbound = by_target.get(dst)
+        if inbound is not None:
+            kind = ""
+            if bits & 0x12 == 0x02:
+                kind = "syn"
+            elif _int_field(row, "icmp.type") == 8 and "icmp" in (row.get("frame.protocols") or "").split(":"):
+                kind = "icmp"
+            candidate = inbound.get(kind) if kind else None
+            if candidate is not None:
+                mac = (row.get("eth.src") or "").lower()
+                if mac in candidate["flood_macs"]:
+                    candidate["sent"][src] += 1
+                else:
+                    candidate["mixed"].add(src)
+                if any(start - 1 <= ts < end + 1 for start, end, _ in candidate["windows"]):
+                    candidate["in_window"] += 1
+                    candidate["window_macs"][mac] += 1
+                    span = candidate["flood_span"]
+                    if span is None:
+                        candidate["flood_span"] = [ts, ts]
+                    else:
+                        span[0], span[1] = min(span[0], ts), max(span[1], ts)
+                    if mac not in candidate["flood_macs"]:
+                        candidate["window_mixed"].add(src)
+                    window_sources = candidate["window_sources"]
+                    if src in window_sources or len(window_sources) < 1000:
+                        window_sources[src] += 1
+                    if kind == "syn":
+                        candidate["ports"][_int_field(row, "tcp.dstport", 0)] += 1
+                        if len(candidate["syn_keys"]) < 200_000:
+                            candidate["syn_keys"].add((src, _int_field(row, "tcp.srcport", 0)))
+            else:
+                others[dst].add(src)
+                syn_flood = inbound.get("syn")
+                # A bare ACK or data after the SYN (no SYN, no RST) completes a handshake.
+                if syn_flood is not None and bits & 0x10 and not bits & 0x06:
+                    key = (src, _int_field(row, "tcp.srcport", 0))
+                    if key in syn_flood["syn_keys"]:
+                        syn_flood["completed"].add(key)
+                if carries_data:
+                    for flood_item in inbound.values():
+                        phase = self._flood_phase(flood_item, ts)
+                        if phase:
+                            flood_item["requests"][phase][src] += 1
+            for flood_item in inbound.values():
+                self._flood_seen(flood_item, ts)
+        outbound = by_target.get(src)
+        if outbound is not None:
+            for flood_item in outbound.values():
+                self._flood_seen(flood_item, ts)
+                if carries_data:
+                    phase = self._flood_phase(flood_item, ts)
+                    if phase:
+                        flood_item["answers"][phase][dst] += 1
+
+    @staticmethod
+    def _flood_phase(candidate: Dict[str, Any], ts: float) -> str:
+        """'before', 'during' or 'after' the main flood window (within the margin), or ''."""
+        first, last = candidate["main"]
+        margin = candidate["margin"]
+        if ts < first:
+            return "before" if ts >= first - margin else ""
+        if ts < last:
+            return "during"
+        return "after" if ts < last + margin else ""
+
+    @staticmethod
+    def _flood_seen(candidate: Dict[str, Any], ts: float) -> None:
+        seen = candidate["seen"]
+        if seen is None:
+            candidate["seen"] = [ts, ts]
+        elif ts < seen[0]:
+            seen[0] = ts
+        elif ts > seen[1]:
+            seen[1] = ts
+
+    def _set_aside_spoofed_sources(self, detailed: List[Dict[str, Any]], others: Dict[str, set],
+                                   hyg: Dict[str, Any]) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        """Remove the source addresses that exist only as forged senders of a flood.
+
+        A flood is forged when it came through at most three MACs from at least
+        SPOOF_MIN_SOURCES addresses that sent two packets or fewer on average,
+        and (SYN floods) most of its handshakes did not complete.
+        An address is set aside when it sent the target nothing but flood
+        packets through the flood's MACs, never appeared in ARP, sent nothing
+        else in the inventory, and talked to no other host.  Returns, per
+        (target, kind), the addresses, flows and packets set aside.
+        """
+        assert self.session is not None
+        arp_ips = hyg.get("ip_to_macs") or {}
+        owner: Dict[str, Tuple[str, str]] = {}
+        shared: set = set()
+        for candidate in detailed:
+            sent: Counter = candidate["sent"]
+            packets = sum(sent.values())
+            candidate["sources"] = len(sent) + len(candidate["window_mixed"].difference(sent))
+            # Completed handshakes prove the sources received the SYN-ACK: real addresses.
+            handshakes = (len(candidate["syn_keys"]) >= 20
+                          and len(candidate["completed"]) * 2 >= len(candidate["syn_keys"]))
+            candidate["spoofed"] = (0 < len(candidate["flood_macs"]) <= 3 and len(sent) >= SPOOF_MIN_SOURCES
+                                    and len(sent) * 2 >= packets and not handshakes)
+            if not candidate["spoofed"]:
+                continue
+            target = candidate["target"]
+            excluded = others.get(target, set())
+            for address, count in sent.items():
+                if address == target or address in excluded or address in candidate["mixed"] or address in arp_ips:
+                    continue
+                device = self.session.devices.get(address)
+                if device is not None and device.outgoing_count > count:
+                    continue
+                if address in owner and owner[address][0] != target:
+                    shared.add(address)
+                owner.setdefault(address, (target, candidate["kind"]))
+        for address in shared:
+            owner.pop(address, None)
+        # An address that also talked to any other host is real.
+        for connection in self.session.connections.values():
+            for end, peer in ((connection.source_ip, connection.destination_ip),
+                              (connection.destination_ip, connection.source_ip)):
+                if end in owner and owner[end][0] != peer:
+                    owner.pop(end)
+        removed: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        if not owner:
+            return removed
+
+        def _entry(key: Tuple[str, str]) -> Dict[str, Any]:
+            return removed.setdefault(key, {"addresses": 0, "flows": 0, "packets": 0, "sample": []})
+
+        for key in [key for key, connection in self.session.connections.items()
+                    if connection.source_ip in owner or connection.destination_ip in owner]:
+            connection = self.session.connections.pop(key)
+            entry = _entry(owner.get(connection.source_ip) or owner[connection.destination_ip])
+            entry["flows"] += 1
+            entry["packets"] += connection.packet_count
+        for address, key in owner.items():
+            self.session.devices.pop(address, None)
+            entry = _entry(key)
+            entry["addresses"] += 1
+            if len(entry["sample"]) < 12:
+                entry["sample"].append(address)
+        return removed
+
+    def _hosts_behind_mac(self, mac: str, hyg: Dict[str, Any], target: str) -> Tuple[List[str], List[str]]:
+        """The addresses a MAC claimed in ARP, and the other addresses whose traffic it carried."""
+        assert self.session is not None
+        claimed = {ip for ip in (hyg.get("mac_to_ips") or {}).get(mac, set())
+                   if ip != target and not is_unspecified_address(ip)}
+        carried = {device.ip for device in self.session.devices.values()
+                   if device.ip != target and device.ip not in claimed
+                   and any(item.lower() == mac for item in device.macs)}
+        return sorted(claimed, key=_ip_sort_key), sorted(carried, key=_ip_sort_key)
+
+    def _flood_impact(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        """Compare the target's data packets to its clients before, during and after the main flood window."""
+        target = candidate["target"]
+        first, last = candidate["main"]
+        margin = candidate["margin"]
+        low, high = candidate["coverage"]
+        if low is None or high is None:
+            low, high = candidate["seen"] or (first, last)
+        lengths = {
+            "before": max(0.0, first - max(first - margin, low)),
+            "during": max(1.0, last - first),
+            "after": max(0.0, min(last + margin, high) - last),
+        }
+        phases = [phase for phase in ("before", "during", "after") if lengths[phase] >= 1]
+        # The flood's own senders are not the clients whose service is in question.
+        senders: Counter = candidate["sent"]
+        clients: Counter = Counter()
+        flooders: Counter = Counter()
+        for phase in lengths:
+            for table in (candidate["requests"], candidate["answers"]):
+                for peer, count in table[phase].items():
+                    if not is_group_address(peer):
+                        (flooders if peer in senders else clients)[peer] += count
+        answers = {phase: sum(candidate["answers"][phase][peer] for peer in clients) for phase in lengths}
+        requests = {phase: sum(candidate["requests"][phase][peer] for peer in clients) for phase in lengths}
+        rates = {phase: answers[phase] / lengths[phase] for phase in phases}
+        lines = [f"Service check, {target}'s data packets to its clients: " + ", ".join(
+            f"{rates[phase]:.1f}/s {phase} ({human_duration(lengths[phase])})" for phase in phases)]
+
+        def _cells(peer: str) -> str:
+            return " → ".join(f"{candidate['requests'][phase][peer] / lengths[phase]:.1f}/"
+                              f"{candidate['answers'][phase][peer] / lengths[phase]:.1f}" for phase in phases)
+
+        for peer, _ in clients.most_common(3):
+            lines.append(f"Client {peer}: requests/answers per second, {' → '.join(phases)}: {_cells(peer)}")
+        for peer, _ in flooders.most_common(1):
+            lines.append(f"Flood sender {peer} (not counted above): requests/answers per second, "
+                         f"{' → '.join(phases)}: {_cells(peer)}")
+        base_phase = next((phase for phase in ("before", "after")
+                           if lengths[phase] >= 10 and answers[phase] >= 5), "")
+        if not base_phase:
+            text = (f"OTscope could not tell whether {target} kept working: it sent no data to its clients "
+                    "outside the flood window to compare with.")
+            if requests["during"] and not answers["during"]:
+                text += f" During the flood its clients sent {requests['during']:,} requests and got no answers."
+            return {"verdict": "unknown", "text": text, "lines": lines}
+        base, during = rates[base_phase], rates["during"]
+        if during < 0.5 * base:
+            text = (f"{target}'s answers to its clients fell from {base:.1f} per second {base_phase} the flood "
+                    f"to {during:.1f} per second during it")
+            if base_phase == "before" and "after" in phases and lengths["after"] >= 10:
+                if rates["after"] >= 0.5 * base:
+                    text += f", and recovered afterwards ({rates['after']:.1f} per second)"
+                else:
+                    text += (f", and had not recovered {human_duration(lengths['after'])} later "
+                             f"({rates['after']:.1f} per second)")
+            return {"verdict": "drop", "text": text + ": a loss of service during the flood.", "lines": lines,
+                    "base": base, "during": during}
+        rate_text = ", ".join(f"{rates[phase]:.1f} per second {'during it' if phase == 'during' else phase + ' the flood'}"
+                              for phase in phases)
+        return {"verdict": "ok", "lines": lines,
+                "text": f"{target} kept answering its clients ({rate_text}): no visible loss of service from "
+                        "this capture point."}
+
+    def _report_flood(self, candidate: Dict[str, Any], removed: Dict[str, Any], hyg: Dict[str, Any]) -> None:
+        """Add the finding, device observations, console line and metadata for one flood."""
+        assert self.session is not None
+        kind, target = candidate["kind"], candidate["target"]
+        label, what, protocol, match = self._FLOOD_KINDS[kind]
+        windows = candidate["windows"]
+        detailed = candidate["detailed"]
+        duration = sum(end - start for start, end, _ in windows)
+        if detailed and candidate["flood_span"]:
+            # From the first to the last flood packet seen in the follow-up read.
+            first, last = candidate["flood_span"]
+            bounds = f"frame.time_epoch >= {first:.6f} && frame.time_epoch <= {last:.6f}"
+            if len(windows) == 1:
+                duration = max(1.0, last - first)
+        else:
+            first, last = windows[0][0], windows[-1][1] - 1
+            bounds = f"frame.time_epoch >= {first:.0f} && frame.time_epoch < {last + 1:.0f}"
+        packets = candidate["in_window"] if detailed and candidate["in_window"] else candidate["hot_packets"]
+        rate = packets / duration if duration else 0.0
+        span_text = window_span_text(first, last)
+        if kind == "syn" and detailed and len(candidate["syn_keys"]) >= 20 \
+                and len(candidate["completed"]) * 2 >= len(candidate["syn_keys"]):
+            label, what = "TCP connection flood", "new TCP connections"
+        address_field = "ipv6.dst" if ":" in target else "ip.dst"
+        evidence = [
+            f"Window: {span_text} ({human_duration(duration)}) — Wireshark: {address_field} == {target} && "
+            f"{match} && {bounds}",
+            f"Rate: {rate:,.0f} packets/s on average, {candidate['peak']:,}/s at peak; "
+            f"{packets:,} packets in the flood window",
+        ]
+        if len(windows) > 1:
+            evidence.append(f"Flood bursts ({len(windows)}): " + "; ".join(
+                f"{window_span_text(start, end - 1)} ({count:,} packets)" for start, end, count in windows[:6]))
+        description = [f"That is about {rate:,.0f} per second, peaking at {candidate['peak']:,} per second."]
+        if kind == "syn" and detailed and candidate["ports"]:
+            ports: Counter = candidate["ports"]
+            port, port_count = ports.most_common(1)[0]
+            evidence.append("Target ports: " + ", ".join(
+                f"{item} ({format_share(count, sum(ports.values()))})" for item, count in ports.most_common(5))
+                + (f" and {len(ports) - 5:,} more" if len(ports) > 5 else ""))
+            if candidate["syn_keys"]:
+                evidence.append(f"Handshakes completed: {len(candidate['completed']):,} of "
+                                f"{len(candidate['syn_keys']):,} connection requests")
+            if port_count * 5 >= sum(ports.values()) * 4:
+                description.append(f"Almost all of them went to port {port}.")
+            if label == "TCP connection flood":
+                description.append("Most of the connections were completed, so the source addresses are real; "
+                                   "opening connections this fast can exhaust a controller's connection table.")
+            elif candidate["syn_keys"]:
+                completed = len(candidate["completed"])
+                description.append(f"Only {completed:,} of them went on to a completed connection." if completed
+                                   else "None of them went on to a completed connection.")
+        sender_ips: List[str] = []
+        sender_macs: List[str] = []
+        senders: Counter = candidate.get("window_macs") or candidate["macs"]
+        total_sent = sum(senders.values())
+        for mac, count in senders.most_common(3):
+            if not mac:
+                continue
+            vendor = lookup_oui_vendor(mac)
+            sender_macs.append(mac)
+            evidence.append(f"Ethernet sender: {mac}" + (f" ({vendor})" if vendor else "")
+                            + f" — {format_share(count, total_sent)} of the flood packets")
+        if detailed and candidate.get("spoofed"):
+            sources = candidate["sources"]
+            bogus = sum(1 for address in candidate["sent"] if is_impossible_source(address))
+            flood_macs = [mac for mac in candidate["flood_macs"] if mac]
+            mac_text = (f"one Ethernet sender, MAC {self._mac_label(flood_macs[0])}" if len(flood_macs) == 1
+                        else f"{len(flood_macs)} MAC addresses ({', '.join(self._mac_label(mac) for mac in flood_macs)})")
+            evidence.append(f"Source addresses: {sources:,} distinct"
+                            + (f", {bogus:,} of them impossible as senders (0.0.0.0/8, 127.0.0.0/8, multicast or "
+                               "reserved)" if bogus else ""))
+            behind = {mac: self._hosts_behind_mac(mac, hyg, target) for mac in flood_macs}
+            for mac, (claimed, carried) in behind.items():
+                for heading, addresses in (("claimed in ARP", claimed), ("also carried traffic for", carried)):
+                    if addresses:
+                        evidence.append(f"{mac} {heading}: {', '.join(addresses[:8])}"
+                                        + (f" (+{len(addresses) - 8} more)" if len(addresses) > 8 else ""))
+            known = sorted({ip for claimed, carried in behind.values() for ip in (claimed or carried)},
+                           key=_ip_sort_key)
+            routers = [mac for mac, (_, carried) in behind.items() if len(carried) >= 3]
+            text = (f"Almost every packet carried a different source address — {sources:,} addresses"
+                    + (f", {bogus:,} of which no real host can send from" if bogus else "")
+                    + (f" — but they all came through {mac_text}" if flood_macs else "")
+                    + ", so the source addresses are forged (spoofed).")
+            if not flood_macs:
+                text += " The capture records no Ethernet addresses, so it cannot show the real sender."
+            elif routers:
+                text += (f" MAC {routers[0]} also carries the traffic of {len(behind[routers[0]][1])} other hosts, so "
+                         "it is probably a router or firewall and the flood came from another network: trace it "
+                         "upstream.")
+            elif known:
+                sender_ips = known[:3]
+                text += f" The real sender is {' / '.join(known[:3])}, the host behind that MAC address."
+            else:
+                text += (" No IP address was seen for that MAC: find the host on the switch port that learned it "
+                         "(the switch's MAC address table).")
+            description.append(text)
+        elif detailed and candidate["window_sources"]:
+            window_sources: Counter = candidate["window_sources"]
+            window_total = sum(window_sources.values())
+            sender_ips = [address for address, count in window_sources.most_common(5) if count * 10 >= window_total]
+            if not sender_ips:
+                description.append(f"It came from {len(window_sources):,}{'+' if len(window_sources) >= 1000 else ''} "
+                                   "source addresses, none sending more than a tenth of the packets.")
+            evidence.append("Sources in the flood window: " + ", ".join(
+                f"{address} ({count:,})" for address, count in window_sources.most_common(5))
+                + (f" and {len(window_sources) - 5:,} more" if len(window_sources) > 5 else ""))
+        elif detailed:
+            description.append("The follow-up read found none of the flood packets, so its senders are not named.")
+        else:
+            description.append(f"Its senders and its effect on {target} were not checked (OTscope follows up the "
+                               f"{FLOOD_DETAIL_TARGETS} largest floods only); the Ethernet senders are listed below.")
+        impact = self._flood_impact(candidate) if detailed else {"verdict": "unknown", "text": "", "lines": []}
+        if impact["text"]:
+            description.append(impact["text"])
+        evidence.extend(impact["lines"])
+        if removed.get("addresses"):
+            description.append("The forged addresses are left out of the device inventory, the diagrams and the flow "
+                               "allowlist.")
+            evidence.append(f"Set aside from the device inventory: {removed['addresses']:,} forged addresses and "
+                            f"{removed['flows']:,} flows ({removed['packets']:,} packets)")
+            evidence.append(f"Sample forged sources: {', '.join(removed['sample'][:10])}")
+        # The first sentence is the report's "What happened": who flooded whom, how, and when.
+        forged = " under forged source addresses" if candidate.get("spoofed") else ""
+        lead = (f"{', '.join(sender_ips[:3])} flooded {target} with {packets:,} {what}{forged}" if sender_ips
+                else f"{target} received {packets:,} {what}{forged}")
+        lead += f" in {human_duration(duration)} ({span_text})"
+        if impact["verdict"] == "drop":
+            lead += f", during which {target} answered its clients less than half as often"
+        description.insert(0, lead + ".")
+        # Forged source addresses have no use outside an attack or an approved test.
+        if candidate.get("spoofed"):
+            severity = SEVERITY_INTRUSION
+        elif impact["verdict"] == "drop":
+            severity = SEVERITY_CRITICAL
+        else:
+            severity = SEVERITY_HIGH
+        title = f"{label} against {target}"
+        self.add_finding(
+            severity, "Intrusion Indicators", title, " ".join(description), evidence,
+            sender_ips, [target], protocol, candidate["pcaps"], f"intrusion::flood::{kind}::{target}",
+            tags=["dos", "flood", kind] + (["spoofed"] if candidate.get("spoofed") else []),
+            first_seen=f"{first:.6f}", last_seen=f"{last:.6f}",
+            mitre_ids=["T0814"] + (["T0826"] if impact["verdict"] == "drop" else []),
+        )
+        effect = {"ok": "kept answering its clients", "drop": "its answers to clients dropped during the flood",
+                  "unknown": "effect on its service not determined"}[impact["verdict"]]
+        target_device = self.session.devices.get(target)
+        if target_device is not None:
+            article = "an" if label[0] in "AEIOU" else "a"
+            self._remember_unique(target_device.evidence,
+                                  f"Target of {article} {label} ({packets:,} packets, {span_text}); {effect}")
+        for address in sender_ips[:3]:
+            device = self.session.devices.get(address)
+            if device is not None:
+                forged = f" under {candidate['sources']:,} forged source addresses" if candidate.get("spoofed") else ""
+                self._remember_unique(device.evidence, f"Sent the {label} against {target}{forged} ({span_text})")
+        line = f"[!] {title}: {packets:,} packets in {human_duration(duration)}"
+        if removed.get("addresses"):
+            line += (f" — {removed['addresses']:,} forged source addresses set aside "
+                     f"({len(self.session.devices):,} devices remain)")
+        self._log_ts(colorize(line, severity))
+        if removed.get("addresses"):
+            self.session.analysis_metadata.setdefault("spoofed_sources", []).append({
+                "target": target, "flood": label, "addresses": removed["addresses"], "flows": removed["flows"],
+                "packets": removed["packets"],
+                "sender_macs": [mac for mac in (candidate.get("flood_macs") or sender_macs) if mac],
+                "sender_ips": sender_ips, "first_seen": round(first, 6), "last_seen": round(last, 6),
+                "sample": removed["sample"],
+            })
+
+    @staticmethod
+    def _mac_label(mac: str) -> str:
+        vendor = lookup_oui_vendor(mac)
+        return f"{mac} ({vendor})" if vendor else mac
+
     def run_optional_checks(self, pcaps: Sequence[Path]) -> None:
         """Run the analysis categories after inventory without per-check prompts."""
         assert self.session is not None
@@ -9677,6 +10364,9 @@ class OTPcapAnalyzer:
                              + (f" (+{len(device.source_pcaps)-3} more)" if len(device.source_pcaps) > 3 else ""))
             if zone_total > ZONE_DEVICE_CAP:
                 lines.append(f"  … (+ {zone_total - ZONE_DEVICE_CAP:,} more device(s) in this zone — see Device Inventory CSV addendum)")
+        spoofed_phrase, _ = spoofed_sources_phrase(self.session)
+        if spoofed_phrase:
+            lines.append(f"[Not shown]  {spoofed_phrase} (not real hosts)")
         lines.append("")
         lines.append("Connections:")
         for connection in sorted(self.session.connections.values(), key=lambda item: item.packet_count, reverse=True)[:50]:
@@ -9760,7 +10450,9 @@ class OTPcapAnalyzer:
         GAP = 14
         title_h = 44
         legend_h = 32
-        total_h = title_h + legend_h + PAD + len(active_layers) * (BOX_H + GAP) + PAD
+        spoofed_phrase, _ = spoofed_sources_phrase(self.session)
+        note_h = 20 if spoofed_phrase else 0
+        total_h = title_h + legend_h + PAD + len(active_layers) * (BOX_H + GAP) + PAD + note_h
 
         svg_lines: List[str] = []
         svg_lines.append(
@@ -9837,6 +10529,12 @@ class OTPcapAnalyzer:
                 f'Protocols: {_xml_escape(top_protos)}</text>'
             )
             y += BOX_H + GAP
+
+        if spoofed_phrase:
+            svg_lines.append(
+                f'<text x="{PAD}" y="{y + 6}" font-size="10" fill="#555">'
+                f'Not shown: {_xml_escape(spoofed_phrase)} (not real hosts).</text>'
+            )
 
         # Arrow marker def
         svg_lines.insert(1,
@@ -10715,8 +11413,11 @@ class OTPcapAnalyzer:
                 reverse=True,
             )
             total_devices = len(all_devices_sorted)
+            spoofed_phrase, spoofed_total = spoofed_sources_phrase(self.session)
+            spoofed_text = (f" (not counting {spoofed_phrase}, which the flood finding describes)"
+                            if spoofed_total else "")
             document.add_paragraph(
-                f"Total observed devices: {total_devices:,}.  "
+                f"Total observed devices: {total_devices:,}{spoofed_text}.  "
                 "Top 15 by traffic are shown below.  Broadcast and multicast destinations are not "
                 "devices; they are listed in the Network Interpretation Summary.  "
                 "The complete Device Inventory CSV (all devices, all fields) is written "
@@ -10760,6 +11461,8 @@ class OTPcapAnalyzer:
                 "segmentation gap analysis.  Each row is a communication path actually "
                 "observed; flows not in the CSV but permitted by policy may indicate "
                 "unnecessary exposure."
+                + ("  Flows from forged (spoofed) flood source addresses are not listed."
+                   if spoofed_total else "")
             )
             document.add_paragraph(
                 "Auditor note: the Flow Allowlist does not distinguish authorized from "
@@ -10944,7 +11647,9 @@ class OTPcapAnalyzer:
                         "See Device Inventory CSV for the complete list."
                     )
                 else:
-                    document.add_paragraph(f"All {total_devices:,} observed device(s).")
+                    document.add_paragraph(f"All {total_devices:,} observed device(s)."
+                                           + (f"  Not listed: {spoofed_phrase} (not real hosts)."
+                                              if spoofed_total else ""))
                 inv_table = document.add_table(rows=1, cols=8)
                 _style_table(inv_table)
                 inv_h = inv_table.rows[0].cells
@@ -11180,6 +11885,7 @@ class OTPcapAnalyzer:
                 ],
             },
             "connections_count": len(self.session.connections),
+            "spoofed_sources": spoofed_source_records(self.session),
             "correlation_summary": correlation_summary_lines(self.session),
         }
         report_path.write_text(pretty_json(report_data), encoding="utf-8")
@@ -11564,7 +12270,9 @@ def session_summary(session: SessionState) -> None:
     print(f"Site: {session.site}")
     print(f"Assessor: {session.assessor}")
     print(f"Pcap files: {len(session.processed_pcaps)}")
-    print(f"Devices: {len(session.devices)}")
+    _, spoofed_total = spoofed_sources_phrase(session)
+    print(f"Devices: {len(session.devices)}"
+          + (f" (+ {spoofed_total:,} forged flood source addresses set aside)" if spoofed_total else ""))
     print(f"Findings: {len(session.findings)}")
     print(f"Last analysis date: {session.updated_at}")
     if counts:

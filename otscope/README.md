@@ -22,7 +22,7 @@ It is designed for the case where you receive a pile of pcap files from a site y
 | **Coverage** | Every run says how much of the capture it assessed; recognized-but-unchecked OT protocols and unidentified traffic are listed, never silently ignored. |
 | **Safety** | `--offline` hard-lock means the tool never leaks DNS / HTTPS for unknown-source pcaps. tshark always invoked with `-n`. |
 | **Performance** | Single combined tshark pass per file across all protocol checks (N protocols × M files becomes 1 × M). Calibrated per-step ETAs. Atomic session checkpointing — resume from any boundary. |
-| **Scale** | Handles flood-scale captures with 1M+ spoofed source IPs via per-finding emission caps + rollup findings. |
+| **Scale** | Handles flood-scale captures: forged flood source addresses are set aside instead of becoming devices, and per-finding emission caps + rollup findings cover the rest. |
 | **Form** | Single Python file. No Flask, no Django, no databases. Run with `python3 otscope.py`. |
 
 ---
@@ -107,7 +107,7 @@ OT/ICS protocols, attack patterns, and hygiene anomalies are detected in a singl
 - **TLS weakness** — the version and cipher suite each server actually selected (SSLv2/3, TLS 1.0/1.1; NULL/anon/EXPORT/RC4/DES/3DES/MD5 suites), certificates rejected by the peer, expired certificates, JA3 fingerprints of known offensive tools.
 - **SNMP** — walks (≥50 GetNext/GetBulk), SET ops, SNMPv1/v2c community strings.
 - **Reconnaissance** — broad-and-shallow OT port scans, ICMP sweeps, port-scan unreachable bursts, register-map sweeps, SNMP walks, suspicious tool User-Agents (Mimikatz, Cobalt Strike, sqlmap, masscan, nmap), recon-then-write correlation. Routine engineering discovery (IEC 104 interrogation, CIP List Identity, S7 Read SZL) is reported but not treated as reconnaissance.
-- **Denial of service** — correlation of unanswered SYNs, aborted connections, and hammer-rate requests between one client and one server.
+- **Denial of service** — ping, SYN, and connection floods against one host (50+ per second for 10+ seconds). Forged source addresses are recognized and the real sender named by MAC, vendor and IP, and a before / during / after check shows whether the target kept answering its clients. Also a correlation of unanswered SYNs, aborted connections, and hammer-rate requests between one client and one server.
 - **Suppression attacks** — DNP3 disable-spontaneous, cold/warm restart, alarm silencing.
 - **Brute-force** — authentication-failure bursts read from server replies (FTP 530, HTTP 401, Telnet login failures).
 - **Boundary violations** — IT/OT crossings, dual-zone bridging, public-IP exposure of OT devices.

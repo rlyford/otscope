@@ -454,6 +454,89 @@ def check_custom_protocol_config(r: Result, out: RunOutput) -> None:
     forbid(r, out, "Traffic not identified by OTscope")
 
 
+def check_attack_spoofed_floods(r: Result, out: RunOutput) -> None:
+    plc, attacker, mac = "10.10.1.10", "10.10.1.66", "00:0c:29:aa:bb:cc"
+    icmp = out.matching("ICMP flood against", dst=plc, severity="INTRUSION")
+    syn = out.matching("TCP SYN flood against", dst=plc, severity="INTRUSION")
+    r.check(len(icmp) == 1, "forged ping flood not reported as one INTRUSION finding")
+    r.check(len(syn) == 1, "forged SYN flood not reported as one INTRUSION finding")
+    for finding in icmp + syn:
+        r.check(finding["source_ips"] == [attacker], f"{finding['title']} attributed to {finding['source_ips']}")
+        r.check("forged (spoofed)" in finding["description"], f"{finding['title']} does not say the sources are forged")
+        r.check(any(mac in line for line in finding["evidence"]), f"{finding['title']} does not name the sender MAC")
+        r.check("T0814" in finding["mitre_ids"], f"{finding['title']} not mapped to T0814")
+        r.check(finding.get("report_id", "").startswith("INTRUSION-"), f"report ID {finding.get('report_id')!r}")
+    if icmp:
+        r.check(icmp[0]["description"].startswith(
+            f"{attacker} flooded {plc} with 2,000 ICMP echo requests (pings) under forged source addresses"),
+            "forged ping flood does not open with who flooded whom")
+        r.check("no visible loss of service" in icmp[0]["description"], "ping flood: service check missing")
+        r.check("T0826" not in icmp[0]["mitre_ids"], "ping flood mapped to Loss of Availability without a loss")
+    if syn:
+        r.check(f"during which {plc} answered its clients less than half as often." in syn[0]["description"],
+                "SYN flood's first sentence does not mention the loss of service")
+        r.check("fell from 2.0 per second before the flood to 0.2 per second during it" in syn[0]["description"]
+                and "recovered afterwards" in syn[0]["description"], "SYN flood: loss of service not described")
+        r.check("T0826" in syn[0]["mitre_ids"], "SYN flood with loss of service not mapped to T0826")
+    devices = set(out.report.get("devices", {}))
+    real = {plc, attacker, "10.10.1.20", "10.10.1.1"}
+    r.check(devices == real, f"device inventory: {len(devices)} devices, unexpected {sorted(devices - real)[:5]}")
+    records = out.report.get("spoofed_sources") or []
+    total = sum(record.get("addresses", 0) for record in records)
+    r.check(len(records) == 2 and total >= 3900, f"{total} forged addresses set aside in {len(records)} record(s)")
+    r.check(len(out.allowlist) <= 3, f"flow allowlist lists {len(out.allowlist)} flows")
+    coverage = out.report.get("traffic_coverage", {})
+    r.check(coverage.get("total_packets", 0) >= 4300, f"coverage counts {coverage.get('total_packets')} packets")
+    r.check(out.device(attacker).get("evidence") and "forged source addresses" in out.device(attacker)["evidence"][0],
+            "attacker VM has no flood observation")
+    r.check(out.band() in ("HIGH", "SEVERE"), f"risk band {out.band()} for an active flood")
+    summary = [svg for svg in out.svgs if "Purdue_Summary" in svg.name]
+    r.check(bool(summary) and "Not shown: " in summary[0].read_text(encoding="utf-8"),
+            "Purdue summary diagram does not mention the forged addresses")
+    require_text(r, out, "Total observed devices: 4 (not counting 4,000 forged source addresses used in the ICMP "
+                         "flood against 10.10.1.10 and the TCP SYN flood against 10.10.1.10")
+    r.check("forged source addresses set aside" in out.log, "console does not report the forged addresses")
+
+
+def check_attack_single_source_flood(r: Result, out: RunOutput) -> None:
+    plc, laptop = "10.30.0.10", "10.30.0.99"
+    icmp = out.matching("ICMP flood against", src=laptop, dst=plc, severity="HIGH")
+    syn = out.matching("TCP SYN flood against", src=laptop, dst=plc, severity="CRITICAL")
+    r.check(bool(icmp), "answered ping flood from one host not reported as HIGH")
+    r.check(bool(syn), "SYN flood that silenced the PLC not reported as CRITICAL")
+    if icmp:
+        r.check(icmp[0]["description"].startswith("10.30.0.99 flooded 10.30.0.10 with 1,200 ICMP echo requests"),
+                "ping flood does not open with its single source")
+        r.check("no visible loss of service" in icmp[0]["description"], "ping flood: service check missing")
+    if syn:
+        r.check("loss of service during the flood" in syn[0]["description"], "SYN flood: loss of service not described")
+        r.check("Almost all of them went to port 502" in syn[0]["description"], "SYN flood: target port not named")
+        r.check("forged" not in syn[0]["description"], "single-source SYN flood called forged")
+    r.check(not out.report.get("spoofed_sources"), "addresses set aside for a flood from one real host")
+    r.check(laptop in out.report.get("devices", {}), "flooding laptop missing from the device inventory")
+
+
+def check_attack_connection_flood(r: Result, out: RunOutput) -> None:
+    plc, flooder = "10.50.0.10", "10.50.0.66"
+    hits = out.matching("TCP connection flood against", src=flooder, dst=plc, severity="CRITICAL")
+    r.check(bool(hits), "Modbus query flood over completed connections not reported as a CRITICAL connection flood")
+    if hits:
+        text = hits[0]["description"]
+        r.check("the source addresses are real" in text and "forged" not in text, "connection flood: source wording")
+        r.check("fell from 2.0 per second before the flood" in text, "connection flood: HMI's loss of service not used")
+        r.check(any(line.startswith(f"Flood sender {flooder} (not counted above)") for line in hits[0]["evidence"]),
+                "connection flood: the flood sender is not listed apart from the clients")
+    forbid(r, out, "TCP SYN flood against")
+    r.check(not out.report.get("spoofed_sources"), "addresses set aside for a flood of completed connections")
+
+
+def check_benign_high_rate_monitoring(r: Result, out: RunOutput) -> None:
+    expect_benign(r, out, "MODERATE", ["flood", "sweep", "denial-of-service", "unanswered syn"])
+    r.check(not out.report.get("spoofed_sources"), "addresses set aside in benign traffic")
+    r.check("Flood follow-up" not in out.log, "benign traffic triggered the flood follow-up read")
+    r.check(len(out.report.get("devices", {})) == 17, f"{len(out.report.get('devices', {}))} devices, expected 17")
+
+
 CHECKS: Dict[str, Callable[[Result, RunOutput], None]] = {
     "benign_modbus_hmi": check_benign_modbus_hmi,
     "benign_scada_master": check_benign_scada_master,
@@ -474,6 +557,10 @@ CHECKS: Dict[str, Callable[[Result, RunOutput], None]] = {
     "unidentified_udp": check_unidentified_udp,
     "ot_protocol_catalog": check_ot_protocol_catalog,
     "custom_protocol_config": check_custom_protocol_config,
+    "attack_spoofed_floods": check_attack_spoofed_floods,
+    "attack_single_source_flood": check_attack_single_source_flood,
+    "attack_connection_flood": check_attack_connection_flood,
+    "benign_high_rate_monitoring": check_benign_high_rate_monitoring,
 }
 # Scenarios that run with their own ~/.ot_pcap_analyzer.conf.
 HOME_CONFIG: Dict[str, Dict[str, Any]] = {"custom_protocol_config": CUSTOM_PROTOCOLS}
