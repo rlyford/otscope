@@ -78,11 +78,12 @@ class Net:
         self.frames.append((ts, _mac(dst_mac) + _mac(src_mac) + struct.pack("!H", ethertype) + payload))
 
     def ip_packet(self, ts: float, src: str, dst: str, proto: int, l4: bytes, ttl: int = 64,
-                  dst_mac: Optional[str] = None) -> None:
-        self.emit(ts, self.mac(src), dst_mac or self.mac(dst), 0x0800, self._ipv4(src, dst, proto, l4, ttl))
+                  dst_mac: Optional[str] = None, src_mac: Optional[str] = None) -> None:
+        self.emit(ts, src_mac or self.mac(src), dst_mac or self.mac(dst), 0x0800, self._ipv4(src, dst, proto, l4, ttl))
 
     def tcp(self, ts: float, src: str, sport: int, dst: str, dport: int, seq: int, ack: int,
-            flags: str, payload: bytes = b"", ttl: int = 64) -> None:
+            flags: str, payload: bytes = b"", ttl: int = 64, src_mac: Optional[str] = None,
+            dst_mac: Optional[str] = None) -> None:
         bits = 0
         for flag in flags:
             bits |= TCP_FLAG_BITS[flag]
@@ -91,7 +92,7 @@ class Net:
         segment = header + payload
         csum = self._l4_checksum(src, dst, 6, segment)
         segment = segment[:16] + struct.pack("!H", csum) + segment[18:]
-        self.ip_packet(ts, src, dst, 6, segment, ttl=ttl)
+        self.ip_packet(ts, src, dst, 6, segment, ttl=ttl, dst_mac=dst_mac, src_mac=src_mac)
 
     def udp(self, ts: float, src: str, sport: int, dst: str, dport: int, payload: bytes,
             dst_mac: Optional[str] = None) -> None:
@@ -102,10 +103,11 @@ class Net:
             dst_mac = multicast_mac(dst)
         self.ip_packet(ts, src, dst, 17, segment, dst_mac=dst_mac)
 
-    def icmp_echo(self, ts: float, src: str, dst: str, ident: int, seq: int, reply: bool = False) -> None:
+    def icmp_echo(self, ts: float, src: str, dst: str, ident: int, seq: int, reply: bool = False,
+                  src_mac: Optional[str] = None) -> None:
         body = struct.pack("!BBHHH", 0 if reply else 8, 0, 0, ident, seq) + b"abcdefghijklmnopqrstuvwabcdefghi"
         body = body[:2] + struct.pack("!H", _inet_checksum(body)) + body[4:]
-        self.ip_packet(ts, src, dst, 1, body)
+        self.ip_packet(ts, src, dst, 1, body, src_mac=src_mac)
 
     def arp(self, ts: float, op: int, sender_mac: str, sender_ip: str, target_ip: str,
             target_mac: str = "00:00:00:00:00:00", eth_src: Optional[str] = None,

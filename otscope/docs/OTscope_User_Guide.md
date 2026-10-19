@@ -4,7 +4,7 @@
 
 Interactive multi-pcap OT/ICS traffic analysis with session persistence, role inference, attack-chain correlation, MITRE ATT&CK for ICS mapping, Wireshark investigation guidance, Purdue-Model architecture diagrams, and machine-readable artifacts.
 
-> **Version 2.8.4**  ·  October 2026
+> **Version 2.8.5**  ·  October 2026
 > Authored by Ryan Lyford  ·  © 2026 Ryan Lyford. All rights reserved.
 
 ---
@@ -259,6 +259,7 @@ Always runs. One full tshark pass per pcap that builds the unified device and fl
 - **Flow direction.** Every flow is oriented client → server. The server side comes from the TCP handshake (SYN / SYN-ACK) when the capture contains it; otherwise from well-known service ports. A flow is recorded once as *client → server : service port* — the client's ephemeral port never becomes a "destination port", and a device's **ports** are the services it actually answered on (its **client ports** are the services it used).
 - **Truncated captures.** A capture that ends mid-packet or has a damaged record (common when a capture is stopped abruptly or copied while still being written) is analyzed up to the damage, flagged `truncated` in the JSON report, and noted on the console — it is not dropped.
 - **Hosts only.** Broadcast and multicast destinations (`x.x.x.255`, `255.255.255.255`, `224.0.0.0/4`, `ff00::/8`) are not devices; they are counted separately and listed in the report's Network Interpretation Summary. Hosts seen only in ARP — quiet devices, or an attacker poisoning caches from its own address — are added from their ARP frames. An IPv6 link-local address is folded into the IPv4 host that uses the same MAC, so one machine appears once.
+- **Forged source addresses.** When a flood (§6.2) carries a new forged source address on almost every packet, those addresses are set aside after the protocol pass. An address is set aside only when it sent nothing but flood packets through the flood's MACs, never appeared in ARP, and talked to no other host. They are not devices, so they are left out of the device count, the Device Inventory (summary, appendix and CSV), the Purdue diagrams, the flow allowlist, and the top affected assets. One line in each of those places says how many were set aside and which flood used them, and the JSON report lists them under `spoofed_sources`. Their packets still count as assessed traffic.
 
 ### 6.2 Phase 2 — Streaming Protocol Pass
 
@@ -293,6 +294,12 @@ Detectors read structured tshark fields — function codes, transaction IDs, TLS
 - IT noise on OT — mDNS / LLMNR / NetBIOS / SSDP / WS-Discovery from subnets that hold OT devices.
 - DHCP rogue server detection.
 - ICMP sweep / unreachable burst.
+- Floods: ICMP echo requests (ping) or TCP connection requests (SYN without ACK) aimed at one host at 50 or more per second for at least 10 seconds, with up to two quieter seconds allowed inside the flood. For the five largest floods, OTscope reads the target's traffic once more to work out:
+  - **who sent it.** When at least 100 source addresses, sending about one or two packets each, arrive through at most three MACs, the addresses are forged (spoofed). The finding names the sender's MAC and vendor and the IP address that MAC uses (from its ARP frames or its own traffic). If the MAC carries traffic for many hosts, the finding says it is probably a router and the flood came from another network. Otherwise the finding names the source addresses.
+  - **whether the target kept answering.** It compares the target's data packets to its clients before, during and after the flood, overall and for its three busiest clients. The flood's own senders are listed separately and not counted as clients. Each comparison window lasts as long as the flood, at least one minute and at most ten.
+  - **how many SYNs completed a connection** (SYN floods only). When most of them did, the finding is a *TCP connection flood*: the source addresses are real, and opening connections that fast can exhaust a controller's connection table (a Modbus query flood looks like this).
+
+  Severity is INTRUSION when the source addresses are forged. Otherwise it is CRITICAL when the target's answers fell by half or more during the flood, and HIGH when they did not. The evidence gives the flood window in UTC with a Wireshark filter, the average and peak rate, the Ethernet senders, a sample of forged addresses, and the before/during/after rates.
 - TCP RST bursts (aborted connections only — RSTs that follow a normal FIN close are routine teardown) and repeated unanswered SYNs (SYN-ACK counts separate answered from unanswered).
 - ARP — for every IP claimed by more than one MAC, the analysis decides which MAC owns it and which is impersonating it (see §6.4); gratuitous-ARP bursts, one MAC claiming many IPs, frames sent on another host's behalf, and unsolicited replies are reported separately only when no impostor explains them.
 
@@ -387,7 +394,7 @@ OTscope writes up to six report artifacts alongside the session file, named with
 | Artifact | Filename Pattern / Purpose |
 | --- | --- |
 | Word report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.docx` — the human-readable deliverable. |
-| JSON report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.json` — machine-readable findings (each with its report ID, e.g. `MODBUS-001`) + devices + risk + `remediation_plan` + `traffic_coverage` (packets assessed, recognized but not assessed by protocol, not identified, and the largest unidentified flows and frames) for SIEM/ticketing. |
+| JSON report | `OT_PCAP_Analysis_<site>_<YYYYMMDD>.json` — machine-readable findings (each with its report ID, e.g. `MODBUS-001`) + devices + risk + `remediation_plan` + `traffic_coverage` (packets assessed, recognized but not assessed by protocol, not identified, and the largest unidentified flows and frames) + `spoofed_sources` (per flood: target, how many forged addresses and flows were set aside, the sender's MACs and IPs, the window, and sample addresses) for SIEM/ticketing. |
 | Device Inventory CSV | `OT_Device_Inventory_<site>_<YYYYMMDD>.csv` — full device list with per-device traffic, role, vendor, OS, VLAN, source pcaps, `is_critical_in_findings` flag, plus `client_ports` (services the device used), `ipv6_link_local` (folded IPv6 addresses), and `observations` (e.g. "impersonated by MAC …", "ARP cache poisoned by …"). |
 | Flow Allowlist CSV | `OT_Flow_Allowlist_<site>_<YYYYMMDD>.csv` — observed (client, server, service port, protocol) tuples sorted by frequency, with a default ALLOW action column for asset-owner review. |
 | Purdue Summary SVG | `OTscope_Purdue_Summary_<site>_<YYYYMMDD>.svg` — visual layered diagram (always written). |
@@ -424,10 +431,10 @@ The Word report is designed as an **auditor workpaper** for IT-oriented cybersec
    Lower-severity findings get a compact summary: assets, MITRE IDs, the description (or one line per device pair), evidence, and a one-line *What to do*.
 7. **Suggested Controls** — defensive measures suggested by what the capture contained (for example, IDS signatures for exposed credentials). Recommendations, not findings; not scored.
 8. **Assessor Notes** — free-text notes recorded during the session.
-9. **Network Interpretation Summary** — plain-language paragraphs describing the observed architecture: likely initiators and controllers, host observations (impersonated, impostor, poisoned), IPv6 addresses matched to their IPv4 hosts, broadcast and multicast destinations, IT discovery protocols on OT subnets, services on dynamic ports.
+9. **Network Interpretation Summary** — plain-language paragraphs describing the observed architecture: likely initiators and controllers, host observations (impersonated, impostor, poisoned, flood sender and target), forged flood source addresses left out of the inventory, IPv6 addresses matched to their IPv4 hosts, broadcast and multicast destinations, IT discovery protocols on OT subnets, services on dynamic ports.
 10. **MITRE ATT&CK for ICS Coverage** — technique IDs (hyperlinked to attack.mitre.org), names, and finding counts.
-11. **Device Inventory Summary** — top 15 devices by traffic with MAC and vendor (⚠ marks an IP seen with more than one MAC), role, zone, protocols, and risk score, followed by any per-device observations; the full list is in the Device Inventory CSV.
-12. **Flow Allowlist Summary** — how to use the Flow Allowlist CSV for segmentation review.
+11. **Device Inventory Summary** — top 15 devices by traffic with MAC and vendor (⚠ marks an IP seen with more than one MAC), role, zone, protocols, and risk score, followed by any per-device observations; the full list is in the Device Inventory CSV. Forged flood source addresses are not counted (§6.1); one sentence says how many there were.
+12. **Flow Allowlist Summary** — how to use the Flow Allowlist CSV for segmentation review (flows from forged flood source addresses are not listed).
 13. **Limitations of Analysis** — disclosures to carry into a formal audit.
 14. **Appendix A: Wireshark Investigation Guide** — the investigation guides that match the reported findings, grouped by category (see §8).
 
@@ -464,7 +471,7 @@ One color-coded box per Purdue layer with its device count and top protocols, st
 - Physical Security / OT Edge
 - Unclassified (only if any device couldn't be placed)
 
-Empty layers are skipped automatically.
+Empty layers are skipped automatically. When forged flood source addresses were set aside (§6.1), a note under the layers says how many are not shown.
 
 #### 7.3.2 Detail Diagram (only for ≤50 devices)
 
@@ -526,7 +533,7 @@ Observation window: first seen @1745801234.567890, last seen @1745801999.123456
 
 ### 8.3 Appendix A — Per-Category Guides
 
-Each category that fired at least one finding gets the guides matching its findings in Appendix A of the Word report — a category with several finding types can show several guides — each with a display filter and 3-5 concrete steps (column suggestions, Follow Stream targets, Statistics menu paths). Findings without a specific guide point to a General Investigation Steps section. Protocols from the OT protocol catalog (§6.3.1) get a guide built from their own display filter. Every display filter is valid tshark/Wireshark 4.x syntax (set members are comma-separated, e.g. `tcp.port in {512, 513}`); a few contain `<src>`-style placeholders to fill in. Categories covered include ARP/MITM, Modbus, DNP3, BACnet, IEC 104 / IEC 61850 / GOOSE / MMS, OPC-UA, EtherNet/IP/CIP, Siemens S7, PROFINET, cleartext/legacy/credentials, TLS weakness, beaconing/C2, DNS anomalies, SNMP, ARP/RST/SYN/ICMP scans, mDNS/LLMNR/NBNS/SSDP, DHCP rogue, suspicious UA / EOL banners, auth-failure bursts, public IP exposure, baseline drift, audio/video streaming (RTP/SIP/RTSP/MPEG-TS), and capture-integrity / no-NTP.
+Each category that fired at least one finding gets the guides matching its findings in Appendix A of the Word report — a category with several finding types can show several guides — each with a display filter and 3-5 concrete steps (column suggestions, Follow Stream targets, Statistics menu paths). Findings without a specific guide point to a General Investigation Steps section. Protocols from the OT protocol catalog (§6.3.1) get a guide built from their own display filter. Every display filter is valid tshark/Wireshark 4.x syntax (set members are comma-separated, e.g. `tcp.port in {512, 513}`); a few contain `<src>`-style placeholders to fill in. Categories covered include ARP/MITM, Modbus, DNP3, BACnet, IEC 104 / IEC 61850 / GOOSE / MMS, OPC-UA, EtherNet/IP/CIP, Siemens S7, PROFINET, cleartext/legacy/credentials, TLS weakness, beaconing/C2, DNS anomalies, SNMP, ARP/RST/SYN/ICMP scans, ping and SYN floods, mDNS/LLMNR/NBNS/SSDP, DHCP rogue, suspicious UA / EOL banners, auth-failure bursts, public IP exposure, baseline drift, audio/video streaming (RTP/SIP/RTSP/MPEG-TS), and capture-integrity / no-NTP.
 
 ---
 
@@ -581,7 +588,7 @@ After every pcap is fully processed (in both inventory and streaming passes), th
 
 ### 10.3 Flood-Scale Captures
 
-On flood-scale captures (e.g. ping-flood or Modbus query-flood test pcaps with 1M+ spoofed source IPs), per-finding emission caps engage automatically:
+When a ping or SYN flood forges a new source address on every packet, OTscope recognizes the flood (§6.2) and sets the forged addresses aside (§6.1), so they no longer become millions of devices. For floods it does not recognize as forged, and for other flood-scale captures (for example Modbus query floods), per-finding emission caps engage automatically:
 
 - Network hygiene findings cap at 200 per type (25 in fast-path mode); excess collapses to one rollup finding per type.
 - Repeated detections merge into one finding that keeps at most 50 evidence lines and 1,000 IPs per side, with an `occurrences` count in the JSON.
@@ -591,7 +598,7 @@ On flood-scale captures (e.g. ping-flood or Modbus query-flood test pcaps with 1
 - Affected Endpoints lines cap at 30, Source Pcaps at 8 per finding.
 - Source Pcaps line collapses to "(all N session pcaps)" when finding spans the full set.
 
-Net result: a 1.4M-device flood capture renders as a ~50-page Word report with the full data exported to the Device Inventory CSV and a readable Purdue Summary diagram.
+Net result: a 1.4M-device capture renders as a ~50-page Word report with the full data exported to the Device Inventory CSV and a readable Purdue Summary diagram.
 
 ### 10.4 Subprocess Hygiene
 
@@ -639,6 +646,8 @@ When the Word report opens, work top-down for fastest triage:
 
 - Catalog protocols (§6.3.1) are recognized, not analyzed: OTscope reports who used them and when, but not what they carried. Siemens S7comm-plus (S7-1200/1500 engineering) shares TCP 102 with S7comm and has no tshark decoder, so its engineering sessions are not yet told apart.
 - Devices that use only industrial Ethernet without IP (EtherCAT, PROFINET IO, POWERLINK…) appear in findings by MAC address, not in the device inventory or the Purdue diagrams.
+- Flood detection covers ICMP echo requests over IPv4 and TCP SYNs, aimed at one host. UDP floods are not detected, because legitimate high-rate UDP such as EtherNet/IP I/O and PROFINET makes rate alone unreliable. A flood spread over many targets at under 50 packets per second each is not reported as a flood. Only the five largest floods get the sender and service follow-up, which costs one extra read of the capture files around each flood.
+- The flood service check sees only what reaches the capture point. It cannot see an HMI on another switch that lost its connection, or a controller that kept answering but stopped running its logic, so confirm with operations.
 - Single-threaded tshark per file. Parallel reads are deferred until profiling justifies the refactor risk.
 - Some payload-level CIP services (symbolic-name extraction for service `0x4e`, multi-service-packet frame counts) are not parsed. Use Wireshark for those forensic drills.
 - Baseline behavior is not auto-learned — you must capture a known-good run with `--save-baseline`.
@@ -657,6 +666,17 @@ When the Word report opens, work top-down for fastest triage:
 ## 14. Version History
 
 Running log of capabilities added in each release. Newest at the top.
+
+### Version 2.8.5 · October 2026
+
+Flood-detection release, after a run on `eth2dump-pingFloodDDoS1m-6h_1.pcap`. The capture holds a one-minute ping flood against a PLC: 11,934 echo requests at about 200 per second, each from a different forged source address, all sent by one VMware MAC. v2.8.4 reported it only as a LOW *ICMP traffic involving OT devices* finding ("11103 OT-adjacent hosts"). The forged addresses filled the device inventory (11,108 devices), the Purdue diagram (10,316 External / Public devices) and the top affected assets, and the risk band was LOW.
+
+- **Ping and SYN flood detection** (§6.2) — ICMP echo requests or TCP SYNs aimed at one host at 50 or more per second for at least 10 seconds. The finding (Intrusion Indicators, MITRE T0814) gives the window in UTC with a Wireshark filter, the rate, the senders and, for SYN floods, the target ports.
+- **Forged sources and the real sender** — when almost every packet carries a new source address but all of them come through one or a few MACs, the finding says the addresses are forged. It names the MAC, its vendor and the IP address that MAC uses. On the test capture that is 00:0c:29:e6:14:0d (VMware), 172.27.224.50 from its ARP frames. Forged-source floods are INTRUSION, so the risk band is at least HIGH.
+- **Service check** — the target's data packets to its clients before, during and after the flood, with the flood's own senders kept apart. The finding says "no visible loss of service from this capture point" (on the test capture the PLC kept answering 3.3 times a second), or it gives the drop. A drop makes a flood from real addresses CRITICAL and adds T0826 Loss of Availability. On `eth2dump-modbusQuery2Flooding1m-1h_1.pcap` this produces a CRITICAL *TCP connection flood*: 5,490 connections in a minute from 172.27.224.50, during which the HMI's answers fell from 3.0 to 0.7 per second.
+- **Forged addresses are set aside** (§6.1) from the device count and inventory, the CSVs, the Purdue diagrams, the flow allowlist and the top affected assets, with one line saying how many. The JSON lists them under `spoofed_sources`, and their packets still count as assessed. On the test capture this leaves 6 devices instead of 11,108, and the risk band is HIGH instead of LOW.
+- *ICMP traffic involving OT devices* counts OT devices and their peers separately.
+- **Regression suite** — 24 scenarios. New: `attack_spoofed_floods` (forged ping and SYN floods against a PLC: one it rode out, one that silenced it), `attack_single_source_flood` (ping and SYN floods from one real host), `attack_connection_flood` (a Modbus query flood over completed connections), and `benign_high_rate_monitoring` (ping monitoring, latency tests and connect-per-poll traffic below the flood rules).
 
 ### Version 2.8.4 · October 2026
 

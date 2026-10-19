@@ -9,7 +9,7 @@ plant / office traffic and must not produce intrusion-class findings;
 from __future__ import annotations
 
 import struct
-from typing import Dict
+from typing import Dict, Tuple
 
 from pcapgen import (
     WSD_HELLO,
@@ -542,6 +542,118 @@ def custom_protocol_config() -> Net:
     return n
 
 
+def _random_address(n: Net) -> str:
+    """Any IPv4 address, reserved ranges included: what flood tools forge."""
+    return ".".join(str(n.rng.randrange(256)) for _ in range(4))
+
+
+def _hmi_polling(n: Net, hmi: str, plc: str, seconds: int, silent: Tuple[float, float] = (0.0, 0.0)) -> None:
+    """An HMI reads ten registers twice a second; the PLC does not answer inside `silent` (seconds from start)."""
+    s = n.session(hmi, 50210, plc, 502).open(n.t0)
+    for i in range(seconds * 2):
+        rel = 0.5 + i * 0.5
+        s.c2s(modbus_request(i + 1, 3, 0, 10), n.t0 + rel)
+        if not silent[0] <= rel < silent[1]:
+            s.s2c(modbus_read_response(i + 1, 3, [i % 100] * 10), n.t0 + rel + 0.01)
+        s.ack_c(n.t0 + rel + 0.2)
+
+
+def attack_spoofed_floods() -> Net:
+    """An HMI polls a PLC twice a second for five minutes while an attacker VM
+    (which ARPs once, so its address is known) floods the PLC twice, forging a
+    new source address on every packet: 20 s of pings at 100/s that the PLC
+    rides out, then 20 s of SYNs to port 502 at 100/s during which the PLC
+    stops answering the HMI.  The PLC answers the first 300 forged SYNs
+    through the gateway."""
+    n = Net(seed=41)
+    hmi, plc, attacker, gateway = "10.10.1.20", "10.10.1.10", "10.10.1.66", "10.10.1.1"
+    n.set_mac(attacker, "00:0c:29:aa:bb:cc")
+    n.arp(n.t0 + 1, 1, n.mac(attacker), attacker, gateway)
+    n.arp(n.t0 + 1.001, 2, n.mac(gateway), gateway, attacker, target_mac=n.mac(attacker),
+          eth_dst=n.mac(attacker))
+    _hmi_polling(n, hmi, plc, 300, silent=(182.0, 200.0))
+    attacker_mac = n.mac(attacker)
+    for i in range(2000):
+        n.icmp_echo(n.t0 + 60 + i * 0.01, _random_address(n), plc, 0x4242, i, src_mac=attacker_mac)
+    for i in range(2000):
+        ts = n.t0 + 180 + i * 0.01
+        forged, port = _random_address(n), 1024 + n.rng.randrange(60000)
+        n.tcp(ts, forged, port, plc, 502, n.rng.randrange(2 ** 32), 0, "S", src_mac=attacker_mac)
+        if i < 300:
+            n.tcp(ts + 0.002, plc, 502, forged, port, n.rng.randrange(2 ** 32), 1, "SA", dst_mac=n.mac(gateway))
+    return n
+
+
+def attack_single_source_flood() -> Net:
+    """An HMI polls a PLC twice a second for four minutes.  A laptop using its own
+    address pings the PLC 80 times a second for 15 s (every ping is answered),
+    then sends it 70 SYNs a second to port 502 for 15 s from new ports; the PLC
+    answers the first 100, which the laptop resets, and stops answering the HMI
+    until the flood ends."""
+    n = Net(seed=42)
+    hmi, plc, laptop = "10.30.0.20", "10.30.0.10", "10.30.0.99"
+    _hmi_polling(n, hmi, plc, 240, silent=(121.0, 135.0))
+    for i in range(1200):
+        ts = n.t0 + 40 + i / 80
+        n.icmp_echo(ts, laptop, plc, 0x0101, i)
+        n.icmp_echo(ts + 0.0005, plc, laptop, 0x0101, i, reply=True)
+    for i in range(1050):
+        ts = n.t0 + 120 + i / 70
+        port = 20000 + i
+        n.tcp(ts, laptop, port, plc, 502, 1000 + i, 0, "S")
+        if i < 100:
+            n.tcp(ts + 0.001, plc, 502, laptop, port, 5000 + i, 1001 + i, "SA")
+            n.tcp(ts + 0.002, laptop, port, plc, 502, 1001 + i, 0, "R")
+    return n
+
+
+def attack_connection_flood() -> Net:
+    """An HMI polls a PLC twice a second for two minutes.  Another host runs a
+    Modbus query flood: 60 times a second for 20 s it opens a connection, reads
+    one register and closes it; the PLC answers every query but stops answering
+    the HMI until the flood ends."""
+    n = Net(seed=44)
+    hmi, plc, flooder = "10.50.0.20", "10.50.0.10", "10.50.0.66"
+    _hmi_polling(n, hmi, plc, 120, silent=(52.0, 70.0))
+    for i in range(1200):
+        ts = n.t0 + 50 + i / 60
+        s = n.session(flooder, 30000 + i, plc, 502).open(ts)
+        s.c2s(modbus_request(i + 1, 3, 0, 1), ts + 0.002)
+        s.s2c(modbus_read_response(i + 1, 3, [7]), ts + 0.004)
+        s.close(ts + 0.006)
+    return n
+
+
+def benign_high_rate_monitoring() -> Net:
+    """Busy but normal traffic that stays under the flood rules: a monitoring server
+    pings twelve devices once a second for two minutes; a technician sends a burst
+    of 200 pings in two seconds, a 40-per-second latency test for 30 s and a
+    60-per-second test for 8 s (all answered); a historian opens a new Modbus
+    connection five times a second for a minute; an HMI polls the PLC."""
+    n = Net(seed=43)
+    nms, tech, historian, hmi, plc = "10.40.0.5", "10.40.0.6", "10.40.0.7", "10.40.0.20", "10.40.0.10"
+    devices = [f"10.40.0.{100 + k}" for k in range(12)]
+    for second in range(120):
+        for k, device in enumerate(devices):
+            ts = n.t0 + 1 + second + k * 0.01
+            n.icmp_echo(ts, nms, device, 0x0500 + k, second)
+            n.icmp_echo(ts + 0.0004, device, nms, 0x0500 + k, second, reply=True)
+    for device, count, rate, start in ((devices[0], 200, 100, 10), (devices[1], 1200, 40, 20),
+                                       (devices[2], 480, 60, 60)):
+        for i in range(count):
+            ts = n.t0 + start + i / rate
+            n.icmp_echo(ts, tech, device, 0x0600, i)
+            n.icmp_echo(ts + 0.0004, device, tech, 0x0600, i, reply=True)
+    for i in range(300):
+        ts = n.t0 + 30 + i * 0.2
+        s = n.session(historian, 40000 + i, plc, 502).open(ts)
+        s.c2s(modbus_request(i + 1, 3, 100, 2), ts + 0.01)
+        s.s2c(modbus_read_response(i + 1, 3, [1, 2]), ts + 0.02)
+        s.close(ts + 0.03)
+    _hmi_polling(n, hmi, plc, 120)
+    return n
+
+
 SCENARIOS = {
     "benign_modbus_hmi": benign_modbus_hmi,
     "benign_scada_master": benign_scada_master,
@@ -560,4 +672,8 @@ SCENARIOS = {
     "unidentified_udp": unidentified_udp,
     "ot_protocol_catalog": ot_protocol_catalog,
     "custom_protocol_config": custom_protocol_config,
+    "attack_spoofed_floods": attack_spoofed_floods,
+    "attack_single_source_flood": attack_single_source_flood,
+    "attack_connection_flood": attack_connection_flood,
+    "benign_high_rate_monitoring": benign_high_rate_monitoring,
 }
